@@ -37,9 +37,11 @@ device_hostname = ""
 firmware = "1.4.4"
 
 [management]
-# Ingress proxies HA → 127.0.0.1:8080. Bind only to localhost so the
-# port isn't reachable from the LAN (the UI is exposed via Ingress).
-bind_address = "127.0.0.1:8080"
+# Bound on all interfaces so the HA supervisor's watchdog probe (which
+# lives in its own network namespace) can reach /api/health, and so
+# Ingress can proxy the UI. The admin API has no auth — keep this on a
+# trusted network or restrict at the firewall if your LAN isn't.
+bind_address = "0.0.0.0:8080"
 
 [dispatcher]
 strategy = "equal"

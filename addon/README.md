@@ -27,7 +27,9 @@ The add-on uses host networking — it listens on the host's IP for:
 - UDP/1010 — the virtual Shelly the batteries poll
 - TCP/80   — Shelly REST/RPC (**off by default**, only enable it for
   inverters that talk HTTP to the Shelly — some Hoymiles models)
-- TCP/8080 — admin web UI (proxied via HA Ingress)
+- TCP/8080 — admin web UI (proxied via HA Ingress; also reachable on
+  the LAN at `http://<ha-host>:8080` — no auth, trust your network or
+  restrict at the firewall)
 
 Marstek Venus E and similar use only UDP/1010 + mDNS, so out of the
 box the add-on doesn't bind port 80 and won't conflict with HA's own

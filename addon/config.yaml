@@ -47,3 +47,8 @@ schema:
 startup: services
 boot: auto
 init: false
+
+# HA polls this URL; if it stops responding, the supervisor restarts
+# the add-on. Toggle the watchdog from the add-on's Info tab in HA.
+# `[HOST]` and `[PORT:8080]` are substituted by the supervisor.
+watchdog: "http://[HOST]:[PORT:8080]/api/health"
