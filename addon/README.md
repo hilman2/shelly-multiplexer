@@ -11,8 +11,13 @@ sidebar via Ingress, so no separate URL or port forwarding is needed.
 3. Install **Shelly Multiplexer** from the new repository entry.
 4. Set the real Shelly's IP and reconfigured UDP port in the add-on's
    **Configuration** tab and start the add-on.
-5. Open the multiplexer's web UI from the HA sidebar to add batteries,
-   tune the dispatcher and override the safety cap.
+5. From the add-on's **Info** tab, click **OPEN WEB UI** to add
+   batteries, tune the dispatcher and override the safety cap. The
+   UI is reachable directly at `http://<ha-host>:8080`.
+
+> The web UI cannot run via Home Assistant Ingress because the add-on
+> needs `host_network: true` (so the inverters can find it on UDP/1010
+> and via mDNS), and Ingress is incompatible with host networking.
 
 ## Required setup on the real Shelly
 

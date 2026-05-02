@@ -1,6 +1,6 @@
 ---
 name: Shelly Multiplexer
-version: "0.1.1"
+version: "0.1.2"
 slug: shelly_multiplexer
 description: >-
   Emulates a Shelly Pro 3EM and saldiert (sum-balances) the real meter's
@@ -16,21 +16,16 @@ url: https://github.com/hilman2/shelly-multiplexer
 # means HA users don't need a Rust toolchain in their VM.
 image: ghcr.io/hilman2/shelly-multiplexer-{arch}
 
-# UDP/1010 is the default Shelly RPC port the batteries poll; UDP and
-# host_network are required so they can find us at the HA host's IP.
+# UDP/1010 + mDNS multicast require host networking so the inverters
+# can find us on the LAN. host_network and Ingress can NOT be combined
+# (Ingress lives on the hassio bridge, host_network bypasses it), so
+# we expose the admin UI via the standard "Open Web UI" link instead.
 host_network: true
-host_dbus: false
 
-# Enable Ingress so the multiplexer's web UI shows up in the HA sidebar.
-ingress: true
-ingress_port: 8080
-ingress_entry: ""
-panel_icon: mdi:transit-connection-variant
-panel_title: Shelly Multiplexer
-
-# Persisted state (config.toml lives here).
-map:
-  - addon_config:rw
+# Direct link to the admin UI. HA replaces [HOST]/[PORT:8080] with the
+# host's IP and the configured port. Shows up as "OPEN WEB UI" on the
+# add-on's Info tab.
+webui: "http://[HOST]:[PORT:8080]"
 
 # A boot-time options block. The full live configuration is done via
 # the embedded web UI; here we expose only the bits a user needs to set
@@ -46,7 +41,6 @@ schema:
 
 startup: services
 boot: auto
-init: false
 
 # HA polls this URL; if it stops responding, the supervisor restarts
 # the add-on. Toggle the watchdog from the add-on's Info tab in HA.
