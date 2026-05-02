@@ -20,25 +20,35 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # amd64 runs natively on the standard x86_64 runners.
           - arch: amd64
             platform: linux/amd64
             base: ghcr.io/home-assistant/amd64-base-debian:bookworm
+            runner: ubuntu-latest
+          # aarch64 runs natively on GitHub's free public-repo ARM
+          # runners — about 5–10× faster than QEMU emulation.
           - arch: aarch64
             platform: linux/arm64
             base: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+            runner: ubuntu-24.04-arm
+          # armv7 has no native runner, so it stays on QEMU. It's also
+          # the architecture fewest HA users still need (Pi 3 with a
+          # 32-bit OS); if it ever becomes a bottleneck we can drop it.
           - arch: armv7
             platform: linux/arm/v7
             base: ghcr.io/home-assistant/armv7-base-debian:bookworm
+            runner: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up QEMU
+        if: matrix.arch == 'armv7'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
