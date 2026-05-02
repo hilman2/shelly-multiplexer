@@ -21,22 +21,19 @@ RUN cargo build --release --locked --bin shelly-multiplexer && \
 # ---- Runtime stage --------------------------------------------------------
 FROM ${BUILD_FROM}
 
-ENV LANG C.UTF-8
+ENV LANG=C.UTF-8
 
-# bashio is preinstalled in the HA base images. We rely on it in run.sh
-# to read /data/options.json. Avahi is included so mDNS advertisement
-# works even without host networking; with host_network: true (which is
-# required anyway for UDP/1010) Avahi acts as the system mDNS responder.
-RUN apk add --no-cache ca-certificates tini libgcc 2>/dev/null || \
-    (apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates tini && rm -rf /var/lib/apt/lists/*)
+# HA base images already provide bashio + s6-overlay (which acts as
+# init / signal forwarder), so we don't add tini. Only install what
+# we actually need beyond the base.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/shelly-multiplexer /usr/bin/shelly-multiplexer
-
 COPY addon/run.sh /usr/bin/run.sh
 RUN chmod a+x /usr/bin/run.sh /usr/bin/shelly-multiplexer
 
-ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["/usr/bin/run.sh"]
 
 LABEL \
