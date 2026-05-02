@@ -1,0 +1,49 @@
+---
+name: Shelly Multiplexer
+version: "0.1.0"
+slug: shelly_multiplexer
+description: >-
+  Emulates a Shelly Pro 3EM and saldiert (sum-balances) the real meter's
+  power across several battery storages (Marstek Venus E, Hoymiles HM/HMS
+  in CT mode). Includes a built-in web UI for live tuning.
+arch:
+  - amd64
+  - aarch64
+  - armv7
+url: https://github.com/hilman2/shelly-multiplexer
+# Pre-built per architecture by GitHub Actions and pushed to GHCR.
+# `{arch}` is substituted by the HA supervisor. Avoiding a local build
+# means HA users don't need a Rust toolchain in their VM.
+image: ghcr.io/hilman2/shelly-multiplexer-{arch}
+
+# UDP/1010 is the default Shelly RPC port the batteries poll; UDP and
+# host_network are required so they can find us at the HA host's IP.
+host_network: true
+host_dbus: false
+
+# Enable Ingress so the multiplexer's web UI shows up in the HA sidebar.
+ingress: true
+ingress_port: 8080
+ingress_entry: ""
+panel_icon: mdi:transit-connection-variant
+panel_title: Shelly Multiplexer
+
+# Persisted state (config.toml lives here).
+map:
+  - addon_config:rw
+
+# A boot-time options block. The full live configuration is done via
+# the embedded web UI; here we expose only the bits a user needs to set
+# before the first start so the multiplexer can reach the real Shelly.
+options:
+  real_shelly_host: "192.168.1.50"
+  real_shelly_udp_port: 2020
+  log_level: info
+schema:
+  real_shelly_host: str
+  real_shelly_udp_port: port
+  log_level: list(trace|debug|info|warn|error)
+
+startup: services
+boot: auto
+init: false

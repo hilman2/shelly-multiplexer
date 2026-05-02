@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShellyMultiplexer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>ShellyMultiplexer</h1>
+    <div class="meta">
+      <span id="conn-state" class="dot"></span>
+      <span id="last-seen">–</span>
+      <span class="sep">·</span>
+      <span>Cap <span id="header-cap">–</span></span>
+      <span class="sep">·</span>
+      <span>Uptime <span id="uptime">–</span></span>
+    </div>
+  </header>
+
+  <nav>
+    <button data-view="status" class="active">Status</button>
+    <button data-view="batteries">Batteries &amp; Allocation</button>
+    <button data-view="safety">Safety</button>
+    <button data-view="config">Configuration</button>
+  </nav>
+
+  <main>
+    <section id="view-status" class="view active">
+      <h2>Real Shelly 3EM</h2>
+      <div class="phase-grid">
+        <div class="phase">
+          <div class="label">Phase L1</div>
+          <div class="value" id="p-a">–</div>
+          <div class="unit">W</div>
+          <div class="sub">Voltage <span id="v-a">–</span> V</div>
+        </div>
+        <div class="phase">
+          <div class="label">Phase L2</div>
+          <div class="value" id="p-b">–</div>
+          <div class="unit">W</div>
+          <div class="sub">Voltage <span id="v-b">–</span> V</div>
+        </div>
+        <div class="phase">
+          <div class="label">Phase L3</div>
+          <div class="value" id="p-c">–</div>
+          <div class="unit">W</div>
+          <div class="sub">Voltage <span id="v-c">–</span> V</div>
+        </div>
+        <div class="phase total">
+          <div class="label">Total</div>
+          <div class="value" id="p-total">–</div>
+          <div class="unit">W</div>
+          <div class="sub" id="direction-label">–</div>
+        </div>
+      </div>
+
+      <h2>Energy</h2>
+      <table class="energy">
+        <thead>
+          <tr><th>Phase</th><th>Imported (kWh)</th><th>Exported (kWh)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>L1</td><td id="e-a-cons">–</td><td id="e-a-ret">–</td></tr>
+          <tr><td>L2</td><td id="e-b-cons">–</td><td id="e-b-ret">–</td></tr>
+          <tr><td>L3</td><td id="e-c-cons">–</td><td id="e-c-ret">–</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="view-batteries" class="view">
+      <h2>Battery allocation</h2>
+      <p class="hint">
+        Saldierende Verteilung: each battery is told to charge or
+        discharge by the indicated wattage. The dispatcher reconstructs
+        the true grid demand by adding back the previously commanded
+        battery output, so the control loop is stable even when the CT
+        already reads near zero. SoC is polled directly from each
+        battery and used to gate charge / discharge eligibility.
+      </p>
+      <table class="alloc">
+        <thead>
+          <tr>
+            <th>Battery</th>
+            <th>IP</th>
+            <th>Group</th>
+            <th>SoC</th>
+            <th>SoC age</th>
+            <th title="+ = battery should discharge; − = battery should charge">Allocated (W)</th>
+            <th>Note</th>
+            <th>Last request</th>
+          </tr>
+        </thead>
+        <tbody id="alloc-body"></tbody>
+      </table>
+    </section>
+
+    <section id="view-safety" class="view">
+      <h2>Safety cap</h2>
+      <div class="safety-card" id="safety-card">
+        <div class="cap-headline">
+          <div>
+            <div class="label">Effective cap</div>
+            <div class="cap-value" id="safety-cap-value">–</div>
+            <div class="sub" id="safety-source">–</div>
+          </div>
+          <div class="badge" id="safety-badge">–</div>
+        </div>
+        <div class="ack-grid">
+          <div class="ack" id="ack-risk">
+            <span class="ack-icon">○</span>
+            <span>Risk acknowledged</span>
+          </div>
+          <div class="ack" id="ack-fuses">
+            <span class="ack-icon">○</span>
+            <span>Separate fuses confirmed</span>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="btn-override" class="primary">Unlock higher cap…</button>
+          <button id="btn-reset" class="secondary">Reset to config default</button>
+        </div>
+      </div>
+
+      <div class="warning-box">
+        <strong>Important:</strong> the default 3000&nbsp;W cap protects
+        against damage when wiring is not rated for higher loads. Only
+        raise it if every battery is on its <em>own</em>, adequately rated
+        protective device. Runtime overrides are not persisted — a restart
+        always returns the system to a known-safe state.
+      </div>
+    </section>
+
+    <section id="view-config" class="view">
+      <h2>Configuration</h2>
+      <p class="hint">
+        Edits are validated, persisted to the TOML file
+        (<code id="cfg-path">–</code>) and applied live where possible.
+        Settings tagged <span class="restart-tag">restart required</span>
+        are written to disk but only take effect after a service restart.
+        TOML comments are not preserved when the file is rewritten.
+      </p>
+
+      <form id="form-real" class="cfg-form" data-section="real_shelly">
+        <h3>Real Shelly</h3>
+        <div class="form-grid">
+          <label>Host (IP)
+            <input name="host" type="text" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>UDP port
+            <input name="udp_port" type="number" min="1" max="65535" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>Poll interval (ms)
+            <input name="poll_interval_ms" type="number" min="50" max="60000" required>
+          </label>
+          <label>Request timeout (ms)
+            <input name="request_timeout_ms" type="number" min="50" max="60000" required>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary">Save</button>
+          <span class="form-status"></span>
+        </div>
+      </form>
+
+      <form id="form-virtual" class="cfg-form" data-section="virtual_shelly">
+        <h3>Virtual Shelly</h3>
+        <div class="form-grid">
+          <label>Bind interface
+            <input name="bind_interface" type="text" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>UDP port
+            <input name="udp_port" type="number" min="1" max="65535" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>HTTP port
+            <input name="http_port" type="number" min="1" max="65535" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>Min sample period (ms)
+            <input name="min_sample_period_ms" type="number" min="0" max="60000" required>
+          </label>
+          <label>Device MAC (hex, 12 chars; empty = derive)
+            <input name="device_mac" type="text" pattern="^$|^[0-9A-Fa-f]{12}$">
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>Device hostname (empty = derive)
+            <input name="device_hostname" type="text">
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>Firmware version
+            <input name="firmware" type="text" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary">Save</button>
+          <span class="form-status"></span>
+        </div>
+      </form>
+
+      <form id="form-management" class="cfg-form" data-section="management">
+        <h3>Management UI</h3>
+        <div class="form-grid">
+          <label>Bind address (host:port)
+            <input name="bind_address" type="text" required>
+            <span class="restart-tag">restart required</span>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary">Save</button>
+          <span class="form-status"></span>
+        </div>
+      </form>
+
+      <form id="form-dispatcher" class="cfg-form" data-section="dispatcher">
+        <h3>Dispatcher (saldierender Passthrough)</h3>
+        <p class="hint">
+          The CT readings are forwarded to each battery scaled by its
+          weighted share (sums to 1.0 across eligible batteries). The
+          inverter's own control loop drives its output to compensate.
+          <strong>Important:</strong> ensure each battery's hardware
+          discharge / charge limit is set to the same value as
+          <code>max_charge_w</code> / <code>max_discharge_w</code> in
+          its config — otherwise the wiring protection enforced here
+          may not match what the inverter will actually deliver.
+        </p>
+        <div class="form-grid">
+          <label>Strategy
+            <select name="strategy" required>
+              <option value="equal">equal</option>
+              <option value="by_capacity">by_capacity</option>
+              <option value="by_soc">by_soc</option>
+              <option value="priority">priority</option>
+            </select>
+          </label>
+          <label>Deadband (W)
+            <input name="deadband_w" type="number" min="0" step="any" required>
+          </label>
+          <label>Rate limit (W/s, 0 = off)
+            <input name="rate_limit_w_per_s" type="number" min="0" step="any" required>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary">Save</button>
+          <span class="form-status"></span>
+        </div>
+      </form>
+
+      <form id="form-safety" class="cfg-form" data-section="safety">
+        <h3>Safety (persisted defaults)</h3>
+        <p class="hint">
+          These values are written to the TOML file. The runtime cap
+          (visible on the Safety tab) is updated live unless a Web UI
+          override is currently active — in that case use the
+          “Reset to config default” button on the Safety tab to apply.
+        </p>
+        <div class="form-grid">
+          <label>max_total_w
+            <input name="max_total_w" type="number" min="0" max="20000" step="any" required>
+          </label>
+          <label class="checkbox">
+            <input name="acknowledged_higher_risk" type="checkbox">
+            <span>acknowledged_higher_risk</span>
+          </label>
+          <label class="checkbox">
+            <input name="acknowledged_separate_fuses" type="checkbox">
+            <span>acknowledged_separate_fuses</span>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary">Save</button>
+          <span class="form-status"></span>
+        </div>
+      </form>
+
+      <div class="cfg-form" id="form-groups-wrap">
+        <h3>Groups</h3>
+        <p class="hint">
+          A group caps the sum of its members' allocations (e.g. a
+          shared B16 fuse). Cap = phases × fuse_amps × voltage.
+        </p>
+        <table class="editor-table">
+          <thead>
+            <tr><th>id</th><th>fuse_amps</th><th>phases</th><th>voltage</th><th>cap (W)</th><th></th></tr>
+          </thead>
+          <tbody id="groups-body"></tbody>
+        </table>
+        <div class="form-actions">
+          <button type="button" class="secondary" id="btn-add-group">+ Add group</button>
+          <button type="button" class="primary" id="btn-save-groups">Save groups</button>
+          <span class="form-status" id="status-groups"></span>
+        </div>
+      </div>
+
+      <div class="cfg-form" id="form-batteries-wrap">
+        <h3>Batteries</h3>
+        <p class="hint">
+          Each battery is identified by its IP address. Adding/removing
+          batteries or changing <code>marstek_port</code> requires a
+          restart; other fields apply live.
+        </p>
+        <div id="batteries-list"></div>
+        <div class="form-actions">
+          <button type="button" class="secondary" id="btn-add-battery">+ Add battery</button>
+          <button type="button" class="primary" id="btn-save-batteries">Save batteries</button>
+          <span class="form-status" id="status-batteries"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Override flow modals -->
+  <div id="modal-1" class="modal">
+    <div class="modal-content">
+      <h3>Step 1 of 2 — Risk acknowledged?</h3>
+      <p>
+        Raising the safety cap above 3000&nbsp;W can cause
+        <strong>overload, damage to your wiring, or — in the worst case —
+        fire</strong> if the installation is not rated for the higher load
+        or if multiple batteries share an undersized protective device.
+      </p>
+      <p>
+        The multiplexer cannot inspect your wiring. The responsibility
+        is entirely yours.
+      </p>
+      <div class="modal-actions">
+        <button class="secondary" data-action="cancel">Cancel</button>
+        <button class="primary" data-action="step1-ok">I understand, continue</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-2" class="modal">
+    <div class="modal-content">
+      <h3>Step 2 of 2 — Each battery on its own breaker?</h3>
+      <p>
+        Confirm that <strong>every battery is on its own, adequately
+        rated protective device</strong> (MCB / RCD). No two batteries
+        may share a protective device whose rated current is below the
+        sum of their potential output.
+      </p>
+      <div class="form-row">
+        <label>New cap (watts):</label>
+        <input type="number" id="new-cap-input" min="3000" max="20000" step="100" value="5000">
+      </div>
+      <div class="modal-actions">
+        <button class="secondary" data-action="cancel">Cancel</button>
+        <button class="primary" data-action="step2-ok">Confirm &amp; activate</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

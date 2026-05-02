@@ -1,0 +1,9 @@
+/target
+*.log
+config.toml
+config.local.toml
+config.test.toml
+.idea/
+.vscode/
+# Third-party reference material kept locally (not redistributed).
+/reference/

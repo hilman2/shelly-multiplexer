@@ -1,0 +1,24 @@
+---
+configuration:
+  real_shelly_host:
+    name: Real Shelly host (IP)
+    description: >-
+      The IP address of your real Shelly Pro 3EM. The multiplexer polls
+      it for the per-phase grid power.
+  real_shelly_udp_port:
+    name: Real Shelly UDP-RPC port
+    description: >-
+      The UDP-RPC port the real Shelly is reachable on. Must NOT be 1010
+      (the default) because the multiplexer itself binds 1010 to look
+      like a Shelly to the batteries. Reconfigure the real Shelly via
+      "Settings → Advanced → Outbound RPC / UDP RPC" first.
+  log_level:
+    name: Log level
+    description: >-
+      Verbosity of the multiplexer's log output. "info" is fine for
+      normal operation; "debug" surfaces every dispatcher tick and
+      battery poll.
+network:
+  "1010/udp": Virtual Shelly UDP-RPC (batteries poll this)
+  "80/tcp": Virtual Shelly HTTP/REST (Shelly clients poll this)
+  "8080/tcp": Admin UI (exposed via Ingress, do not publish)

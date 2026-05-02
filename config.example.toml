@@ -1,0 +1,128 @@
+# ShellyMultiplexer — example configuration
+#
+# Before starting the multiplexer the real Shelly Pro 3EM MUST be moved
+# off the default UDP-RPC port 1010 (here: 2020) so the multiplexer can
+# bind 1010 itself without colliding with the real device.
+#
+# In the Shelly: Settings -> Advanced -> Outbound RPC / UDP RPC.
+
+[real_shelly]
+# IP of the real Shelly Pro 3EM
+host = "192.168.1.50"
+# Reconfigured UDP-RPC port on the real Shelly
+udp_port = 2020
+# How often the multiplexer polls the real Shelly
+poll_interval_ms = 250
+# Timeout per poll
+request_timeout_ms = 1000
+
+[virtual_shelly]
+# Interface the virtual Shelly listens on; 0.0.0.0 = all
+bind_interface = "0.0.0.0"
+# Standard Shelly UDP-RPC port — batteries expect 1010
+udp_port = 1010
+# HTTP port for REST/RPC endpoints (REST: /shelly, /settings; RPC: /rpc)
+http_port = 80
+# Minimum spacing between two responses to the same client (throttling)
+min_sample_period_ms = 1000
+# Device identification
+device_mac = ""        # empty = derive from primary NIC
+device_hostname = ""   # empty = "shellypro3em-<MAC>"
+firmware = "1.4.4"
+
+[management]
+# Separate port for the web UI and management API. Kept distinct from
+# the virtual Shelly so the UI is reachable even when the virtual Shelly
+# binds port 80.
+bind_address = "0.0.0.0:8080"
+
+[dispatcher]
+# Allocation strategy:
+#   "equal"        – every battery in the group gets the same share
+#   "by_capacity"  – proportional to max charge / discharge limits
+#   "by_soc"       – discharging: prefer higher SoC; charging: prefer lower
+#   "priority"     – priority-tiered, lower number = first
+strategy = "equal"
+
+# Max change in allocated power per second per battery.
+# 0 disables the limit. 500-1500 W/s is a sensible anti-oscillation range.
+rate_limit_w_per_s = 1000
+
+# Don't split grid imports/exports below this threshold (deadband, watts)
+deadband_w = 30
+
+[safety]
+# Global hard cap on the absolute sum of all battery allocations
+# (charging + discharging share the same cap).
+#
+# DEFAULT 3000 W. Going higher requires BOTH acknowledgement flags
+# below to be true AND every battery to be on its own protective device.
+# A runtime override via the web UI is also possible but is not
+# persisted across restarts.
+max_total_w = 3000
+acknowledged_higher_risk = false
+acknowledged_separate_fuses = false
+
+# --- Groups ---
+# A group caps the sum of allocations of its member batteries (e.g. a
+# shared B16 fuse). Batteries with no group assignment are uncapped.
+
+[[groups]]
+id = "basement"
+fuse_amps = 16
+phases = 1            # 1 = single-phase, 3 = three-phase
+voltage = 230
+# -> cap = 1 * 16 * 230 = 3680 W
+
+[[groups]]
+id = "garage"
+fuse_amps = 16
+phases = 3
+voltage = 230
+# -> cap = 3 * 16 * 230 = 11040 W
+
+# --- Batteries ---
+# Each battery is identified by its IP address. In the battery itself
+# point the "Shelly IP" setting at the multiplexer's IP.
+
+[[batteries]]
+id = "marstek-basement-1"
+address = "192.168.1.51"
+vendor = "marstek"
+group = "basement"
+phase = "a"             # informational — saldierende inverters react to total, not per-phase
+max_charge_w = 2500
+max_discharge_w = 2500
+# SoC window — outside this range the battery is excluded from the
+# corresponding direction. Required: telemetry must be reachable.
+min_soc_percent = 12
+max_soc_percent = 100
+priority = 1
+marstek_port = 30000        # Marstek Open API UDP port (default 30000)
+telemetry_interval_ms = 60000
+
+[[batteries]]
+id = "marstek-basement-2"
+address = "192.168.1.52"
+vendor = "marstek"
+group = "basement"
+phase = "a"
+max_charge_w = 2500
+max_discharge_w = 2500
+min_soc_percent = 12
+max_soc_percent = 100
+priority = 1
+marstek_port = 30000
+telemetry_interval_ms = 60000
+
+[[batteries]]
+id = "hoymiles-garage-1"
+address = "192.168.1.61"
+vendor = "hoymiles"
+group = "garage"
+phase = "all"
+max_charge_w = 1920
+max_discharge_w = 1920
+min_soc_percent = 12
+max_soc_percent = 100
+priority = 2

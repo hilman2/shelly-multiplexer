@@ -1,0 +1,15 @@
+---
+# Per-architecture base images. Debian-based so we have glibc for the
+# Rust binary; Alpine would force musl, which our deps build against
+# fine but locks us to a smaller toolchain. Debian-bookworm is the
+# current stable HA base.
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-debian:bookworm
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+  armv7: ghcr.io/home-assistant/armv7-base-debian:bookworm
+
+labels:
+  org.opencontainers.image.title: "Shelly Multiplexer"
+  org.opencontainers.image.description: "Saldierende Verteilung einer Shelly-Pro-3EM-Messung auf mehrere Batteriespeicher."
+  org.opencontainers.image.source: "https://github.com/hilman2/shelly-multiplexer"
+  org.opencontainers.image.licenses: "Apache-2.0"
