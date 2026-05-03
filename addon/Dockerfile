@@ -4,7 +4,7 @@ ARG BUILD_FROM
 # Home Assistant build system invokes us once per architecture with the
 # matching BUILD_FROM, so a plain `cargo build` ends up with the right
 # binary without any cross-toolchain juggling.
-FROM rust:1.85-bookworm AS builder
+FROM rust:1-bookworm AS builder
 WORKDIR /src
 
 # Cache dependencies first so source-only edits don't re-download crates.

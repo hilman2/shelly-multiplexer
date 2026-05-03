@@ -2,7 +2,7 @@
 name = "shelly-multiplexer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 description = "Splits one Shelly 3EM grid measurement across multiple battery storage systems with group/fuse-aware load allocation"
 license = "Apache-2.0"
 
