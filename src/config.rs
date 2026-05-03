@@ -54,7 +54,12 @@ impl Default for HomeAssistantConfig {
 }
 
 fn default_ha_url() -> String {
-    "http://supervisor/core/api".into()
+    // We always run with host_network: true (HA add-on) or on
+    // separate hardware — never inside the hassio bridge — so the
+    // `supervisor` hostname is never resolvable. Default to the
+    // mDNS host name HA-OS publishes; user can override with a raw
+    // IP for setups where mDNS doesn't reach.
+    "http://homeassistant.local:8123/api".into()
 }
 
 fn default_ha_timeout_ms() -> u64 {

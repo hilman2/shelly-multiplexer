@@ -276,9 +276,21 @@ pub fn persist_results(
         }
     }
     let toml = toml::to_string_pretty(&new_cfg).context("serialise updated config")?;
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir {}", parent.display()))?;
+    }
     let tmp = config_path.with_extension("toml.tmp");
-    std::fs::write(&tmp, toml).context("write tmp")?;
-    std::fs::rename(&tmp, config_path).context("rename")?;
+    info!(
+        path = %config_path.display(),
+        results = results.len(),
+        bytes = toml.len(),
+        "persisting phase-detection results"
+    );
+    std::fs::write(&tmp, toml).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .with_context(|| format!("rename to {}", config_path.display()))?;
     config_swap.store(Arc::new(new_cfg));
+    info!(path = %config_path.display(), "phase-detection results persisted");
     Ok(())
 }

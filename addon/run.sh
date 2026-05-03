@@ -68,16 +68,26 @@ acknowledged_separate_fuses = false
 [home_assistant]
 # Set enabled = true and add `soc_entity_id = "sensor.xyz"` to a
 # battery to read SoC from HA instead of polling the inverter
-# directly — useful when an HA integration already owns the
-# inverter's UDP port. The token is injected at runtime from
-# \$SUPERVISOR_TOKEN, so leave it blank in the file.
+# directly. The token is injected at runtime from \$SUPERVISOR_TOKEN,
+# so leave it blank here. The URL must be reachable from the add-on
+# container — with host_network: true (the only mode we run in) the
+# hassio "supervisor" alias does NOT resolve, so we hit HA Core
+# directly. Replace homeassistant.local with the host's IP if your
+# network doesn't do mDNS.
 enabled = false
-url = "http://supervisor/core/api"
+url = "http://homeassistant.local:8123/api"
 token = ""
 timeout_ms = 3000
 EOF
 else
-    bashio::log.info "Reusing existing /data/config.toml (real_shelly host/port from HA options)."
+    bashio::log.info "Reusing existing /config/config.toml (real_shelly host/port from HA options)."
+    # Migrate the obsolete supervisor URL: with host_network the
+    # supervisor hostname doesn't resolve from this container, so
+    # any persisted config still pointing at it can never reach HA.
+    if grep -qF 'http://supervisor/core/api' "${CONFIG_FILE}"; then
+        bashio::log.info "Rewriting deprecated 'http://supervisor/core/api' to direct HA URL."
+        sed -i 's|http://supervisor/core/api|http://homeassistant.local:8123/api|g' "${CONFIG_FILE}"
+    fi
 fi
 
 export RUST_LOG="shelly_multiplexer=${LOG_LEVEL},${LOG_LEVEL}"

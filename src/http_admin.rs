@@ -376,12 +376,25 @@ async fn api_reset_safety(State(ctx): State<AdminCtx>) -> impl IntoResponse {
 
 async fn api_get_config(State(ctx): State<AdminCtx>) -> impl IntoResponse {
     let cfg = ctx.config.load_full();
+    // Serialize home_assistant separately so we can blank the token —
+    // the GUI's Save flow round-trips this value, and we don't want
+    // a SUPERVISOR_TOKEN materialised into the on-disk file via the
+    // browser. The user can paste their own long-lived token instead.
+    let mut ha = serde_json::to_value(&cfg.home_assistant).unwrap_or(json!({}));
+    if let Some(obj) = ha.as_object_mut() {
+        if std::env::var("SUPERVISOR_TOKEN").ok().as_deref()
+            == Some(cfg.home_assistant.token.as_str())
+        {
+            obj.insert("token".into(), json!(""));
+        }
+    }
     Json(json!({
         "real_shelly": &cfg.real_shelly,
         "virtual_shelly": &cfg.virtual_shelly,
         "management": &cfg.management,
         "dispatcher": &cfg.dispatcher,
         "safety": &cfg.safety,
+        "home_assistant": ha,
         "groups": &cfg.groups,
         "batteries": &cfg.batteries,
         "config_path": ctx.config_path.display().to_string(),
@@ -447,16 +460,27 @@ async fn apply_full_config(ctx: &AdminCtx, new_cfg: Config) -> Response {
         }
     };
 
-    // Write atomically: create a sibling tmp file, then rename. On
-    // Windows this is best-effort (rename across an existing file works
-    // since Rust 1.52 via MoveFileExW + MOVEFILE_REPLACE_EXISTING).
+    // Write atomically: create a sibling tmp file, then rename.
     let path = &ctx.config_path;
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(dir = %parent.display(), error = %e, "config dir mkdir failed");
+        return server_error(format!("mkdir {}: {e}", parent.display()));
+    }
     let tmp = path.with_extension("toml.tmp");
+    info!(
+        path = %path.display(),
+        bytes = serialized.len(),
+        "writing config"
+    );
     if let Err(e) = std::fs::write(&tmp, &serialized) {
+        warn!(path = %tmp.display(), error = %e, "config write failed");
         return server_error(format!("writing {}: {e}", tmp.display()));
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
+        warn!(path = %path.display(), error = %e, "config rename failed");
         return server_error(format!("renaming to {}: {e}", path.display()));
     }
     info!(path = %path.display(), "config saved via admin UI");

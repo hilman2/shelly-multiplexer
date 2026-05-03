@@ -103,11 +103,24 @@ async fn main() -> Result<()> {
         if std::env::var("SUPERVISOR_TOKEN").ok().as_deref() == Some(for_disk.home_assistant.token.as_str()) {
             for_disk.home_assistant.token.clear();
         }
-        if let Ok(toml) = toml::to_string_pretty(&for_disk) {
-            let tmp = cli.config.with_extension("toml.tmp");
-            if std::fs::write(&tmp, toml).is_ok() {
-                let _ = std::fs::rename(&tmp, &cli.config);
+        match toml::to_string_pretty(&for_disk) {
+            Ok(toml) => {
+                let tmp = cli.config.with_extension("toml.tmp");
+                if let Err(e) = std::fs::write(&tmp, &toml) {
+                    error!(path = %tmp.display(), error = %e, "CLI-override write failed");
+                } else if let Err(e) = std::fs::rename(&tmp, &cli.config) {
+                    error!(
+                        from = %tmp.display(),
+                        to = %cli.config.display(),
+                        error = %e,
+                        "CLI-override rename failed"
+                    );
+                    let _ = std::fs::remove_file(&tmp);
+                } else {
+                    info!(path = %cli.config.display(), "CLI overrides persisted to config");
+                }
             }
+            Err(e) => error!(error = %e, "CLI-override serialise failed"),
         }
     }
 

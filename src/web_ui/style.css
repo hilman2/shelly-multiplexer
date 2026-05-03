@@ -226,6 +226,29 @@ td.num,
   color: var(--negative);
 }
 
+/* Fixed-layout column widths — sums to 100%. Without this, browsers
+ * auto-size columns based on header text vs cell content and the
+ * narrow ones (Status, Note) collapse to the cell's width while wide
+ * ones (Allocated header is 13 chars) inflate, making it look like
+ * cells are in the wrong column. With table-layout:fixed every cell
+ * sits exactly under its <col>. */
+table.alloc {
+  table-layout: fixed;
+}
+table.alloc .col-battery { width: 12%; }
+table.alloc .col-ip      { width: 12%; }
+table.alloc .col-group   { width: 8%; }
+table.alloc .col-soc     { width: 7%; }
+table.alloc .col-socage  { width: 8%; }
+table.alloc .col-alloc   { width: 12%; }
+table.alloc .col-status  { width: 14%; }
+table.alloc .col-note    { width: 17%; }
+table.alloc .col-last    { width: 10%; }
+table.alloc td, table.alloc th {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .alloc-note {
   display: inline-block;
   margin-left: 8px;

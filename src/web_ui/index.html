@@ -104,6 +104,17 @@
         battery and used to gate charge / discharge eligibility.
       </p>
       <table class="alloc">
+        <colgroup>
+          <col class="col-battery">
+          <col class="col-ip">
+          <col class="col-group">
+          <col class="col-soc">
+          <col class="col-socage">
+          <col class="col-alloc">
+          <col class="col-status">
+          <col class="col-note">
+          <col class="col-last">
+        </colgroup>
         <thead>
           <tr>
             <th>Battery</th>
@@ -325,15 +336,27 @@
           Optional: read battery SoC from HA entities instead of
           polling the inverter directly. Useful when an HA integration
           (e.g. a Marstek HACS plugin) already owns the inverter's UDP
-          port. Inside the HA add-on the URL defaults to
-          <code>http://supervisor/core/api</code> and the token is
-          injected automatically; for standalone use, paste a
-          long-lived access token here.
+          port. The URL must be reachable from the add-on container —
+          we always run with <code>host_network: true</code>, so the
+          hassio-internal <code>http://supervisor/core/api</code>
+          alias does <strong>not</strong> resolve. Use
+          <code>http://homeassistant.local:8123/api</code> (HA-OS mDNS
+          name) or replace with the HA host's IP if mDNS doesn't
+          work for you. Token can be left blank inside the add-on —
+          it's then taken from <code>$SUPERVISOR_TOKEN</code>, which
+          HA Core accepts as a Bearer token directly.
+        </p>
+        <p class="hint">
+          <strong>All HA fields take effect only after an add-on
+          restart.</strong> The HA poller spawns its tasks at startup
+          based on the current config; flipping `enabled` or changing
+          `soc_entity_id` while the add-on is running has no effect
+          until the next restart.
         </p>
         <div class="form-grid">
           <label class="checkbox">
             <input name="enabled" type="checkbox">
-            <span>enabled</span>
+            <span>enabled <span class="restart-tag">restart required</span></span>
           </label>
           <label>URL
             <input name="url" type="text" placeholder="http://supervisor/core/api">
