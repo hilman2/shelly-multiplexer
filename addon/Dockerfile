@@ -14,7 +14,12 @@ WORKDIR /src
 # a prior compile. Build incrementality matters less than correctness.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked --bin shelly-multiplexer && \
+# We commit Cargo.lock so the same dependency versions reach
+# everyone, but we don't pass --locked: when the host Cargo writes a
+# newer lockfile format than the CI image's Cargo expects, --locked
+# refuses to even open it. Without --locked, Cargo silently rewrites
+# in-place while keeping the resolved versions identical.
+RUN cargo build --release --bin shelly-multiplexer && \
     strip target/release/shelly-multiplexer && \
     ls -lh target/release/shelly-multiplexer
 
