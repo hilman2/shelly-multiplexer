@@ -35,6 +35,31 @@ header {
 
 header h1 { margin: 0; font-size: 20px; font-weight: 600; }
 
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.brand-icon {
+  width: 36px;
+  height: 36px;
+  color: var(--fg-dim); /* trunk + bus lines pick this up via currentColor */
+  flex-shrink: 0;
+}
+.brand-icon .brand-batteries rect {
+  fill: none;
+  stroke: var(--fg);
+  stroke-width: 1.5;
+}
+.brand-shelly {
+  transform-origin: 32px 10px;
+  animation: brand-pulse 2.4s ease-in-out infinite;
+}
+@keyframes brand-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.55; transform: scale(0.85); }
+}
+
 .meta {
   font-size: 13px;
   color: var(--fg-dim);
@@ -669,6 +694,7 @@ table.editor-table tr {
     padding: 10px 14px;
   }
   header h1 { font-size: 17px; }
+  .brand-icon { width: 30px; height: 30px; }
   .meta { font-size: 12px; flex-wrap: wrap; }
 
   nav { padding: 0 8px; }
