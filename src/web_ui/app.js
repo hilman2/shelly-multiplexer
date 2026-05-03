@@ -196,6 +196,14 @@ async function refresh() {
         ? `<span title="${escape(a.soc_error)}" style="color:var(--positive)">err</span>`
         : fmtPct(a.soc_percent);
       const noteCell = a.note ? `<span class="alloc-note">${escape(a.note)}</span>` : "";
+      let stuckCell = "<span class=\"ok-tag\">ok</span>";
+      if (a.stuck_direction === "charging") {
+        stuckCell = `<span class="restart-tag" title="${a.stuck_events_in_window} events in 10-min window">stuck (charge)</span>`;
+      } else if (a.stuck_direction === "discharging") {
+        stuckCell = `<span class="restart-tag" title="${a.stuck_events_in_window} events in 10-min window">stuck (discharge)</span>`;
+      } else if (a.stuck_events_in_window === 0) {
+        stuckCell = `<span style="color:var(--fg-dim)" title="no recent step events">–</span>`;
+      }
       tr.innerHTML = `
         <td>${escape(a.battery_id)}</td>
         <td>${escape(a.address)}</td>
@@ -203,6 +211,7 @@ async function refresh() {
         <td class="num">${socCell}</td>
         <td>${fmtAge(a.soc_age_ms)}</td>
         <td class="num"><strong>${fmtPower(a.allocated_w)}</strong></td>
+        <td>${stuckCell}</td>
         <td>${noteCell}</td>
         <td>${fmtAge(a.last_request_ms_ago)}</td>
       `;
@@ -635,6 +644,82 @@ els.btnReset.addEventListener("click", async () => {
     showToast("Error: " + e.message, "error");
   }
 });
+
+// === Phase detection ===
+
+const btnPhaseDetect = document.getElementById("btn-phase-detect");
+const phaseDetectStatus = document.getElementById("phase-detect-status");
+const phaseDetectResults = document.getElementById("phase-detect-results");
+
+if (btnPhaseDetect) {
+  btnPhaseDetect.addEventListener("click", async () => {
+    if (!confirm(
+      "This pauses normal dispatch and drives each battery alone for ~50 s.\n" +
+      "Make sure no critical loads depend on grid balance right now.\n\nProceed?"
+    )) return;
+    btnPhaseDetect.disabled = true;
+    setStatus(phaseDetectStatus, "Starting…", null);
+    try {
+      const res = await fetch(api("/api/phase-detect"), { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(phaseDetectStatus, "Error: " + (data.error || res.status), "error");
+        btnPhaseDetect.disabled = false;
+        return;
+      }
+      pollPhaseDetect();
+    } catch (e) {
+      setStatus(phaseDetectStatus, "Network error: " + e.message, "error");
+      btnPhaseDetect.disabled = false;
+    }
+  });
+}
+
+async function pollPhaseDetect() {
+  try {
+    const res = await fetch(api("/api/phase-detect"), { cache: "no-store" });
+    const s = await res.json();
+    renderDetectStatus(s);
+    if (s.running) {
+      setTimeout(pollPhaseDetect, 1000);
+    } else {
+      btnPhaseDetect.disabled = false;
+      // Reload config so the new detected_phase shows in the battery cards.
+      loadConfig();
+    }
+  } catch (e) {
+    setStatus(phaseDetectStatus, "Status error: " + e.message, "error");
+    btnPhaseDetect.disabled = false;
+  }
+}
+
+function renderDetectStatus(s) {
+  const msg = s.message || (s.running ? "running…" : "idle");
+  setStatus(phaseDetectStatus, msg, s.last_error ? "error" : (s.running ? null : "success"));
+  if (!phaseDetectResults) return;
+  const rows = Object.entries(s.results || {}).map(([id, r]) => {
+    const pct = (r.confidence * 100).toFixed(0) + "%";
+    const cls = r.confidence > 0.6 ? "" : "low-conf";
+    return `<tr class="${cls}">
+      <td>${escape(id)}</td>
+      <td>${escape(r.phase)}</td>
+      <td class="num">${pct}</td>
+      <td class="num">${fmtPower(r.delta_a_w)}</td>
+      <td class="num">${fmtPower(r.delta_b_w)}</td>
+      <td class="num">${fmtPower(r.delta_c_w)}</td>
+      <td>${escape(r.detected_at)}</td>
+    </tr>`;
+  }).join("");
+  phaseDetectResults.innerHTML = rows
+    ? `<table class="alloc"><thead><tr>
+         <th>Battery</th><th>Phase</th><th>Confidence</th>
+         <th>Δ L1</th><th>Δ L2</th><th>Δ L3</th><th>Detected at</th>
+       </tr></thead><tbody>${rows}</tbody></table>`
+    : "";
+}
+
+// On load, fetch any persisted detection state once so previous results are visible.
+fetch(api("/api/phase-detect")).then(r => r.json()).then(renderDetectStatus).catch(() => {});
 
 refresh();
 loadConfig();

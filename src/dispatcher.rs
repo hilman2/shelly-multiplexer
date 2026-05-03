@@ -70,6 +70,11 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) {
 
     loop {
         interval.tick().await;
+        // Phase-detection drives allocations directly; the dispatcher
+        // must keep its hands off so the probe signal is clean.
+        if state.detection_active.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
         let cfg = config.load_full();
         let now = Instant::now();
         let dt_s = now.saturating_duration_since(last_tick).as_secs_f64();

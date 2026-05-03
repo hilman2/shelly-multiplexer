@@ -88,12 +88,29 @@
             <th>SoC</th>
             <th>SoC age</th>
             <th title="+ = battery should discharge; − = battery should charge">Allocated (W)</th>
+            <th title="Passive 10-min responsiveness verdict">Status</th>
             <th>Note</th>
             <th>Last request</th>
           </tr>
         </thead>
         <tbody id="alloc-body"></tbody>
       </table>
+
+      <div class="cfg-form" id="phase-detect-card">
+        <h3>Phase detection</h3>
+        <p class="hint">
+          Briefly drives each battery alone to detect which CT phase it
+          sits on. <strong>Pauses normal dispatch</strong> for ~50&nbsp;s
+          per battery — kick it off when nothing critical is happening
+          on the grid. Result is persisted to <code>config.toml</code>
+          and used by the stuck detector and (later) by smarter routing.
+        </p>
+        <div class="form-actions">
+          <button type="button" class="primary" id="btn-phase-detect">Detect phases now</button>
+          <span class="form-status" id="phase-detect-status"></span>
+        </div>
+        <div id="phase-detect-results"></div>
+      </div>
     </section>
 
     <section id="view-safety" class="view">

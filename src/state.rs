@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -88,6 +89,15 @@ pub struct AppState {
     /// Not persisted on purpose: a restart resets to the TOML value, so
     /// an emergency reboot always lands on a known-safe configuration.
     pub safety: RwLock<RuntimeSafety>,
+    /// True while phase-detection is actively driving batteries — the
+    /// dispatcher skips its loop in this case so it doesn't fight the
+    /// detection routine.
+    pub detection_active: AtomicBool,
+    /// Rolling 10-minute responsiveness statistics per battery, used
+    /// for passive "stuck" detection. Updated by the dispatcher
+    /// whenever it issues a non-trivial command and observes the CT
+    /// reaction.
+    pub responsiveness: RwLock<HashMap<String, ResponsivenessTracker>>,
     pub started_at: Instant,
 }
 
@@ -116,6 +126,52 @@ impl RuntimeSafety {
     pub fn override_active(&self) -> bool {
         self.effective_cap_w > SAFETY_DEFAULT_CAP_W
     }
+}
+
+/// Rolling-window evidence of how well one battery is responding to
+/// the dispatcher's commands. We don't have direct telemetry of
+/// *what the inverter actually does*, so the heuristic is: whenever
+/// we issue a step change in factor, the CT phase that the battery
+/// sits on should react proportionally a few seconds later. If many
+/// such expected reactions don't materialise over a 10-minute window,
+/// the battery is probably saturated (full when charging, empty when
+/// discharging — or just hung).
+///
+/// This struct holds raw observations; the verdict (stuck / fine /
+/// unknown) is computed on demand from them.
+#[derive(Debug, Clone, Default)]
+pub struct ResponsivenessTracker {
+    pub battery_id: String,
+    /// Append-only ring of recent step events. Pruned to the last
+    /// 10 minutes on every insert.
+    pub events: std::collections::VecDeque<StepEvent>,
+    /// Direction the battery is currently believed to be stuck in,
+    /// derived once per minute by the dispatcher.
+    pub stuck_direction: Option<StuckDirection>,
+    /// When the verdict was last refreshed.
+    pub last_verdict_at: Option<Instant>,
+}
+
+/// One recorded "we asked for a change of X W and saw a CT swing of Y W"
+/// observation. Compared against an expected swing range to score it.
+#[derive(Debug, Clone, Copy)]
+pub struct StepEvent {
+    pub at: Instant,
+    /// Direction expected (charging = negative target, discharging = positive).
+    pub direction: StuckDirection,
+    /// Magnitude of the *commanded* step in W (always positive; the
+    /// direction field carries the sign).
+    pub commanded_step_w: f64,
+    /// Magnitude of the observed CT swing on the assigned phase, also
+    /// always positive.
+    pub observed_step_w: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StuckDirection {
+    Charging,
+    Discharging,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -168,6 +224,8 @@ impl AppState {
             telemetry: RwLock::new(HashMap::new()),
             energy: RwLock::new(EnergyCounters::default()),
             safety: RwLock::new(RuntimeSafety::from_config(safety)),
+            detection_active: AtomicBool::new(false),
+            responsiveness: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
         })
     }

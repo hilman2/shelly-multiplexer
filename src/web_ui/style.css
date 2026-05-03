@@ -551,6 +551,106 @@ button:active { transform: translateY(1px); }
   font-weight: 600;
 }
 
+.ok-tag {
+  display: inline-block;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 99px;
+  color: var(--negative);
+  border: 1px solid rgba(81, 207, 102, 0.4);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+tr.low-conf td {
+  color: var(--warn);
+}
+
+/* === Responsive layout =================================================== */
+
+/* Wrap tables that have many columns so they scroll horizontally on
+ * narrow screens instead of overflowing the viewport. */
+table.alloc,
+table.energy,
+table.editor-table {
+  display: block;
+  overflow-x: auto;
+  white-space: nowrap;
+  max-width: 100%;
+}
+table.alloc thead,
+table.alloc tbody,
+table.alloc tr,
+table.energy thead,
+table.energy tbody,
+table.energy tr,
+table.editor-table thead,
+table.editor-table tbody,
+table.editor-table tr {
+  display: table;
+  width: 100%;
+  table-layout: auto;
+}
+
+@media (max-width: 720px) {
+  main { padding: 14px; }
+
+  header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 10px 14px;
+  }
+  header h1 { font-size: 17px; }
+  .meta { font-size: 12px; flex-wrap: wrap; }
+
+  nav { padding: 0 8px; }
+  nav button { padding: 10px 12px; font-size: 13px; }
+
+  .phase-grid {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 8px;
+  }
+  .phase { padding: 12px; }
+  .phase .value { font-size: 26px; }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .battery-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 10px;
+  }
+
+  .cfg-form {
+    padding: 14px 16px;
+  }
+
+  .cap-headline { flex-direction: column; gap: 12px; }
+  .cap-value { font-size: 32px; }
+
+  .modal-content {
+    max-width: 100%;
+    padding: 18px;
+  }
+
+  .form-row { flex-direction: column; align-items: stretch; gap: 4px; }
+  .form-row label { min-width: auto; }
+  .form-row input[type="number"] { width: 100%; }
+
+  table th, table td { padding: 8px 10px; }
+
+  .actions { flex-wrap: wrap; }
+}
+
+@media (max-width: 480px) {
+  .battery-grid { grid-template-columns: 1fr; }
+  .phase-grid { grid-template-columns: 1fr 1fr; }
+  .ack-grid { grid-template-columns: 1fr; }
+}
+
 .editor-table {
   margin-bottom: 12px;
 }

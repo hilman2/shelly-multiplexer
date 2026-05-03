@@ -11,7 +11,8 @@ use tracing_subscriber::EnvFilter;
 use shelly_multiplexer::config::Config;
 use shelly_multiplexer::state::AppState;
 use shelly_multiplexer::{
-    dispatcher, ha, http_admin, http_shelly, marstek, mdns, real_shelly, virtual_shelly,
+    dispatcher, ha, http_admin, http_shelly, marstek, mdns, real_shelly, stuck_detect,
+    virtual_shelly,
 };
 
 #[derive(Parser, Debug)]
@@ -162,6 +163,16 @@ async fn main() -> Result<()> {
         tasks.spawn(async move {
             let r = ha::run(s, c).await;
             log_task_exit("ha", r);
+        });
+    }
+
+    // Passive stuck detector (10-min rolling window per battery).
+    {
+        let s = state.clone();
+        let c = cfg_swap.clone();
+        tasks.spawn(async move {
+            let r = stuck_detect::run(s, c).await;
+            log_task_exit("stuck_detect", r);
         });
     }
 

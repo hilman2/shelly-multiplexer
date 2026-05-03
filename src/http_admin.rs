@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::config::{Config, SAFETY_DEFAULT_CAP_W};
+use crate::phase_detect::{self, DetectionStatus, SharedStatus};
 use crate::state::{AppState, RuntimeSafety};
 
 #[derive(Embed)]
@@ -31,6 +32,7 @@ struct AdminCtx {
     state: Arc<AppState>,
     config: Arc<ArcSwap<Config>>,
     config_path: PathBuf,
+    detection_status: SharedStatus,
 }
 
 pub async fn run(
@@ -41,10 +43,14 @@ pub async fn run(
     let bind = config.load().management.bind_address.clone();
     let addr: SocketAddr = bind.parse().with_context(|| format!("parsing {bind}"))?;
 
+    let detection_status: SharedStatus =
+        Arc::new(parking_lot::RwLock::new(DetectionStatus::default()));
+
     let ctx = AdminCtx {
         state: state.clone(),
         config,
         config_path,
+        detection_status,
     };
 
     let router = Router::new()
@@ -54,6 +60,10 @@ pub async fn run(
         .route("/api/config/section/{name}", put(api_put_section))
         .route("/api/safety", get(api_get_safety).post(api_post_safety))
         .route("/api/safety/reset", post(api_reset_safety))
+        .route(
+            "/api/phase-detect",
+            get(api_phase_detect_status).post(api_phase_detect_start),
+        )
         .route("/api/health", get(api_health))
         .route("/{*path}", get(serve_static))
         .with_state(ctx);
@@ -169,6 +179,10 @@ struct AllocationInfo {
     soc_percent: Option<f64>,
     soc_age_ms: Option<u128>,
     soc_error: Option<String>,
+    /// "charging" / "discharging" / null — passive 10-min verdict.
+    stuck_direction: Option<crate::state::StuckDirection>,
+    /// Number of step events in the rolling window.
+    stuck_events_in_window: usize,
 }
 
 #[derive(Serialize)]
@@ -200,10 +214,12 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
     let allocs = ctx.state.allocations.read();
     let last_polls = ctx.state.last_poll_at.read();
     let tel = ctx.state.telemetry.read();
+    let resp = ctx.state.responsiveness.read();
     let allocations: Vec<AllocationInfo> = allocs
         .iter()
         .map(|(ip, a)| {
             let t = tel.get(&a.battery_id);
+            let r = resp.get(&a.battery_id);
             AllocationInfo {
                 battery_id: a.battery_id.clone(),
                 address: ip.to_string(),
@@ -224,11 +240,14 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
                 soc_age_ms: t.and_then(|t| t.last_update)
                     .map(|x| now.saturating_duration_since(x).as_millis()),
                 soc_error: t.and_then(|t| t.last_error.clone()),
+                stuck_direction: r.and_then(|r| r.stuck_direction),
+                stuck_events_in_window: r.map(|r| r.events.len()).unwrap_or(0),
             }
         })
         .collect();
     drop(tel);
     drop(last_polls);
+    drop(resp);
 
     let safety_state = ctx.state.safety.read();
     let safety = SafetyInfo {
@@ -473,4 +492,39 @@ fn server_error(msg: impl Into<String>) -> Response {
 
 async fn api_health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+async fn api_phase_detect_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
+    Json((*ctx.detection_status.read()).clone())
+}
+
+async fn api_phase_detect_start(State(ctx): State<AdminCtx>) -> Response {
+    if ctx.detection_status.read().running {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "phase detection already running"})),
+        )
+            .into_response();
+    }
+    let status = ctx.detection_status.clone();
+    let state = ctx.state.clone();
+    let cfg_swap = ctx.config.clone();
+    let path = ctx.config_path.clone();
+    tokio::spawn(async move {
+        let res = phase_detect::run_all(&state, &cfg_swap, status.clone()).await;
+        match res {
+            Ok(results) => {
+                if let Err(e) = phase_detect::persist_results(&cfg_swap, &path, &results) {
+                    let mut s = status.write();
+                    s.last_error = Some(format!("persist failed: {e:#}"));
+                }
+            }
+            Err(e) => {
+                let mut s = status.write();
+                s.running = false;
+                s.last_error = Some(format!("{e:#}"));
+            }
+        }
+    });
+    Json(json!({"ok": true, "started": true})).into_response()
 }

@@ -278,6 +278,29 @@ pub struct BatteryConfig {
     /// port. Example: `sensor.marstek_venus_e_battery_soc`.
     #[serde(default)]
     pub soc_entity_id: Option<String>,
+    /// Result of the active phase-detection pass. Populated by the
+    /// detection routine and persisted so it survives restarts.
+    /// `phase` here is informational and may differ from the manually
+    /// configured `phase` field above (which is used by group-cap
+    /// estimation when set).
+    #[serde(default)]
+    pub detected_phase: Option<DetectedPhase>,
+}
+
+/// Outcome of a phase-detection probe for one battery.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DetectedPhase {
+    pub phase: PhaseAssignment,
+    /// 0.0 (not detected) to 1.0 (perfectly clear). Below ~0.5 the
+    /// detection should be considered unreliable.
+    pub confidence: f64,
+    /// ISO-8601 timestamp of the detection run.
+    pub detected_at: String,
+    /// Largest signed delta observed on each phase between charge and
+    /// discharge probes — useful for diagnosing low-confidence runs.
+    pub delta_a_w: f64,
+    pub delta_b_w: f64,
+    pub delta_c_w: f64,
 }
 
 fn default_min_soc() -> f64 {
