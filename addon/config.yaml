@@ -1,6 +1,6 @@
 ---
 name: Shelly Multiplexer
-version: "0.1.9"
+version: "0.1.10"
 slug: shelly_multiplexer
 description: >-
   Emulates a Shelly Pro 3EM and saldiert (sum-balances) the real meter's
@@ -26,6 +26,13 @@ host_network: true
 # Used to read battery SoC from HA entities when the user configures
 # `home_assistant.enabled = true` and per-battery `soc_entity_id`.
 homeassistant_api: true
+
+# Mounts /config/ inside the add-on (= /addon_configs/<slug>/ on the
+# HA host) so the user can edit config.toml from the Studio Code Server
+# add-on. /data/ would be private to the add-on and invisible to other
+# add-ons.
+map:
+  - addon_config:rw
 
 # Direct link to the admin UI. HA replaces [HOST]/[PORT:8080] with the
 # host's IP and the configured port. Shows up as "OPEN WEB UI" on the

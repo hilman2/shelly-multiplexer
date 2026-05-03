@@ -2,7 +2,17 @@
 # shellcheck shell=bash
 set -euo pipefail
 
-CONFIG_FILE="/data/config.toml"
+# /config/ inside the container = /addon_configs/<slug>/ on the host,
+# which is visible from the Studio Code Server add-on for hand edits.
+# /data/ was the previous location; migrate transparently if it's still
+# the only one present.
+CONFIG_FILE="/config/config.toml"
+LEGACY_CONFIG="/data/config.toml"
+if [ ! -f "${CONFIG_FILE}" ] && [ -f "${LEGACY_CONFIG}" ]; then
+    bashio::log.info "Migrating config.toml from /data/ to /config/."
+    mkdir -p /config
+    cp "${LEGACY_CONFIG}" "${CONFIG_FILE}"
+fi
 
 # Boot-time options from the HA add-on UI.
 REAL_HOST=$(bashio::config 'real_shelly_host')

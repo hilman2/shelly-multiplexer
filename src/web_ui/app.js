@@ -48,6 +48,7 @@ const els = {
   formManagement: document.getElementById("form-management"),
   formDispatcher: document.getElementById("form-dispatcher"),
   formSafety: document.getElementById("form-safety"),
+  formHa: document.getElementById("form-ha"),
   groupsBody: document.getElementById("groups-body"),
   batteriesList: document.getElementById("batteries-list"),
   btnAddGroup: document.getElementById("btn-add-group"),
@@ -255,6 +256,12 @@ const SECTION_FIELDS = {
     acknowledged_higher_risk: "bool",
     acknowledged_separate_fuses: "bool",
   },
+  home_assistant: {
+    enabled: "bool",
+    url: "string",
+    token: "string",
+    timeout_ms: "int",
+  },
 };
 
 function fillForm(form, section, data) {
@@ -350,6 +357,7 @@ bindSimpleForm(els.formVirtual, "virtual_shelly");
 bindSimpleForm(els.formManagement, "management");
 bindSimpleForm(els.formDispatcher, "dispatcher");
 bindSimpleForm(els.formSafety, "safety");
+bindSimpleForm(els.formHa, "home_assistant");
 
 // --- Groups editor ---
 
@@ -442,6 +450,7 @@ function addBatteryCard(b) {
     priority: 1,
     marstek_port: 30000,
     telemetry_interval_ms: 60000,
+    soc_entity_id: null,
   };
   const groupOptions = (currentConfig?.groups || [])
     .map(g => `<option value="${escape(g.id)}"${b.group === g.id ? " selected" : ""}>${escape(g.id)}</option>`)
@@ -482,6 +491,8 @@ function addBatteryCard(b) {
         <input data-field="marstek_port" type="number" min="1" max="65535" value="${b.marstek_port}"></label>
       <label>telemetry_interval_ms
         <input data-field="telemetry_interval_ms" type="number" min="500" step="100" value="${b.telemetry_interval_ms}"></label>
+      <label>soc_entity_id (HA, optional — overrides direct SoC poll)
+        <input data-field="soc_entity_id" type="text" placeholder="sensor.marstek_venus_e_soc" value="${escape(b.soc_entity_id || "")}"></label>
     </div>
     <div class="form-actions">
       <button type="button" class="secondary card-del">Remove battery</button>
@@ -510,6 +521,7 @@ function readBatteries() {
     const addr = get("address").trim();
     if (!addr) throw new Error("battery " + id + ": address required");
     const groupVal = get("group");
+    const socEntity = get("soc_entity_id").trim();
     out.push({
       id,
       address: addr,
@@ -523,6 +535,7 @@ function readBatteries() {
       priority: getInt("priority"),
       marstek_port: getInt("marstek_port"),
       telemetry_interval_ms: getInt("telemetry_interval_ms"),
+      soc_entity_id: socEntity === "" ? null : socEntity,
     });
   }
   return out;

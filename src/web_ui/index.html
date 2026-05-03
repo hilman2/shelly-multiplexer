@@ -278,6 +278,40 @@
         </div>
       </form>
 
+      <form id="form-ha" class="cfg-form" data-section="home_assistant">
+        <h3>Home Assistant integration</h3>
+        <p class="hint">
+          Optional: read battery SoC from HA entities instead of
+          polling the inverter directly. Useful when an HA integration
+          (e.g. a Marstek HACS plugin) already owns the inverter's UDP
+          port. Inside the HA add-on the URL defaults to
+          <code>http://supervisor/core/api</code> and the token is
+          injected automatically; for standalone use, paste a
+          long-lived access token here.
+        </p>
+        <div class="form-grid">
+          <label class="checkbox">
+            <input name="enabled" type="checkbox">
+            <span>enabled</span>
+          </label>
+          <label>URL
+            <input name="url" type="text" placeholder="http://supervisor/core/api">
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>Token (long-lived access token; leave blank to use SUPERVISOR_TOKEN)
+            <input name="token" type="password" autocomplete="off">
+            <span class="restart-tag">restart required</span>
+          </label>
+          <label>Request timeout (ms)
+            <input name="timeout_ms" type="number" min="100" max="30000" required>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary">Save</button>
+          <span class="form-status"></span>
+        </div>
+      </form>
+
       <div class="cfg-form" id="form-groups-wrap">
         <h3>Groups</h3>
         <p class="hint">
