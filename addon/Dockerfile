@@ -7,16 +7,16 @@ ARG BUILD_FROM
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 
-# Cache dependencies first so source-only edits don't re-download crates.
+# Plain build with sources copied in one go. The previous attempt at a
+# split dependency-prebuild was producing a binary built from the
+# placeholder `fn main() {}` instead of our real source — Cargo doesn't
+# always re-resolve targets when the dummy main/lib are replaced after
+# a prior compile. Build incrementality matters less than correctness.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
-    echo "" > src/lib.rs && \
-    cargo build --release --locked --bin shelly-multiplexer || true && \
-    rm -rf src
-
 COPY src ./src
 RUN cargo build --release --locked --bin shelly-multiplexer && \
-    strip target/release/shelly-multiplexer
+    strip target/release/shelly-multiplexer && \
+    ls -lh target/release/shelly-multiplexer
 
 # ---- Runtime stage --------------------------------------------------------
 FROM ${BUILD_FROM}
