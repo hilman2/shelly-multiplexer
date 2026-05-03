@@ -569,8 +569,9 @@ tr.low-conf td {
 
 /* === Responsive layout =================================================== */
 
-/* Wrap tables that have many columns so they scroll horizontally on
- * narrow screens instead of overflowing the viewport. */
+/* Tables with many columns scroll horizontally as a fallback —
+ * .alloc switches to a stacked card layout on small screens further
+ * below using the data-label attributes the JS sets per cell. */
 table.alloc,
 table.energy,
 table.editor-table {
@@ -591,6 +592,71 @@ table.editor-table tr {
   display: table;
   width: 100%;
   table-layout: auto;
+}
+
+/* On narrow screens turn the battery allocation table into a stack
+ * of cards. Each <tr> becomes a card; each <td> becomes a label/value
+ * row using the data-label attribute as the label. */
+@media (max-width: 720px) {
+  table.alloc {
+    display: block;
+    overflow: visible;
+    background: transparent;
+    border-radius: 0;
+    white-space: normal;
+  }
+  table.alloc thead {
+    display: none;
+  }
+  table.alloc tbody {
+    display: block;
+    width: 100%;
+  }
+  table.alloc tr {
+    display: block;
+    width: 100%;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+  table.alloc tr.live { border-left: 3px solid var(--negative); }
+  table.alloc tr.stale { opacity: 0.65; }
+  table.alloc tr.live td:first-child::before,
+  table.alloc tr.stale td:first-child::before {
+    content: "";
+  }
+  table.alloc td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    padding: 4px 0;
+    border-bottom: none;
+    text-align: right;
+    white-space: normal;
+  }
+  table.alloc td:first-child {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+  }
+  table.alloc td::before {
+    content: attr(data-label);
+    color: var(--fg-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    text-align: left;
+    flex-shrink: 0;
+  }
+  table.alloc td:first-child::before {
+    content: none;
+  }
 }
 
 @media (max-width: 720px) {

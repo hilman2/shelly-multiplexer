@@ -205,15 +205,15 @@ async function refresh() {
         stuckCell = `<span style="color:var(--fg-dim)" title="no recent step events">–</span>`;
       }
       tr.innerHTML = `
-        <td>${escape(a.battery_id)}</td>
-        <td>${escape(a.address)}</td>
-        <td>${a.group ? escape(a.group) : "–"}</td>
-        <td class="num">${socCell}</td>
-        <td>${fmtAge(a.soc_age_ms)}</td>
-        <td class="num"><strong>${fmtPower(a.allocated_w)}</strong></td>
-        <td>${stuckCell}</td>
-        <td>${noteCell}</td>
-        <td>${fmtAge(a.last_request_ms_ago)}</td>
+        <td data-label="Battery">${escape(a.battery_id)}</td>
+        <td data-label="IP">${escape(a.address)}</td>
+        <td data-label="Group">${a.group ? escape(a.group) : "–"}</td>
+        <td class="num" data-label="SoC">${socCell}</td>
+        <td data-label="SoC age">${fmtAge(a.soc_age_ms)}</td>
+        <td class="num" data-label="Allocated"><strong>${fmtPower(a.allocated_w)}</strong></td>
+        <td data-label="Status">${stuckCell}</td>
+        <td data-label="Note">${noteCell}</td>
+        <td data-label="Last request">${fmtAge(a.last_request_ms_ago)}</td>
       `;
       els.allocBody.appendChild(tr);
     }
