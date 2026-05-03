@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dispatcher;
+pub mod ha;
 pub mod http_admin;
 pub mod http_shelly;
 pub mod marstek;

@@ -50,9 +50,16 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     let pending: Arc<Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Skip batteries whose SoC is sourced from HA — no need to bind a
+    // socket on a port that might already belong to HA's own integration.
+    let needs_direct_poll = |b: &BatteryConfig| {
+        b.vendor == BatteryVendor::Marstek
+            && !(config.home_assistant.enabled && b.soc_entity_id.is_some())
+    };
+
     let mut sockets_by_port: HashMap<u16, Arc<UdpSocket>> = HashMap::new();
     for battery in &config.batteries {
-        if battery.vendor != BatteryVendor::Marstek {
+        if !needs_direct_poll(battery) {
             continue;
         }
         if sockets_by_port.contains_key(&battery.marstek_port) {
@@ -102,10 +109,10 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
         sockets_by_port.insert(battery.marstek_port, socket);
     }
 
-    // One polling task per battery.
+    // One polling task per battery (only those still polled directly).
     let mut tasks = tokio::task::JoinSet::new();
     for battery in &config.batteries {
-        if battery.vendor != BatteryVendor::Marstek {
+        if !needs_direct_poll(battery) {
             continue;
         }
         let socket = sockets_by_port

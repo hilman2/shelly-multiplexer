@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use shelly_multiplexer::config::Config;
 use shelly_multiplexer::state::AppState;
 use shelly_multiplexer::{
-    dispatcher, http_admin, http_shelly, marstek, mdns, real_shelly, virtual_shelly,
+    dispatcher, ha, http_admin, http_shelly, marstek, mdns, real_shelly, virtual_shelly,
 };
 
 #[derive(Parser, Debug)]
@@ -83,13 +83,30 @@ async fn main() -> Result<()> {
         cfg_dirty = true;
     }
 
-    // Persist merged config so the web UI shows the effective values.
-    if cfg_dirty
-        && let Ok(toml) = toml::to_string_pretty(&cfg)
+    // SUPERVISOR_TOKEN: injected by the HA add-on entry point; lets
+    // the multiplexer call the Core API without the user pasting a
+    // long-lived token into the config file.
+    if let Ok(token) = std::env::var("SUPERVISOR_TOKEN")
+        && !token.is_empty()
+        && cfg.home_assistant.token.is_empty()
     {
-        let tmp = cli.config.with_extension("toml.tmp");
-        if std::fs::write(&tmp, toml).is_ok() {
-            let _ = std::fs::rename(&tmp, &cli.config);
+        cfg.home_assistant.token = token;
+        info!("home_assistant.token sourced from SUPERVISOR_TOKEN");
+    }
+
+    // Persist merged config so the web UI shows the effective values.
+    // Drop the SUPERVISOR_TOKEN before writing — secrets don't belong
+    // in a file the user might back up or share.
+    if cfg_dirty {
+        let mut for_disk = cfg.clone();
+        if std::env::var("SUPERVISOR_TOKEN").ok().as_deref() == Some(for_disk.home_assistant.token.as_str()) {
+            for_disk.home_assistant.token.clear();
+        }
+        if let Ok(toml) = toml::to_string_pretty(&for_disk) {
+            let tmp = cli.config.with_extension("toml.tmp");
+            if std::fs::write(&tmp, toml).is_ok() {
+                let _ = std::fs::rename(&tmp, &cli.config);
+            }
         }
     }
 
@@ -135,6 +152,16 @@ async fn main() -> Result<()> {
         tasks.spawn(async move {
             let r = marstek::run(s, c).await;
             log_task_exit("marstek", r);
+        });
+    }
+
+    // Home Assistant SoC poller (idle if home_assistant.enabled=false)
+    {
+        let s = state.clone();
+        let c = cfg_swap.clone();
+        tasks.spawn(async move {
+            let r = ha::run(s, c).await;
+            log_task_exit("ha", r);
         });
     }
 

@@ -54,6 +54,17 @@ deadband_w = 30
 max_total_w = 3000
 acknowledged_higher_risk = false
 acknowledged_separate_fuses = false
+
+[home_assistant]
+# Set enabled = true and add `soc_entity_id = "sensor.xyz"` to a
+# battery to read SoC from HA instead of polling the inverter
+# directly — useful when an HA integration already owns the
+# inverter's UDP port. The token is injected at runtime from
+# \$SUPERVISOR_TOKEN, so leave it blank in the file.
+enabled = false
+url = "http://supervisor/core/api"
+token = ""
+timeout_ms = 3000
 EOF
 else
     bashio::log.info "Reusing existing /data/config.toml (real_shelly host/port from HA options)."

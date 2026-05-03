@@ -13,9 +13,52 @@ pub struct Config {
     #[serde(default)]
     pub safety: SafetyConfig,
     #[serde(default)]
+    pub home_assistant: HomeAssistantConfig,
+    #[serde(default)]
     pub groups: Vec<GroupConfig>,
     #[serde(default)]
     pub batteries: Vec<BatteryConfig>,
+}
+
+/// Optional bridge to a Home Assistant instance. When `enabled` and a
+/// battery has `soc_entity_id` set, we read SoC from HA via its REST
+/// API instead of polling the inverter directly. Useful when HA already
+/// owns the inverter's UDP port (e.g. an HA Marstek integration is
+/// running) — the multiplexer doesn't need to compete for it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HomeAssistantConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the HA Core API. Inside an HA add-on this is
+    /// `http://supervisor/core/api`; standalone setups use
+    /// `http://<ha-host>:8123/api`.
+    #[serde(default = "default_ha_url")]
+    pub url: String,
+    /// Long-lived access token (or `$SUPERVISOR_TOKEN` inside the add-on).
+    #[serde(default)]
+    pub token: String,
+    /// HTTP request timeout per state lookup.
+    #[serde(default = "default_ha_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for HomeAssistantConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_ha_url(),
+            token: String::new(),
+            timeout_ms: default_ha_timeout_ms(),
+        }
+    }
+}
+
+fn default_ha_url() -> String {
+    "http://supervisor/core/api".into()
+}
+
+fn default_ha_timeout_ms() -> u64 {
+    3000
 }
 
 /// Global protective limit on the absolute sum of all battery
@@ -229,6 +272,12 @@ pub struct BatteryConfig {
     /// How often to poll the battery for SoC and actual power.
     #[serde(default = "default_telemetry_interval_ms")]
     pub telemetry_interval_ms: u64,
+    /// If set AND `home_assistant.enabled = true`, the multiplexer
+    /// reads this entity's state from HA instead of polling the
+    /// inverter directly — avoids fighting HA for the inverter's UDP
+    /// port. Example: `sensor.marstek_venus_e_battery_soc`.
+    #[serde(default)]
+    pub soc_entity_id: Option<String>,
 }
 
 fn default_min_soc() -> f64 {

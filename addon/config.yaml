@@ -1,6 +1,6 @@
 ---
 name: Shelly Multiplexer
-version: "0.1.8"
+version: "0.1.9"
 slug: shelly_multiplexer
 description: >-
   Emulates a Shelly Pro 3EM and saldiert (sum-balances) the real meter's
@@ -21,6 +21,11 @@ image: ghcr.io/hilman2/shelly-multiplexer-{arch}
 # (Ingress lives on the hassio bridge, host_network bypasses it), so
 # we expose the admin UI via the standard "Open Web UI" link instead.
 host_network: true
+
+# Grants the add-on a SUPERVISOR_TOKEN with access to the HA Core API.
+# Used to read battery SoC from HA entities when the user configures
+# `home_assistant.enabled = true` and per-battery `soc_entity_id`.
+homeassistant_api: true
 
 # Direct link to the admin UI. HA replaces [HOST]/[PORT:8080] with the
 # host's IP and the configured port. Shows up as "OPEN WEB UI" on the
