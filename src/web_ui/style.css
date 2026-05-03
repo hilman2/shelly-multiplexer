@@ -594,30 +594,9 @@ tr.low-conf td {
 
 /* === Responsive layout =================================================== */
 
-/* Tables with many columns scroll horizontally as a fallback —
- * .alloc switches to a stacked card layout on small screens further
- * below using the data-label attributes the JS sets per cell. */
-table.alloc,
-table.energy,
-table.editor-table {
-  display: block;
-  overflow-x: auto;
-  white-space: nowrap;
-  max-width: 100%;
-}
-table.alloc thead,
-table.alloc tbody,
-table.alloc tr,
-table.energy thead,
-table.energy tbody,
-table.energy tr,
-table.editor-table thead,
-table.editor-table tbody,
-table.editor-table tr {
-  display: table;
-  width: 100%;
-  table-layout: auto;
-}
+/* On desktop, tables stay as proper tables — column widths align
+ * across thead/tbody. The mobile card layout below is opt-in via a
+ * media query. */
 
 /* On narrow screens turn the battery allocation table into a stack
  * of cards. Each <tr> becomes a card; each <td> becomes a label/value
