@@ -205,8 +205,25 @@ async fn poll_battery_loop(
     loop {
         interval.tick().await;
         match poll_once(&socket, &pending, &battery, target).await {
-            Ok(t) => {
-                state.telemetry.write().insert(battery.id.clone(), t);
+            Ok(mut t) => {
+                let mut tel = state.telemetry.write();
+                if let Some(prev) = tel.get(&battery.id) {
+                    // Carry forward previous SoC for ΔSoC-based
+                    // direction inference in the dispatcher. Only
+                    // shift it when the new reading actually differs
+                    // (Marstek reports integer percentages).
+                    match (prev.soc_percent, t.soc_percent) {
+                        (Some(p_soc), Some(n_soc)) if (n_soc - p_soc).abs() > 1e-3 => {
+                            t.previous_soc_percent = Some(p_soc);
+                            t.previous_soc_at = prev.last_update;
+                        }
+                        _ => {
+                            t.previous_soc_percent = prev.previous_soc_percent;
+                            t.previous_soc_at = prev.previous_soc_at;
+                        }
+                    }
+                }
+                tel.insert(battery.id.clone(), t);
             }
             Err(e) => {
                 let mut tel = state.telemetry.write();
@@ -236,6 +253,9 @@ async fn poll_once(
         soc_percent: parsed.soc.map(|x| x as f64),
         last_update: Some(Instant::now()),
         last_error: None,
+        // The polling loop fills these from the previous reading.
+        previous_soc_percent: None,
+        previous_soc_at: None,
     })
 }
 

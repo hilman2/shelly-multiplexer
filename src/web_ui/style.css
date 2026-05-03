@@ -235,15 +235,15 @@ td.num,
 table.alloc {
   table-layout: fixed;
 }
-table.alloc .col-battery { width: 12%; }
-table.alloc .col-ip      { width: 12%; }
-table.alloc .col-group   { width: 8%; }
-table.alloc .col-soc     { width: 7%; }
-table.alloc .col-socage  { width: 8%; }
-table.alloc .col-alloc   { width: 12%; }
-table.alloc .col-status  { width: 14%; }
-table.alloc .col-note    { width: 17%; }
-table.alloc .col-last    { width: 10%; }
+table.alloc .col-battery   { width: 12%; }
+table.alloc .col-ip        { width: 12%; }
+table.alloc .col-circuit   { width: 8%; }
+table.alloc .col-soc       { width: 7%; }
+table.alloc .col-socage    { width: 8%; }
+table.alloc .col-alloc     { width: 12%; }
+table.alloc .col-multiplex { width: 14%; }
+table.alloc .col-note      { width: 17%; }
+table.alloc .col-last      { width: 10%; }
 table.alloc td, table.alloc th {
   overflow: hidden;
   text-overflow: ellipsis;

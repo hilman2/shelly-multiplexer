@@ -97,20 +97,36 @@ async fn handle_request(
     };
 
     let now = Instant::now();
+    // Multiplex drop-mode: if the dispatcher marked this battery as
+    // inactive (it's not the lead of its circuit, or it's force-
+    // deactivated for testing), we deliberately stop responding so
+    // the inverter's CT-watchdog shuts it off. Bedrock of the safety
+    // guarantee that "max one battery active per circuit".
+    let inactive_info = {
+        let allocs = state.allocations.read();
+        allocs
+            .get(&peer.ip())
+            .map(|a| (a.battery_id.clone(), a.multiplex_inactive))
+    };
+    if let Some((ref id, true)) = inactive_info {
+        debug!(
+            battery = %id,
+            peer = %peer,
+            method = %request.method,
+            "drop poll: multiplex-inactive"
+        );
+        // Still record the poll so the GUI can show "last_request"
+        // for diagnostics, but don't send anything back.
+        state.last_poll_at.write().insert(peer.ip(), now);
+        return;
+    }
+
     let log_state = {
-        // Write the poll timestamp into a dedicated map so the dispatcher
-        // (which atomically replaces `allocations` every tick) cannot
-        // clobber it. Read the battery_id from `allocations` separately
-        // — the read lock there is held only briefly.
         let prev = state.last_poll_at.write().insert(peer.ip(), now);
         let was_silent = prev
             .map(|t| now.saturating_duration_since(t) > RECONNECT_THRESHOLD)
             .unwrap_or(true);
-        let battery_id = state
-            .allocations
-            .read()
-            .get(&peer.ip())
-            .map(|a| a.battery_id.clone());
+        let battery_id = inactive_info.map(|(id, _)| id);
         match battery_id {
             Some(id) => PollLog::Known {
                 battery_id: id,

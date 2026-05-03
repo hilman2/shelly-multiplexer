@@ -64,6 +64,7 @@ pub async fn run(
             "/api/phase-detect",
             get(api_phase_detect_status).post(api_phase_detect_start),
         )
+        .route("/api/battery/{id}/test-deactivate", post(api_test_deactivate))
         .route("/api/health", get(api_health))
         .route("/{*path}", get(serve_static))
         .with_state(ctx);
@@ -159,29 +160,25 @@ struct RealShellyStatus {
 struct AllocationInfo {
     battery_id: String,
     address: String,
-    group: Option<String>,
+    circuit: String,
     factor_a: f64,
     factor_b: f64,
     factor_c: f64,
-    /// Per-phase allocation in watts (signed: + = discharge, − = charge).
     phase_w_a: f64,
     phase_w_b: f64,
     phase_w_c: f64,
-    /// Net allocation across all phases. On a battery that charges on one
-    /// phase and discharges on another, this can be near zero even though
-    /// the battery is actively dispatching — see `magnitude_w`.
     allocated_w: f64,
-    /// Sum of absolute per-phase allocations. Reflects how hard the
-    /// battery is actually working, including cancelling phases.
     magnitude_w: f64,
+    /// True when the multiplex layer keeps this battery on standby
+    /// (not the lead of its circuit). virtual_shelly stops responding
+    /// to its polls so the inverter's CT-watchdog shuts it off.
+    multiplex_inactive: bool,
     last_request_ms_ago: Option<u128>,
     note: Option<String>,
     soc_percent: Option<f64>,
     soc_age_ms: Option<u128>,
     soc_error: Option<String>,
-    /// "charging" / "discharging" / null — passive 10-min verdict.
     stuck_direction: Option<crate::state::StuckDirection>,
-    /// Number of step events in the rolling window.
     stuck_events_in_window: usize,
 }
 
@@ -223,7 +220,8 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
             AllocationInfo {
                 battery_id: a.battery_id.clone(),
                 address: ip.to_string(),
-                group: a.group.clone(),
+                circuit: a.circuit.clone(),
+                multiplex_inactive: a.multiplex_inactive,
                 factor_a: a.factors.a,
                 factor_b: a.factors.b,
                 factor_c: a.factors.c,
@@ -395,7 +393,7 @@ async fn api_get_config(State(ctx): State<AdminCtx>) -> impl IntoResponse {
         "dispatcher": &cfg.dispatcher,
         "safety": &cfg.safety,
         "home_assistant": ha,
-        "groups": &cfg.groups,
+        "circuits": &cfg.circuits,
         "batteries": &cfg.batteries,
         "config_path": ctx.config_path.display().to_string(),
     }))
@@ -434,6 +432,7 @@ async fn api_put_section(
         "dispatcher",
         "safety",
         "home_assistant",
+        "circuits",
         "groups",
         "batteries",
     ];
@@ -517,6 +516,40 @@ fn server_error(msg: impl Into<String>) -> Response {
 
 async fn api_health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+#[derive(serde::Deserialize)]
+struct TestDeactivateQuery {
+    seconds: Option<u64>,
+}
+
+async fn api_test_deactivate(
+    State(ctx): State<AdminCtx>,
+    Path(battery_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<TestDeactivateQuery>,
+) -> Response {
+    // Refuse unknown battery ids so a typo isn't a silent no-op.
+    let cfg = ctx.config.load_full();
+    if !cfg.batteries.iter().any(|b| b.id == battery_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown battery '{battery_id}'")})),
+        )
+            .into_response();
+    }
+    let secs = q.seconds.unwrap_or(60).clamp(5, 600);
+    let until = Instant::now() + std::time::Duration::from_secs(secs);
+    ctx.state
+        .force_inactive_until
+        .write()
+        .insert(battery_id.clone(), until);
+    info!(battery = %battery_id, secs, "test-deactivate armed");
+    Json(json!({
+        "ok": true,
+        "battery": battery_id,
+        "deactivated_for_secs": secs
+    }))
+    .into_response()
 }
 
 async fn api_phase_detect_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {

@@ -113,6 +113,14 @@ async fn poll_entity(
                         ..Default::default()
                     }
                 });
+                // Roll the previous SoC forward for ΔSoC direction
+                // inference in the dispatcher.
+                if let Some(p_soc) = entry.soc_percent
+                    && (soc - p_soc).abs() > 1e-3
+                {
+                    entry.previous_soc_percent = Some(p_soc);
+                    entry.previous_soc_at = entry.last_update;
+                }
                 entry.soc_percent = Some(soc);
                 entry.last_update = Some(std::time::Instant::now());
                 entry.last_error = None;

@@ -10,12 +10,19 @@ pub struct Config {
     pub virtual_shelly: VirtualShellyConfig,
     pub management: ManagementConfig,
     pub dispatcher: DispatcherConfig,
+    /// Kept as a deprecated section for backwards compatibility — the
+    /// dispatcher no longer reads it. Safety is now enforced
+    /// physically: max 1 battery active per circuit, with circuits
+    /// validating that no member exceeds the circuit's cap.
     #[serde(default)]
     pub safety: SafetyConfig,
     #[serde(default)]
     pub home_assistant: HomeAssistantConfig,
-    #[serde(default)]
-    pub groups: Vec<GroupConfig>,
+    /// `[[circuits]]` is the new name; `[[groups]]` still parses for
+    /// backwards compatibility (deserde alias). Output writes always
+    /// use the new key.
+    #[serde(default, alias = "groups")]
+    pub circuits: Vec<CircuitConfig>,
     #[serde(default)]
     pub batteries: Vec<BatteryConfig>,
 }
@@ -224,8 +231,13 @@ pub enum AllocationStrategy {
     Priority,
 }
 
+/// A `Circuit` represents a shared protective device (MCB/RCD)
+/// downstream of which one or more batteries hang. The dispatcher
+/// guarantees that **at most one** battery in a circuit is active at
+/// a time, so the circuit's cap_w must only be ≥ the largest single
+/// member's max(charge_w, discharge_w). Validated at startup.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GroupConfig {
+pub struct CircuitConfig {
     pub id: String,
     pub fuse_amps: f64,
     #[serde(default = "default_phases")]
@@ -234,6 +246,9 @@ pub struct GroupConfig {
     pub voltage: f64,
 }
 
+/// Old name kept as an alias so existing configs still parse.
+pub type GroupConfig = CircuitConfig;
+
 fn default_phases() -> u8 {
     1
 }
@@ -241,7 +256,7 @@ fn default_voltage() -> f64 {
     230.0
 }
 
-impl GroupConfig {
+impl CircuitConfig {
     pub fn cap_w(&self) -> f64 {
         self.fuse_amps * self.voltage * f64::from(self.phases)
     }
@@ -253,8 +268,12 @@ pub struct BatteryConfig {
     pub address: IpAddr,
     #[serde(default = "default_vendor")]
     pub vendor: BatteryVendor,
-    #[serde(default)]
-    pub group: Option<String>,
+    /// Circuit (= shared MCB downstream) the battery sits on.
+    /// Mandatory — drives the multiplex layer that guarantees max one
+    /// active battery per circuit. Old configs may still use `group`
+    /// (deserde alias).
+    #[serde(alias = "group")]
+    pub circuit: String,
     #[serde(default = "default_phase")]
     pub phase: PhaseAssignment,
     pub max_charge_w: f64,
@@ -360,30 +379,58 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.safety.max_total_w < 0.0 {
-            anyhow::bail!("safety.max_total_w must not be negative");
+        // Circuits must be unique and well-formed.
+        let mut seen_circuits = std::collections::HashSet::new();
+        for c in &self.circuits {
+            if !seen_circuits.insert(c.id.clone()) {
+                anyhow::bail!("duplicate circuit id: {}", c.id);
+            }
+            if ![1u8, 3u8].contains(&c.phases) {
+                anyhow::bail!("circuit {}: phases must be 1 or 3", c.id);
+            }
+            if c.fuse_amps <= 0.0 {
+                anyhow::bail!("circuit {}: fuse_amps must be > 0", c.id);
+            }
+            if c.voltage <= 0.0 {
+                anyhow::bail!("circuit {}: voltage must be > 0", c.id);
+            }
         }
-        if self.safety.max_total_w > SAFETY_DEFAULT_CAP_W
-            && (!self.safety.acknowledged_higher_risk
-                || !self.safety.acknowledged_separate_fuses)
-        {
-            tracing::warn!(
-                requested = self.safety.max_total_w,
-                effective = SAFETY_DEFAULT_CAP_W,
-                ack_risk = self.safety.acknowledged_higher_risk,
-                ack_fuses = self.safety.acknowledged_separate_fuses,
-                "safety.max_total_w > 3000 W requires BOTH acknowledgements; clamping to 3000 W"
-            );
-        }
+
+        // Batteries must each reference an existing circuit and stay
+        // within that circuit's cap on their own. The multiplex layer
+        // guarantees only one is ever active per circuit, so the cap
+        // is checked per-member, not per-sum.
         let mut seen_ids = std::collections::HashSet::new();
         for b in &self.batteries {
             if !seen_ids.insert(b.id.clone()) {
                 anyhow::bail!("duplicate battery id: {}", b.id);
             }
-            if let Some(group) = &b.group
-                && !self.groups.iter().any(|g| &g.id == group)
-            {
-                anyhow::bail!("battery {} references unknown group {}", b.id, group);
+            if b.circuit.trim().is_empty() {
+                anyhow::bail!(
+                    "battery {}: `circuit` is required (every battery must belong to a circuit)",
+                    b.id
+                );
+            }
+            let Some(circuit) = self.circuits.iter().find(|c| c.id == b.circuit) else {
+                anyhow::bail!(
+                    "battery {} references unknown circuit '{}'",
+                    b.id,
+                    b.circuit
+                );
+            };
+            let cap = circuit.cap_w();
+            let largest = b.max_charge_w.max(b.max_discharge_w);
+            if largest > cap {
+                anyhow::bail!(
+                    "battery {} (max {} W) exceeds circuit '{}' cap ({} W) — the inverter \
+                     could overload the shared protective device on its own. Either lower \
+                     max_charge_w/max_discharge_w on the battery or move it to a circuit \
+                     with a larger fuse.",
+                    b.id,
+                    largest,
+                    b.circuit,
+                    cap
+                );
             }
             if b.max_charge_w < 0.0 || b.max_discharge_w < 0.0 {
                 anyhow::bail!("battery {} has negative power limits", b.id);
@@ -417,21 +464,7 @@ impl Config {
                 anyhow::bail!("battery {}: marstek_port must be > 0", b.id);
             }
         }
-        let mut seen_groups = std::collections::HashSet::new();
-        for g in &self.groups {
-            if !seen_groups.insert(g.id.clone()) {
-                anyhow::bail!("duplicate group id: {}", g.id);
-            }
-            if !(self.virtual_shelly_phases().contains(&g.phases)) {
-                anyhow::bail!("group {}: phases must be 1 or 3", g.id);
-            }
-            if g.fuse_amps <= 0.0 {
-                anyhow::bail!("group {}: fuse_amps must be > 0", g.id);
-            }
-            if g.voltage <= 0.0 {
-                anyhow::bail!("group {}: voltage must be > 0", g.id);
-            }
-        }
+
         if self.dispatcher.deadband_w < 0.0 {
             anyhow::bail!("dispatcher.deadband_w must not be negative");
         }
@@ -442,9 +475,5 @@ impl Config {
             anyhow::bail!("real_shelly.poll_interval_ms must be > 0");
         }
         Ok(())
-    }
-
-    fn virtual_shelly_phases(&self) -> [u8; 2] {
-        [1, 3]
     }
 }

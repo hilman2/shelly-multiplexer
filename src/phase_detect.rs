@@ -222,7 +222,8 @@ fn park_all(state: &AppState, addrs: &HashMap<String, IpAddr>) {
                 phase_w: PhaseWatts { a: 0.0, b: 0.0, c: 0.0 },
                 allocated_w: 0.0,
                 magnitude_w: 0.0,
-                group: None,
+                circuit: String::new(),
+                multiplex_inactive: true,
                 note: Some("phase-detect: parked".into()),
             },
         );

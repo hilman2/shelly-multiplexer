@@ -37,8 +37,6 @@
       <span id="conn-state" class="dot"></span>
       <span id="last-seen">–</span>
       <span class="sep">·</span>
-      <span>Cap <span id="header-cap">–</span></span>
-      <span class="sep">·</span>
       <span>Uptime <span id="uptime">–</span></span>
     </div>
   </header>
@@ -46,7 +44,6 @@
   <nav>
     <button data-view="status" class="active">Status</button>
     <button data-view="batteries">Batteries &amp; Allocation</button>
-    <button data-view="safety">Safety</button>
     <button data-view="config">Configuration</button>
   </nav>
 
@@ -96,22 +93,25 @@
     <section id="view-batteries" class="view">
       <h2>Battery allocation</h2>
       <p class="hint">
-        Saldierende Verteilung: each battery is told to charge or
-        discharge by the indicated wattage. The dispatcher reconstructs
-        the true grid demand by adding back the previously commanded
-        battery output, so the control loop is stable even when the CT
-        already reads near zero. SoC is polled directly from each
-        battery and used to gate charge / discharge eligibility.
+        Multiplex layout: at most one battery per circuit is active at
+        any time — guaranteeing the shared protective device cannot
+        be overloaded. Active leads share the raw CT readings,
+        weighted by each lead's hardware cap in the current direction.
+        Direction is inferred from the active lead's SoC trend (HA
+        polling), not from the CT (which is bent by the battery's own
+        action). Lead switches honour a 30 s settle so the previous
+        inverter shuts off via its CT-watchdog before the new one
+        starts.
       </p>
       <table class="alloc">
         <colgroup>
           <col class="col-battery">
           <col class="col-ip">
-          <col class="col-group">
+          <col class="col-circuit">
           <col class="col-soc">
           <col class="col-socage">
           <col class="col-alloc">
-          <col class="col-status">
+          <col class="col-multiplex">
           <col class="col-note">
           <col class="col-last">
         </colgroup>
@@ -119,11 +119,11 @@
           <tr>
             <th>Battery</th>
             <th>IP</th>
-            <th>Group</th>
+            <th>Circuit</th>
             <th>SoC</th>
             <th>SoC age</th>
             <th title="+ = battery should discharge; − = battery should charge">Allocated (W)</th>
-            <th title="Passive 10-min responsiveness verdict">Status</th>
+            <th title="Multiplex state — only one battery per circuit is active at a time">Multiplex</th>
             <th>Note</th>
             <th>Last request</th>
           </tr>
@@ -145,42 +145,6 @@
           <span class="form-status" id="phase-detect-status"></span>
         </div>
         <div id="phase-detect-results"></div>
-      </div>
-    </section>
-
-    <section id="view-safety" class="view">
-      <h2>Safety cap</h2>
-      <div class="safety-card" id="safety-card">
-        <div class="cap-headline">
-          <div>
-            <div class="label">Effective cap</div>
-            <div class="cap-value" id="safety-cap-value">–</div>
-            <div class="sub" id="safety-source">–</div>
-          </div>
-          <div class="badge" id="safety-badge">–</div>
-        </div>
-        <div class="ack-grid">
-          <div class="ack" id="ack-risk">
-            <span class="ack-icon">○</span>
-            <span>Risk acknowledged</span>
-          </div>
-          <div class="ack" id="ack-fuses">
-            <span class="ack-icon">○</span>
-            <span>Separate fuses confirmed</span>
-          </div>
-        </div>
-        <div class="actions">
-          <button id="btn-override" class="primary">Unlock higher cap…</button>
-          <button id="btn-reset" class="secondary">Reset to config default</button>
-        </div>
-      </div>
-
-      <div class="warning-box">
-        <strong>Important:</strong> the default 3000&nbsp;W cap protects
-        against damage when wiring is not rated for higher loads. Only
-        raise it if every battery is on its <em>own</em>, adequately rated
-        protective device. Runtime overrides are not persisted — a restart
-        always returns the system to a known-safe state.
       </div>
     </section>
 
@@ -303,33 +267,6 @@
         </div>
       </form>
 
-      <form id="form-safety" class="cfg-form" data-section="safety">
-        <h3>Safety (persisted defaults)</h3>
-        <p class="hint">
-          These values are written to the TOML file. The runtime cap
-          (visible on the Safety tab) is updated live unless a Web UI
-          override is currently active — in that case use the
-          “Reset to config default” button on the Safety tab to apply.
-        </p>
-        <div class="form-grid">
-          <label>max_total_w
-            <input name="max_total_w" type="number" min="0" max="20000" step="any" required>
-          </label>
-          <label class="checkbox">
-            <input name="acknowledged_higher_risk" type="checkbox">
-            <span>acknowledged_higher_risk</span>
-          </label>
-          <label class="checkbox">
-            <input name="acknowledged_separate_fuses" type="checkbox">
-            <span>acknowledged_separate_fuses</span>
-          </label>
-        </div>
-        <div class="form-actions">
-          <button type="submit" class="primary">Save</button>
-          <span class="form-status"></span>
-        </div>
-      </form>
-
       <form id="form-ha" class="cfg-form" data-section="home_assistant">
         <h3>Home Assistant integration</h3>
         <p class="hint">
@@ -376,22 +313,27 @@
         </div>
       </form>
 
-      <div class="cfg-form" id="form-groups-wrap">
-        <h3>Groups</h3>
+      <div class="cfg-form" id="form-circuits-wrap">
+        <h3>Circuits</h3>
         <p class="hint">
-          A group caps the sum of its members' allocations (e.g. a
-          shared B16 fuse). Cap = phases × fuse_amps × voltage.
+          A circuit is a shared protective device (MCB/RCD) downstream
+          of which one or more batteries hang. The dispatcher
+          guarantees <strong>at most one battery per circuit</strong>
+          is active at a time, so the cap (= phases × fuse_amps ×
+          voltage) only needs to be ≥ the largest single member's
+          max(charge_w, discharge_w). Validated at startup —
+          violations refuse the start with a clear error message.
         </p>
         <table class="editor-table">
           <thead>
             <tr><th>id</th><th>fuse_amps</th><th>phases</th><th>voltage</th><th>cap (W)</th><th></th></tr>
           </thead>
-          <tbody id="groups-body"></tbody>
+          <tbody id="circuits-body"></tbody>
         </table>
         <div class="form-actions">
-          <button type="button" class="secondary" id="btn-add-group">+ Add group</button>
-          <button type="button" class="primary" id="btn-save-groups">Save groups</button>
-          <span class="form-status" id="status-groups"></span>
+          <button type="button" class="secondary" id="btn-add-circuit">+ Add circuit</button>
+          <button type="button" class="primary" id="btn-save-circuits">Save circuits</button>
+          <span class="form-status" id="status-circuits"></span>
         </div>
       </div>
 
@@ -411,47 +353,6 @@
       </div>
     </section>
   </main>
-
-  <!-- Override flow modals -->
-  <div id="modal-1" class="modal">
-    <div class="modal-content">
-      <h3>Step 1 of 2 — Risk acknowledged?</h3>
-      <p>
-        Raising the safety cap above 3000&nbsp;W can cause
-        <strong>overload, damage to your wiring, or — in the worst case —
-        fire</strong> if the installation is not rated for the higher load
-        or if multiple batteries share an undersized protective device.
-      </p>
-      <p>
-        The multiplexer cannot inspect your wiring. The responsibility
-        is entirely yours.
-      </p>
-      <div class="modal-actions">
-        <button class="secondary" data-action="cancel">Cancel</button>
-        <button class="primary" data-action="step1-ok">I understand, continue</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="modal-2" class="modal">
-    <div class="modal-content">
-      <h3>Step 2 of 2 — Each battery on its own breaker?</h3>
-      <p>
-        Confirm that <strong>every battery is on its own, adequately
-        rated protective device</strong> (MCB / RCD). No two batteries
-        may share a protective device whose rated current is below the
-        sum of their potential output.
-      </p>
-      <div class="form-row">
-        <label>New cap (watts):</label>
-        <input type="number" id="new-cap-input" min="3000" max="20000" step="100" value="5000">
-      </div>
-      <div class="modal-actions">
-        <button class="secondary" data-action="cancel">Cancel</button>
-        <button class="primary" data-action="step2-ok">Confirm &amp; activate</button>
-      </div>
-    </div>
-  </div>
 
   <div id="toast"></div>
 

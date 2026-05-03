@@ -14,7 +14,6 @@ const els = {
   connState: document.getElementById("conn-state"),
   lastSeen: document.getElementById("last-seen"),
   uptime: document.getElementById("uptime"),
-  headerCap: document.getElementById("header-cap"),
   pa: document.getElementById("p-a"),
   pb: document.getElementById("p-b"),
   pc: document.getElementById("p-c"),
@@ -30,30 +29,18 @@ const els = {
   ecCons: document.getElementById("e-c-cons"),
   ecRet: document.getElementById("e-c-ret"),
   allocBody: document.getElementById("alloc-body"),
-  safetyCard: document.getElementById("safety-card"),
-  safetyCapValue: document.getElementById("safety-cap-value"),
-  safetySource: document.getElementById("safety-source"),
-  safetyBadge: document.getElementById("safety-badge"),
-  ackRisk: document.getElementById("ack-risk"),
-  ackFuses: document.getElementById("ack-fuses"),
-  btnOverride: document.getElementById("btn-override"),
-  btnReset: document.getElementById("btn-reset"),
-  modal1: document.getElementById("modal-1"),
-  modal2: document.getElementById("modal-2"),
-  newCapInput: document.getElementById("new-cap-input"),
   toast: document.getElementById("toast"),
   cfgPath: document.getElementById("cfg-path"),
   formReal: document.getElementById("form-real"),
   formVirtual: document.getElementById("form-virtual"),
   formManagement: document.getElementById("form-management"),
   formDispatcher: document.getElementById("form-dispatcher"),
-  formSafety: document.getElementById("form-safety"),
   formHa: document.getElementById("form-ha"),
-  groupsBody: document.getElementById("groups-body"),
+  circuitsBody: document.getElementById("circuits-body"),
   batteriesList: document.getElementById("batteries-list"),
-  btnAddGroup: document.getElementById("btn-add-group"),
-  btnSaveGroups: document.getElementById("btn-save-groups"),
-  statusGroups: document.getElementById("status-groups"),
+  btnAddCircuit: document.getElementById("btn-add-circuit"),
+  btnSaveCircuits: document.getElementById("btn-save-circuits"),
+  statusCircuits: document.getElementById("status-circuits"),
   btnAddBattery: document.getElementById("btn-add-battery"),
   btnSaveBatteries: document.getElementById("btn-save-batteries"),
   statusBatteries: document.getElementById("status-batteries"),
@@ -108,33 +95,6 @@ function showToast(message, type) {
   els.toast.textContent = message;
   els.toast.className = type ? "show " + type : "show";
   setTimeout(() => els.toast.classList.remove("show"), 4000);
-}
-
-function renderSafety(s) {
-  els.safetyCapValue.textContent = (s.effective_cap_w || 0).toFixed(0) + " W";
-  els.safetySource.textContent =
-    "Source: " + (s.source === "runtime" ? "Web UI override" : "Config file") +
-    (s.last_changed_ms_ago !== null && s.last_changed_ms_ago !== undefined
-      ? " · " + fmtAge(s.last_changed_ms_ago) + " ago"
-      : "");
-  if (s.override_active) {
-    els.safetyBadge.textContent = "Override active";
-    els.safetyBadge.className = "badge override";
-    els.safetyCard.classList.add("override-active");
-  } else {
-    els.safetyBadge.textContent = "Default cap";
-    els.safetyBadge.className = "badge default";
-    els.safetyCard.classList.remove("override-active");
-  }
-  setAck(els.ackRisk, s.acknowledged_higher_risk, "Risk acknowledged");
-  setAck(els.ackFuses, s.acknowledged_separate_fuses, "Separate fuses confirmed");
-  els.headerCap.textContent = (s.effective_cap_w || 0).toFixed(0) + " W";
-}
-function setAck(el, ok, label) {
-  el.classList.toggle("set", !!ok);
-  el.querySelector(".ack-icon").textContent = ok ? "✓" : "○";
-  el.querySelector("span:last-child").textContent =
-    label + (ok ? "" : " (pending)");
 }
 
 async function refresh() {
@@ -196,29 +156,41 @@ async function refresh() {
         ? `<span title="${escape(a.soc_error)}" style="color:var(--positive)">err</span>`
         : fmtPct(a.soc_percent);
       const noteCell = a.note ? `<span class="alloc-note">${escape(a.note)}</span>` : "";
-      let stuckCell = "<span class=\"ok-tag\">ok</span>";
-      if (a.stuck_direction === "charging") {
-        stuckCell = `<span class="restart-tag" title="${a.stuck_events_in_window} events in 10-min window">stuck (charge)</span>`;
-      } else if (a.stuck_direction === "discharging") {
-        stuckCell = `<span class="restart-tag" title="${a.stuck_events_in_window} events in 10-min window">stuck (discharge)</span>`;
-      } else if (a.stuck_events_in_window === 0) {
-        stuckCell = `<span style="color:var(--fg-dim)" title="no recent step events">–</span>`;
-      }
+      const multiplexCell = a.multiplex_inactive
+        ? `<span class="restart-tag">standby</span>`
+        : `<span class="ok-tag">active</span>`;
+      const testBtn = `<button type="button" class="row-action btn-test-deactivate" data-battery="${escape(a.battery_id)}" title="Send no responses for 60 s — verifies the inverter shuts off via its CT-watchdog">deactivate 60 s</button>`;
       tr.innerHTML = `
-        <td data-label="Battery">${escape(a.battery_id)}</td>
+        <td data-label="Battery">${escape(a.battery_id)} ${testBtn}</td>
         <td data-label="IP">${escape(a.address)}</td>
-        <td data-label="Group">${a.group ? escape(a.group) : "–"}</td>
+        <td data-label="Circuit">${escape(a.circuit || "–")}</td>
         <td class="num" data-label="SoC">${socCell}</td>
         <td data-label="SoC age">${fmtAge(a.soc_age_ms)}</td>
         <td class="num" data-label="Allocated"><strong>${fmtPower(a.allocated_w)}</strong></td>
-        <td data-label="Status">${stuckCell}</td>
+        <td data-label="Multiplex">${multiplexCell}</td>
         <td data-label="Note">${noteCell}</td>
         <td data-label="Last request">${fmtAge(a.last_request_ms_ago)}</td>
       `;
       els.allocBody.appendChild(tr);
     }
-
-    renderSafety(data.safety);
+    // Wire test-deactivate buttons.
+    els.allocBody.querySelectorAll(".btn-test-deactivate").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.battery;
+        if (!confirm(`Drop CT responses to "${id}" for 60 s?\n\nThe inverter should shut itself off via its CT-watchdog within ~30 s. Use this to verify the multiplex safety mechanism.`)) return;
+        try {
+          const res = await fetch(api(`/api/battery/${encodeURIComponent(id)}/test-deactivate?seconds=60`), { method: "POST" });
+          const data = await res.json();
+          if (!res.ok) {
+            showToast("Error: " + (data.error || res.status), "error");
+          } else {
+            showToast(`Deactivated ${id} for 60 s`, "success");
+          }
+        } catch (err) {
+          showToast("Network error: " + err.message, "error");
+        }
+      });
+    });
   } catch (e) {
     els.connState.className = "dot dead";
     els.lastSeen.textContent = "API error: " + e.message;
@@ -259,11 +231,6 @@ const SECTION_FIELDS = {
     strategy: "string",
     rate_limit_w_per_s: "float",
     deadband_w: "float",
-  },
-  safety: {
-    max_total_w: "float",
-    acknowledged_higher_risk: "bool",
-    acknowledged_separate_fuses: "bool",
   },
   home_assistant: {
     enabled: "bool",
@@ -365,40 +332,39 @@ bindSimpleForm(els.formReal, "real_shelly");
 bindSimpleForm(els.formVirtual, "virtual_shelly");
 bindSimpleForm(els.formManagement, "management");
 bindSimpleForm(els.formDispatcher, "dispatcher");
-bindSimpleForm(els.formSafety, "safety");
 bindSimpleForm(els.formHa, "home_assistant");
 
-// --- Groups editor ---
+// --- Circuits editor ---
 
-function renderGroups(groups) {
-  els.groupsBody.innerHTML = "";
-  for (const g of groups) addGroupRow(g);
+function renderCircuits(circuits) {
+  els.circuitsBody.innerHTML = "";
+  for (const c of circuits) addCircuitRow(c);
 }
 
-function addGroupRow(g) {
-  g = g || { id: "", fuse_amps: 16, phases: 1, voltage: 230 };
+function addCircuitRow(c) {
+  c = c || { id: "", fuse_amps: 16, phases: 1, voltage: 230 };
   const tr = document.createElement("tr");
   tr.innerHTML = `
-    <td><input data-field="id" type="text" value="${escape(g.id || "")}"></td>
-    <td><input data-field="fuse_amps" type="number" min="0" step="any" value="${g.fuse_amps}"></td>
+    <td><input data-field="id" type="text" value="${escape(c.id || "")}"></td>
+    <td><input data-field="fuse_amps" type="number" min="0" step="any" value="${c.fuse_amps}"></td>
     <td>
       <select data-field="phases">
-        <option value="1"${g.phases === 1 ? " selected" : ""}>1</option>
-        <option value="3"${g.phases === 3 ? " selected" : ""}>3</option>
+        <option value="1"${c.phases === 1 ? " selected" : ""}>1</option>
+        <option value="3"${c.phases === 3 ? " selected" : ""}>3</option>
       </select>
     </td>
-    <td><input data-field="voltage" type="number" min="1" step="any" value="${g.voltage}"></td>
+    <td><input data-field="voltage" type="number" min="1" step="any" value="${c.voltage}"></td>
     <td class="num cap-cell">–</td>
     <td><button type="button" class="secondary row-del">×</button></td>
   `;
   tr.querySelector(".row-del").addEventListener("click", () => tr.remove());
   tr.querySelectorAll("input,select").forEach(i =>
-    i.addEventListener("input", () => recomputeGroupCap(tr)));
-  els.groupsBody.appendChild(tr);
-  recomputeGroupCap(tr);
+    i.addEventListener("input", () => recomputeCircuitCap(tr)));
+  els.circuitsBody.appendChild(tr);
+  recomputeCircuitCap(tr);
 }
 
-function recomputeGroupCap(tr) {
+function recomputeCircuitCap(tr) {
   const fa = parseFloat(tr.querySelector('[data-field=fuse_amps]').value);
   const ph = parseInt(tr.querySelector('[data-field=phases]').value, 10);
   const v = parseFloat(tr.querySelector('[data-field=voltage]').value);
@@ -410,32 +376,32 @@ function recomputeGroupCap(tr) {
   }
 }
 
-function readGroups() {
+function readCircuits() {
   const out = [];
-  for (const tr of els.groupsBody.querySelectorAll("tr")) {
+  for (const tr of els.circuitsBody.querySelectorAll("tr")) {
     const id = tr.querySelector('[data-field=id]').value.trim();
-    if (!id) throw new Error("group id must not be empty");
+    if (!id) throw new Error("circuit id must not be empty");
     const fa = parseFloat(tr.querySelector('[data-field=fuse_amps]').value);
     const ph = parseInt(tr.querySelector('[data-field=phases]').value, 10);
     const v = parseFloat(tr.querySelector('[data-field=voltage]').value);
     if (!Number.isFinite(fa) || !Number.isFinite(ph) || !Number.isFinite(v)) {
-      throw new Error("group " + id + ": numeric values required");
+      throw new Error("circuit " + id + ": numeric values required");
     }
     out.push({ id, fuse_amps: fa, phases: ph, voltage: v });
   }
   return out;
 }
 
-els.btnAddGroup.addEventListener("click", () => addGroupRow());
-els.btnSaveGroups.addEventListener("click", async () => {
+els.btnAddCircuit.addEventListener("click", () => addCircuitRow());
+els.btnSaveCircuits.addEventListener("click", async () => {
   let payload;
   try {
-    payload = readGroups();
+    payload = readCircuits();
   } catch (err) {
-    setStatus(els.statusGroups, err.message, "error");
+    setStatus(els.statusCircuits, err.message, "error");
     return;
   }
-  await postSection("groups", payload, els.statusGroups);
+  await postSection("circuits", payload, els.statusCircuits);
 });
 
 // --- Batteries editor ---
@@ -450,7 +416,7 @@ function addBatteryCard(b) {
     id: "",
     address: "",
     vendor: "marstek",
-    group: null,
+    circuit: "",
     phase: "all",
     max_charge_w: 2500,
     max_discharge_w: 2500,
@@ -461,8 +427,10 @@ function addBatteryCard(b) {
     telemetry_interval_ms: 60000,
     soc_entity_id: null,
   };
-  const groupOptions = (currentConfig?.groups || [])
-    .map(g => `<option value="${escape(g.id)}"${b.group === g.id ? " selected" : ""}>${escape(g.id)}</option>`)
+  // Backwards-compat: old configs may carry `group` instead of `circuit`.
+  const currentCircuit = b.circuit || b.group || "";
+  const circuitOptions = (currentConfig?.circuits || currentConfig?.groups || [])
+    .map(c => `<option value="${escape(c.id)}"${currentCircuit === c.id ? " selected" : ""}>${escape(c.id)}</option>`)
     .join("");
   const card = document.createElement("div");
   card.className = "battery-card";
@@ -477,10 +445,10 @@ function addBatteryCard(b) {
           <option value="generic"${b.vendor === "generic" ? " selected" : ""}>generic</option>
         </select>
       </label>
-      <label>group
-        <select data-field="group">
-          <option value=""${!b.group ? " selected" : ""}>—</option>
-          ${groupOptions}
+      <label>circuit (required)
+        <select data-field="circuit" required>
+          <option value=""${!currentCircuit ? " selected" : ""}>— pick a circuit —</option>
+          ${circuitOptions}
         </select>
       </label>
       <label>phase
@@ -529,13 +497,14 @@ function readBatteries() {
     if (!id) throw new Error("battery id must not be empty");
     const addr = get("address").trim();
     if (!addr) throw new Error("battery " + id + ": address required");
-    const groupVal = get("group");
+    const circuitVal = get("circuit");
+    if (!circuitVal) throw new Error("battery " + id + ": circuit is required");
     const socEntity = get("soc_entity_id").trim();
     out.push({
       id,
       address: addr,
       vendor: get("vendor"),
-      group: groupVal === "" ? null : groupVal,
+      circuit: circuitVal,
       phase: get("phase"),
       max_charge_w: getNum("max_charge_w"),
       max_discharge_w: getNum("max_discharge_w"),
@@ -572,79 +541,13 @@ async function loadConfig() {
     fillForm(els.formVirtual, "virtual_shelly", cfg.virtual_shelly);
     fillForm(els.formManagement, "management", cfg.management);
     fillForm(els.formDispatcher, "dispatcher", cfg.dispatcher);
-    fillForm(els.formSafety, "safety", cfg.safety);
     fillForm(els.formHa, "home_assistant", cfg.home_assistant || {});
-    renderGroups(cfg.groups || []);
+    renderCircuits(cfg.circuits || cfg.groups || []);
     renderBatteries(cfg.batteries || []);
   } catch (e) {
     showToast("Failed to load config: " + e.message, "error");
   }
 }
-
-// === Safety override flow ===
-
-function openModal(m) { m.classList.add("open"); }
-function closeModals() {
-  els.modal1.classList.remove("open");
-  els.modal2.classList.remove("open");
-}
-
-document.querySelectorAll("[data-action=cancel]").forEach(b => {
-  b.addEventListener("click", closeModals);
-});
-[els.modal1, els.modal2].forEach(m => {
-  m.addEventListener("click", e => { if (e.target === m) closeModals(); });
-});
-
-els.btnOverride.addEventListener("click", () => openModal(els.modal1));
-
-els.modal1.querySelector("[data-action=step1-ok]").addEventListener("click", () => {
-  els.modal1.classList.remove("open");
-  els.newCapInput.focus();
-  openModal(els.modal2);
-});
-
-els.modal2.querySelector("[data-action=step2-ok]").addEventListener("click", async () => {
-  const v = parseFloat(els.newCapInput.value);
-  if (!isFinite(v) || v < 3000 || v > 20000) {
-    showToast("Invalid value (allowed range: 3000–20000 W)", "error");
-    return;
-  }
-  try {
-    const res = await fetch(api("/api/safety"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        max_total_w: v,
-        acknowledged_higher_risk: true,
-        acknowledged_separate_fuses: true,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      showToast("Error: " + (data.error || res.status), "error");
-      return;
-    }
-    closeModals();
-    showToast("Override active: " + data.effective_cap_w + " W", "success");
-    refresh();
-  } catch (e) {
-    showToast("Network error: " + e.message, "error");
-  }
-});
-
-els.btnReset.addEventListener("click", async () => {
-  if (!confirm("Reset cap to the value from the configuration file?")) return;
-  try {
-    const res = await fetch(api("/api/safety/reset"), { method: "POST" });
-    const data = await res.json();
-    if (!res.ok || !data.ok) throw new Error(data.error || res.status);
-    showToast("Cap reset: " + data.effective_cap_w + " W", "success");
-    refresh();
-  } catch (e) {
-    showToast("Error: " + e.message, "error");
-  }
-});
 
 // === Phase detection ===
 

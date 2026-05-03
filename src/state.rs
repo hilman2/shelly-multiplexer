@@ -60,7 +60,11 @@ pub struct Allocation {
     /// Sum of |a| + |b| + |c|. Visible measure of how hard the battery
     /// is working, regardless of whether different phases cancel out.
     pub magnitude_w: f64,
-    pub group: Option<String>,
+    pub circuit: String,
+    /// True if this battery is suspended by the multiplex layer (not
+    /// the lead of its circuit). virtual_shelly will drop polls from
+    /// this battery so the inverter's CT-watchdog shuts it off.
+    pub multiplex_inactive: bool,
     /// Why the allocation is what it is — populated by the dispatcher
     /// for cases the user might find non-obvious (battery full, empty,
     /// rate-limited, etc.).
@@ -89,6 +93,12 @@ pub struct AppState {
     /// Not persisted on purpose: a restart resets to the TOML value, so
     /// an emergency reboot always lands on a known-safe configuration.
     pub safety: RwLock<RuntimeSafety>,
+    /// Per-circuit lead state. Dispatcher updates this each tick.
+    pub circuits: RwLock<HashMap<String, CircuitState>>,
+    /// Manual "test deactivate" requests. Battery id → Instant until
+    /// which the multiplex layer treats this battery as forced-inactive
+    /// regardless of normal lead picking. Used by the UI Test button.
+    pub force_inactive_until: RwLock<HashMap<String, Instant>>,
     /// True while phase-detection is actively driving batteries — the
     /// dispatcher skips its loop in this case so it doesn't fight the
     /// detection routine.
@@ -126,6 +136,37 @@ impl RuntimeSafety {
     pub fn override_active(&self) -> bool {
         self.effective_cap_w > SAFETY_DEFAULT_CAP_W
     }
+}
+
+/// Per-circuit lead-tracking state. The dispatcher keeps one of
+/// these per circuit, evolves it each tick:
+///   * `current_lead`: which battery currently gets the CT signal in
+///     this circuit (None = no eligible battery available).
+///   * `last_switch_at`: when we last changed the lead, used for
+///     min-lock to keep the round-robin from oscillating.
+///   * `direction_hint`: the dispatcher's most recent guess at which
+///     way real_total trends, used to bias SoC-based lead selection
+///     (high SoC for discharge, low SoC for charge). Soft signal,
+///     never a safety constraint.
+#[derive(Debug, Clone, Default)]
+pub struct CircuitState {
+    pub current_lead: Option<String>,
+    pub last_switch_at: Option<Instant>,
+    pub direction_hint: DirectionHint,
+    /// While set in the future: the circuit is in transition between
+    /// leads. NO battery is active (old one is letting its CT-watchdog
+    /// time out, new one isn't activated yet) so we can't briefly
+    /// overload the shared protective device.
+    pub transition_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectionHint {
+    #[default]
+    Idle,
+    Charging,
+    Discharging,
 }
 
 /// Rolling-window evidence of how well one battery is responding to
@@ -177,6 +218,13 @@ pub enum StuckDirection {
 #[derive(Debug, Clone, Default)]
 pub struct BatteryTelemetry {
     pub battery_id: String,
+    /// Previous SoC reading kept for delta-based direction detection.
+    /// Updated by `marstek::run` / `ha::run` whenever `soc_percent`
+    /// changes meaningfully — used by the dispatcher to figure out
+    /// which way the active lead is actually moving (charging vs.
+    /// discharging) without having to trust the noisy CT signal.
+    pub previous_soc_percent: Option<f64>,
+    pub previous_soc_at: Option<Instant>,
     /// State of charge in percent. The only piece of telemetry the
     /// dispatcher consumes — used for the min/max SoC eligibility gate.
     pub soc_percent: Option<f64>,
@@ -224,6 +272,8 @@ impl AppState {
             telemetry: RwLock::new(HashMap::new()),
             energy: RwLock::new(EnergyCounters::default()),
             safety: RwLock::new(RuntimeSafety::from_config(safety)),
+            circuits: RwLock::new(HashMap::new()),
+            force_inactive_until: RwLock::new(HashMap::new()),
             detection_active: AtomicBool::new(false),
             responsiveness: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
