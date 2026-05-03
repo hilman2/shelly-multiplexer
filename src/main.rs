@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,6 +24,15 @@ struct Cli {
     /// Override RUST_LOG (e.g. "shelly_multiplexer=debug,info")
     #[arg(long)]
     log: Option<String>,
+
+    /// Override `real_shelly.host` from the TOML config (HA add-on
+    /// passes this from the user's add-on options on every start).
+    #[arg(long)]
+    real_shelly_host: Option<IpAddr>,
+
+    /// Override `real_shelly.udp_port` from the TOML config.
+    #[arg(long)]
+    real_shelly_udp_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -46,9 +56,42 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cfg = Config::load(&cli.config)
+    let mut cfg = Config::load(&cli.config)
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
     info!(path = %cli.config.display(), "config loaded");
+
+    // Apply CLI overrides for real_shelly connection details. The HA
+    // add-on passes these from the user's add-on options so changes
+    // there propagate without forcing a config-file edit.
+    let mut cfg_dirty = false;
+    if let Some(host) = cli.real_shelly_host
+        && cfg.real_shelly.host != host
+    {
+        info!(old = %cfg.real_shelly.host, new = %host, "real_shelly.host overridden by CLI");
+        cfg.real_shelly.host = host;
+        cfg_dirty = true;
+    }
+    if let Some(port) = cli.real_shelly_udp_port
+        && cfg.real_shelly.udp_port != port
+    {
+        info!(
+            old = cfg.real_shelly.udp_port,
+            new = port,
+            "real_shelly.udp_port overridden by CLI"
+        );
+        cfg.real_shelly.udp_port = port;
+        cfg_dirty = true;
+    }
+
+    // Persist merged config so the web UI shows the effective values.
+    if cfg_dirty
+        && let Ok(toml) = toml::to_string_pretty(&cfg)
+    {
+        let tmp = cli.config.with_extension("toml.tmp");
+        if std::fs::write(&tmp, toml).is_ok() {
+            let _ = std::fs::rename(&tmp, &cli.config);
+        }
+    }
 
     let state = AppState::new(&cfg.safety);
     let cfg_swap = Arc::new(ArcSwap::from_pointee(cfg));

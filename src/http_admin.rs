@@ -62,6 +62,23 @@ pub async fn run(
         .await
         .with_context(|| format!("binding admin http on {addr}"))?;
     info!(addr = %addr, "management UI listening");
+
+    // If we're bound to all interfaces, surface every routable LAN IP
+    // so the user can paste a working URL without guessing or relying
+    // on mDNS (HA add-on's webui [HOST] resolves to homeassistant.local
+    // which often doesn't work for the user's browser).
+    if addr.ip().is_unspecified()
+        && let Ok(ifaces) = local_ip_address::list_afinet_netifas()
+    {
+        for (_name, ip) in ifaces {
+            if let std::net::IpAddr::V4(v4) = ip
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+            {
+                info!(url = %format!("http://{v4}:{}/", addr.port()), "admin UI URL");
+            }
+        }
+    }
     axum::serve(listener, router)
         .await
         .context("admin http serve")?;
