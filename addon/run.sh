@@ -37,6 +37,10 @@ min_sample_period_ms = 1000
 device_mac = ""
 device_hostname = ""
 firmware = "1.4.4"
+# HA OS runs Avahi on UDP/5353 already; running our own mdns-sd
+# daemon on top conflicts with it and the worker thread dies. Leave
+# this off unless you've stopped Avahi.
+enable_mdns = false
 
 [management]
 bind_address = "0.0.0.0:8080"

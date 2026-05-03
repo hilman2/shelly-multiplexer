@@ -103,18 +103,18 @@ async fn main() -> Result<()> {
         let s = state.clone();
         let c = cfg_swap.clone();
         tasks.spawn(async move {
-            if let Err(e) = real_shelly::run(s, c).await {
-                error!("real shelly poller stopped: {e:#}");
-            }
+            let r = real_shelly::run(s, c).await;
+            log_task_exit("real_shelly", r);
         });
     }
 
-    // Dispatcher
+    // Dispatcher (loops forever; never returns)
     {
         let s = state.clone();
         let c = cfg_swap.clone();
         tasks.spawn(async move {
             dispatcher::run(s, c).await;
+            log_task_exit::<()>("dispatcher", Ok(()));
         });
     }
 
@@ -123,9 +123,8 @@ async fn main() -> Result<()> {
         let s = state.clone();
         let c = cfg_swap.clone();
         tasks.spawn(async move {
-            if let Err(e) = virtual_shelly::run(s, c).await {
-                error!("virtual shelly UDP server stopped: {e:#}");
-            }
+            let r = virtual_shelly::run(s, c).await;
+            log_task_exit("virtual_shelly", r);
         });
     }
 
@@ -134,20 +133,26 @@ async fn main() -> Result<()> {
         let s = state.clone();
         let c = cfg_swap.clone();
         tasks.spawn(async move {
-            if let Err(e) = marstek::run(s, c).await {
-                error!("marstek telemetry stopped: {e:#}");
-            }
+            let r = marstek::run(s, c).await;
+            log_task_exit("marstek", r);
         });
     }
 
-    // mDNS service advertisement so we appear as a Shelly Pro 3EM
+    // mDNS service advertisement (gated on virtual_shelly.enable_mdns).
+    // On HA OS the host's Avahi already owns UDP/5353 multicast and our
+    // mdns-sd daemon collides with it, so the default in the HA add-on
+    // is OFF. Standalone deployments can flip it on via the web UI.
     {
-        let c = cfg_swap.clone();
-        tasks.spawn(async move {
-            if let Err(e) = mdns::run(c).await {
-                error!("mdns advertisement stopped: {e:#}");
-            }
-        });
+        let cfg_now = cfg_swap.load_full();
+        if cfg_now.virtual_shelly.enable_mdns {
+            let c = cfg_swap.clone();
+            tasks.spawn(async move {
+                let r = mdns::run(c).await;
+                log_task_exit("mdns", r);
+            });
+        } else {
+            info!("mDNS advertisement disabled (virtual_shelly.enable_mdns = false)");
+        }
     }
 
     // Virtual Shelly HTTP server
@@ -155,9 +160,8 @@ async fn main() -> Result<()> {
         let s = state.clone();
         let c = cfg_swap.clone();
         tasks.spawn(async move {
-            if let Err(e) = http_shelly::run(s, c).await {
-                error!("virtual shelly HTTP server stopped: {e:#}");
-            }
+            let r = http_shelly::run(s, c).await;
+            log_task_exit("http_shelly", r);
         });
     }
 
@@ -167,9 +171,8 @@ async fn main() -> Result<()> {
         let c = cfg_swap.clone();
         let p = cli.config.clone();
         tasks.spawn(async move {
-            if let Err(e) = http_admin::run(s, c, p).await {
-                error!("management UI stopped: {e:#}");
-            }
+            let r = http_admin::run(s, c, p).await;
+            log_task_exit("http_admin", r);
         });
     }
 
@@ -188,6 +191,22 @@ async fn main() -> Result<()> {
             error!("a critical task exited; shutting down");
             eprintln!("FATAL: a critical task exited prematurely");
             anyhow::bail!("critical task exited prematurely")
+        }
+    }
+}
+
+/// Helper: every long-running task is supposed to loop forever. If one
+/// returns at all (Ok or Err), surface the task name and reason at
+/// ERROR so we can tell *which* component triggered the shutdown.
+fn log_task_exit<T: std::fmt::Debug>(name: &str, result: Result<T>) {
+    match result {
+        Ok(_) => {
+            error!(task = name, "task exited cleanly (should loop forever)");
+            eprintln!("FATAL task '{name}' exited cleanly");
+        }
+        Err(e) => {
+            error!(task = name, "task failed: {e:#}");
+            eprintln!("FATAL task '{name}' failed: {e:#}");
         }
     }
 }

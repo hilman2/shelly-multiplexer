@@ -110,6 +110,12 @@ pub struct VirtualShellyConfig {
     pub device_hostname: String,
     #[serde(default = "default_firmware")]
     pub firmware: String,
+    /// Advertise via mDNS so inverters can discover us as a Shelly.
+    /// Disabled by default in the HA add-on because HA OS already runs
+    /// Avahi on UDP/5353 and the mdns-sd daemon's worker thread dies
+    /// silently when it can't claim the multicast group.
+    #[serde(default = "default_enable_mdns")]
+    pub enable_mdns: bool,
 }
 
 fn default_bind_interface() -> String {
@@ -126,6 +132,9 @@ fn default_min_sample_period() -> u64 {
 }
 fn default_firmware() -> String {
     "1.4.4".into()
+}
+fn default_enable_mdns() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
