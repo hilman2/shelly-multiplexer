@@ -27,7 +27,7 @@ ENV LANG=C.UTF-8
 # init / signal forwarder), so we don't add tini. Only install what
 # we actually need beyond the base.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/shelly-multiplexer /usr/bin/shelly-multiplexer

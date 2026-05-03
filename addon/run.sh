@@ -58,4 +58,16 @@ else
 fi
 
 export RUST_LOG="shelly_multiplexer=${LOG_LEVEL},${LOG_LEVEL}"
-exec /usr/bin/shelly-multiplexer --config "${CONFIG_FILE}"
+export RUST_BACKTRACE=1
+
+bashio::log.info "Starting shelly-multiplexer (RUST_LOG=${RUST_LOG})…"
+
+# Run instead of exec so we can capture and surface the exit reason
+# in the add-on log when the binary crashes, instead of seeing only
+# s6 stop the service.
+set +e
+/usr/bin/shelly-multiplexer --config "${CONFIG_FILE}"
+EXIT=$?
+set -e
+bashio::log.error "shelly-multiplexer exited with status ${EXIT}"
+exit "${EXIT}"
