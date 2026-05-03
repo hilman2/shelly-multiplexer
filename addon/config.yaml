@@ -1,6 +1,6 @@
 ---
 name: Shelly Multiplexer
-version: "0.1.3"
+version: "0.1.4"
 slug: shelly_multiplexer
 description: >-
   Emulates a Shelly Pro 3EM and saldiert (sum-balances) the real meter's

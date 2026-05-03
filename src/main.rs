@@ -27,6 +27,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // First line out of stderr before anything else happens. If the
+    // binary panics during init we want at least *this* in the log.
+    eprintln!("shelly-multiplexer starting (pid {})", std::process::id());
+
     let cli = Cli::parse();
 
     let env_filter = if let Some(spec) = cli.log {
@@ -34,9 +38,12 @@ async fn main() -> Result<()> {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
+    // Write to stderr — Docker line-buffers stdout in 64 KB chunks, so
+    // a fast crash loses any tracing output. stderr is unbuffered.
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(true)
+        .with_writer(std::io::stderr)
         .init();
 
     let cfg = Config::load(&cli.config)
@@ -128,13 +135,18 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, shutting down");
+            Ok(())
         }
         _ = wait_first(&mut tasks) => {
+            // A spawned task ended unexpectedly — that's a fatal error.
+            // Returning Err makes the process exit non-zero so the
+            // supervisor's restart loop is justified instead of looking
+            // like a clean shutdown.
             error!("a critical task exited; shutting down");
+            eprintln!("FATAL: a critical task exited prematurely");
+            anyhow::bail!("critical task exited prematurely")
         }
     }
-
-    Ok(())
 }
 
 async fn wait_first(tasks: &mut tokio::task::JoinSet<()>) {
