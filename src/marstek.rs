@@ -58,61 +58,108 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     };
 
     let mut sockets_by_port: HashMap<u16, Arc<UdpSocket>> = HashMap::new();
+    let mut blocked_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for battery in &config.batteries {
         if !needs_direct_poll(battery) {
             continue;
         }
-        if sockets_by_port.contains_key(&battery.marstek_port) {
+        if sockets_by_port.contains_key(&battery.marstek_port)
+            || blocked_ports.contains(&battery.marstek_port)
+        {
             continue;
         }
         let bind_addr = format!("0.0.0.0:{}", battery.marstek_port);
-        let socket = UdpSocket::bind(&bind_addr).await.with_context(|| {
-            format!("binding marstek client socket on {bind_addr}")
-        })?;
-        info!(local = %bind_addr, "marstek telemetry socket bound");
-        let socket = Arc::new(socket);
+        match UdpSocket::bind(&bind_addr).await {
+            Ok(socket) => {
+                info!(local = %bind_addr, "marstek telemetry socket bound");
+                let socket = Arc::new(socket);
 
-        // One receiver task per socket, dispatches replies by request id.
-        {
-            let socket = socket.clone();
-            let pending = pending.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; RECV_BUF];
-                loop {
-                    let (len, peer) = match socket.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(error = %e, "marstek recv_from failed");
-                            continue;
+                // One receiver task per socket, dispatches replies by request id.
+                {
+                    let socket = socket.clone();
+                    let pending = pending.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; RECV_BUF];
+                        loop {
+                            let (len, peer) = match socket.recv_from(&mut buf).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(error = %e, "marstek recv_from failed");
+                                    continue;
+                                }
+                            };
+                            let payload = &buf[..len];
+                            let value: Value = match serde_json::from_slice(payload) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(peer = %peer, error = %e, "marstek invalid JSON");
+                                    continue;
+                                }
+                            };
+                            let id = value.get("id").and_then(|i| i.as_i64()).unwrap_or(-1);
+                            debug!(peer = %peer, id, "marstek reply received");
+                            let tx_opt = pending.lock().await.remove(&id);
+                            if let Some(tx) = tx_opt {
+                                let _ = tx.send(value);
+                            } else {
+                                debug!(peer = %peer, id, "marstek reply for unknown id");
+                            }
                         }
-                    };
-                    let payload = &buf[..len];
-                    let value: Value = match serde_json::from_slice(payload) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(peer = %peer, error = %e, "marstek invalid JSON");
-                            continue;
-                        }
-                    };
-                    let id = value.get("id").and_then(|i| i.as_i64()).unwrap_or(-1);
-                    debug!(peer = %peer, id, "marstek reply received");
-                    let tx_opt = pending.lock().await.remove(&id);
-                    if let Some(tx) = tx_opt {
-                        let _ = tx.send(value);
-                    } else {
-                        debug!(peer = %peer, id, "marstek reply for unknown id");
-                    }
+                    });
+                }
+
+                sockets_by_port.insert(battery.marstek_port, socket);
+            }
+            Err(e) => {
+                // Most likely cause on HA-OS: an HA Marstek HACS plugin
+                // already binds this port. Don't crash the whole add-on
+                // — log it, mark the battery so the UI can hint the
+                // user toward the HA SoC integration, and continue.
+                warn!(
+                    port = battery.marstek_port,
+                    error = %e,
+                    "Marstek UDP port already in use — likely an HA Marstek integration owns it. \
+                     Set `home_assistant.enabled = true` and add `soc_entity_id` for affected \
+                     batteries to read SoC via HA instead of polling the inverter directly."
+                );
+                blocked_ports.insert(battery.marstek_port);
+            }
+        }
+    }
+
+    // Pre-mark every battery whose port couldn't be bound, so the UI
+    // surfaces a clear "port blocked, use HA integration" hint instead
+    // of an indefinite "no SoC yet".
+    if !blocked_ports.is_empty() {
+        let mut tel = state.telemetry.write();
+        for battery in &config.batteries {
+            if !needs_direct_poll(battery) {
+                continue;
+            }
+            if !blocked_ports.contains(&battery.marstek_port) {
+                continue;
+            }
+            let entry = tel.entry(battery.id.clone()).or_insert_with(|| {
+                BatteryTelemetry {
+                    battery_id: battery.id.clone(),
+                    ..Default::default()
                 }
             });
+            entry.last_error = Some(format!(
+                "Marstek UDP port {} is already in use (likely the HA Marstek integration). \
+                 Enable `home_assistant` and set `soc_entity_id` to source SoC via HA.",
+                battery.marstek_port
+            ));
         }
-
-        sockets_by_port.insert(battery.marstek_port, socket);
     }
 
     // One polling task per battery (only those still polled directly).
     let mut tasks = tokio::task::JoinSet::new();
     for battery in &config.batteries {
         if !needs_direct_poll(battery) {
+            continue;
+        }
+        if blocked_ports.contains(&battery.marstek_port) {
             continue;
         }
         let socket = sockets_by_port

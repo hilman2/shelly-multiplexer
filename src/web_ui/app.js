@@ -573,6 +573,7 @@ async function loadConfig() {
     fillForm(els.formManagement, "management", cfg.management);
     fillForm(els.formDispatcher, "dispatcher", cfg.dispatcher);
     fillForm(els.formSafety, "safety", cfg.safety);
+    fillForm(els.formHa, "home_assistant", cfg.home_assistant || {});
     renderGroups(cfg.groups || []);
     renderBatteries(cfg.batteries || []);
   } catch (e) {
