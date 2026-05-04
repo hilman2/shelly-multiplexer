@@ -1,75 +1,96 @@
 # ShellyMultiplexer
 
-Splits the per-phase grid measurement of one Shelly Pro 3EM across
-multiple battery storage systems so they no longer fight each other.
+Steers multiple battery storage systems by emulating a Shelly Pro 3EM
+that each Marstek Venus E (or compatible) polls. From v0.2.0 the
+dispatcher is **pulse-based**: each battery has its own virtual
+integrator, the dispatcher emits short delta pulses on every change,
+and the Marstek's internal integrator commits them — exactly like a
+human operator would adjust the CT signal manually, but at 200 ms
+cadence and across many batteries at once.
 
-Without the multiplexer, every battery reads the same Shelly value and
-reacts to it independently — the result is N-fold over-correction and
-oscillation. The multiplexer sits in front of the real Shelly, polls
-it at higher frequency than the batteries do, and presents each battery
-with its own, scaled-down view of grid power so the sum of their
-reactions matches reality.
+The previous architecture (multiplex with one active battery per
+circuit) is gone. The new one needs a **dedicated Shelly Plug PM Gen3
+per battery** and exploits two empirically measured Marstek
+properties: integrator without decay, and reaction to as few as 2
+identical CT samples within ~1.5 s.
+
+## Why pulses
+
+Sending a continuous "fake" CT value never worked precisely — Marstek
+reacts to the integral, not the instant value, and the response gain
+is firmware-dependent. With a Shelly Plug per battery we can:
+
+1. measure exactly what each battery is currently doing,
+2. compute the desired delta to its target,
+3. encode that delta as a short burst of N CT samples, and
+4. confirm via the next plug reading that the burst landed.
+
+This gives us multi-battery-per-circuit (the multiplex layer is gone),
+sub-2-second reaction times, no SoC-direction heuristics, and a hard
+safety guarantee: the circuit cap is enforced from live plug
+measurements, never from "what we think we asked for".
 
 ## Features
 
-- **Virtual Shelly Pro 3EM** on UDP-RPC (port 1010), HTTP-REST (`/shelly`,
-  `/settings`, `/status`) and HTTP-RPC (`/rpc`). Wire-compatible with
-  Marstek, Hoymiles, Anker Solix and other batteries that integrate via
-  Shelly Pro 3EM emulation.
-- **Discoverable on every channel a real Pro 3EM uses:**
-  - **mDNS / Bonjour:** advertises `_shelly._tcp.local` and
-    `_http._tcp.local` with TXT records `id`, `mac`, `gen=2`,
-    `arch=esp32`, `app=Pro3EM`, `ver`, `fw_id`, `model=SPEM-003CEBEU`.
-  - **HTTP identity endpoints:** `/shelly` and `/rpc/Shelly.GetDeviceInfo`.
-  - **UDP-RPC discovery:** any `Shelly.GetDeviceInfo` request to UDP
-    port 1010 — broadcast or unicast — gets a complete reply.
-- **Group-aware allocation** — assign batteries to a group with a shared
-  fuse and the dispatcher will never let them collectively exceed that
-  fuse's rating, even at peak.
-- **Per-battery limits** — each battery has its own `max_charge_w` and
-  `max_discharge_w`, applied per phase.
-- **Phase awareness** — single-phase batteries (e.g. Marstek B2500/Venus
-  on L1) only see the phase they're connected to.
-- **Marstek Open API integration** — pulls live SoC, actual delivered
-  power and charge/discharge permission flags via UDP. Used to drive:
-  - SoC-weighted allocation (`strategy = "by_soc"`)
-  - skip-when-disabled (a battery that can't currently discharge is
-    excluded from the discharge plan)
-  - **redispatch on underdelivery** — if a battery sustainedly delivers
-    less than its share, the unmet portion is shifted to other batteries
-    with headroom.
-- **Anti-oscillation:** rate-limited per-battery setpoint changes plus a
-  configurable deadband.
-- **Global safety cap** — hard 3000 W ceiling on the absolute sum of all
-  allocations. Lifting it requires two explicit acknowledgements (TOML
-  flags or web-UI confirm flow).
-- **Web UI** for live status, allocation visibility, telemetry and the
-  safety override flow.
+- **Virtual Shelly Pro 3EM** on UDP-RPC (port 1010), HTTP-REST and
+  HTTP-RPC. Wire-compatible with Marstek Venus E and other batteries
+  that integrate via Shelly Pro 3EM emulation.
+- **Discoverable via mDNS** as a real Pro 3EM (`_shelly._tcp.local`,
+  `_http._tcp.local`, with the right TXT records).
+- **Per-battery virtual integrator** + delta pulse queue. Hardware-
+  clamped to each battery's `max_charge_w` / `max_discharge_w`.
+- **Plug-driven circuit cap** — the sum of plug readings on a circuit
+  must stay below `cap_w * circuit_headroom`. Violations scale down
+  the affected circuit's targets.
+- **Saturation detection** — when the plug stays below commanded for
+  more than `saturation_window_s`, the battery is parked at the
+  observed ceiling and the unmet watts redispatch to siblings. The
+  battery un-saturates automatically when it can keep up again.
+- **Group failure mode** — if any plug in a circuit goes silent for
+  more than `plug_stale_s`, the whole circuit is muted (CT silent for
+  `group_silent_after_stale_s`), forcing every Marstek's watchdog to
+  clear its integrator. Resumes once plugs are healthy again.
+- **Capacity-weighted distribution** — `priority_weight × directional
+  hardware cap` per battery. Falls back gracefully when a battery is
+  full / empty / saturated by handing the slack to siblings (grid
+  balance > SoC balance).
+- **Marstek SoC poller** — used only for the `soc_full_pct` /
+  `soc_empty_pct` eligibility gate. Power telemetry is no longer read
+  from the Marstek (the plug is faster and authoritative).
+- **HA integration** — optional SoC source per battery via the HA Core
+  REST API.
+- **Standalone calibration tool** — `marstek_calibrate.exe` (Windows
+  binary) for empirically characterising a Marstek's pulse response.
+  Announces itself via mDNS so the Marstek auto-discovers it. See
+  `src/bin/marstek_calibrate.rs`.
 - **Cross-platform** — Linux, Windows, macOS.
 
 ## Architecture
 
-Detailed design notes live in [`docs/architecture.md`](docs/architecture.md).
-The short version:
-
 ```
-                  ┌──────────────────────────────────────────────┐
-                  │                                              │
-   Real Shelly    │  Multiplexer                                 │
-   ──────────    │  ──────────                                  │
-   :2020 (RPC) ◀─┤  Real-Shelly poller (UDP-RPC, ~4 Hz)         │
-                  │     │                                       │
-                  │     ▼                                       │
-                  │  Dispatcher (groups, caps, telemetry, redispatch)
-                  │     │                                       │
-                  │     ▼                                       │
-   Batteries  ───▶│  Virtual Shelly Pro 3EM                     │
-   poll :1010    │   (UDP :1010, HTTP :80 — Shelly-compatible)  │
-                  │                                              │
-   Marstek API   │  Marstek telemetry (UDP :30000 → battery)    │
-                  │                                              │
-   Browser   ───▶│  Web UI / management API (:8080)             │
-                  └──────────────────────────────────────────────┘
+                  ┌──────────────────────────────────────────────────┐
+                  │  ShellyMultiplexer (pulse mode)                  │
+                  │                                                  │
+   Real Shelly    │   Real-Shelly poller (UDP-RPC, ~4 Hz)            │
+   ──────────    │            │                                     │
+   :2020 (RPC) ◀─┤            ▼                                     │
+                  │   Dispatcher loop (200 ms)                       │
+                  │   • compute desired_w per battery                │
+                  │   • update commanded_w (+= delta)                │
+                  │   • queue pulse_count pulses of value=delta      │
+                  │            │                                     │
+                  │            ▼                                     │
+   Marsteks    ──▶│   Virtual Shelly UDP server                      │
+   poll :1010    │   • route by source IP -> battery                │
+                  │   • drain one pulse per poll                     │
+                  │   • drop response if circuit muted               │
+                  │                                                  │
+   Plugs (one    │   Plug HTTP poller (200 ms per plug)             │
+   per battery) ─▶│   • Switch.GetStatus -> last_plug_w             │
+   GET /rpc      │   • stale > plug_stale_s -> mute circuit         │
+                  │                                                  │
+   Browser   ───▶│   Status UI (:8080) — read-only                  │
+                  └──────────────────────────────────────────────────┘
 ```
 
 > ⚠ **Required configuration on the real Shelly:** move its UDP-RPC port
@@ -78,7 +99,7 @@ The short version:
 
 ## Building
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.87+ (edition 2024).
 
 ```bash
 cargo build --release
@@ -90,16 +111,19 @@ to deploy.
 
 ## Running
 
-1. Copy the example config:
+1. Copy the example config (or let the HA add-on write a template on
+   first start):
 
    ```bash
    cp config.example.toml config.toml
    ```
 
 2. Edit `config.toml`:
-   - Real Shelly IP and the *moved* UDP port,
-   - Battery IPs, max powers, group assignment, phase,
-   - Group fuse ratings.
+   - real Shelly IP and the *moved* UDP port,
+   - one or more `[[circuits]]` entries (`fuse_amps`, `voltage`, `phases`),
+   - one `[[battery]]` per battery with `address` (the Marstek's
+     static IP), `circuit`, `plug_url` (mandatory), and the hardware
+     caps.
 
 3. Start it:
 
@@ -107,12 +131,11 @@ to deploy.
    ./shelly-multiplexer --config config.toml
    ```
 
-4. Open the web UI: <http://localhost:8080>
+4. Open the status UI: <http://localhost:8080>
 
 5. In each battery, point its "Shelly Pro 3EM" target at the
    multiplexer's IP (instead of the real Shelly's IP). For Marstek
-   devices, enable the Open API in the Marstek app and confirm the UDP
-   port matches `marstek_port` in `config.toml`.
+   devices, enable the Open API in the Marstek app.
 
 ### Privileged ports
 
@@ -124,70 +147,46 @@ sudo setcap 'cap_net_bind_service=+ep' target/release/shelly-multiplexer
 
 On Windows, run as Administrator or change the ports in `config.toml`.
 
-### mDNS across subnets / VLANs
+## Dispatcher tuning knobs
 
-mDNS uses link-local multicast and **does not cross subnet or VLAN
-boundaries** by default. If the multiplexer and the batteries live on
-different VLANs, either:
+| Field | Default | Purpose |
+|---|---|---|
+| `cycle_ms` | 200 | how often the dispatcher recomputes desired_w |
+| `deadband_w` | 30 | minimum delta before a new pulse queues |
+| `hit_tolerance_w` | 15 | `\|commanded - plug\|` ≤ this counts as "pulse landed" |
+| `pulse_count` | 3 | pulses per delta change (Marstek needs ≥ 2) |
+| `soc_full_pct` | 95 | skip charging at or above this SoC |
+| `soc_empty_pct` | 5 | skip discharging at or below this SoC |
+| `plug_stale_s` | 2.0 | plug silent this long → mute circuit |
+| `group_silent_after_stale_s` | 60.0 | how long the muted circuit stays muted after recovery |
+| `circuit_headroom` | 0.95 | use only this fraction of fuse cap |
+| `saturation_gap_w` | 100 | `\|commanded - plug\|` > this triggers saturation tracking |
+| `saturation_window_s` | 8.0 | gap must persist this long to mark saturated |
 
-- enable an mDNS repeater on your gateway (Avahi reflector, OPNsense
-  "Avahi" plugin, UniFi mDNS reflection, etc.), **or**
-- manually configure each battery with the multiplexer's IP — this
-  works regardless of mDNS and is what Marstek devices need anyway.
+## Migrating from v0.1.x
 
-On the same subnet, no extra setup is needed; batteries scanning for a
-Shelly Pro 3EM will find the multiplexer.
+The schema changed completely. After updating, the dispatcher refuses
+to start with `battery X: plug_url is required`. Either delete
+`config.toml` (the HA add-on writes a v0.2.0 template on next start)
+or manually adapt: drop the `[safety]` section, drop per-battery
+`min_soc_percent` / `max_soc_percent` / `phase` / `priority`, add
+`plug_url` to every battery and renew `[dispatcher]`.
 
-## Allocation strategies
+## Calibration tool
 
-| `strategy` | Behaviour |
-|---|---|
-| `equal` | Every eligible battery in the group gets the same share. Default. |
-| `by_capacity` | Proportional to per-battery max charge/discharge limits. |
-| `by_soc` | Discharge: prefer batteries with high SoC. Charge: prefer batteries with low SoC. Falls back to `equal` for batteries without telemetry. |
-| `priority` | Lower `priority` value contributes first; higher tiers only kick in when the lower tier saturates. |
-
-## Safety cap
-
-By default, the multiplexer will never dispatch more than **3000 W**
-total in either direction (charging or discharging summed across all
-batteries). This is a residential-friendly default that protects against
-configuration mistakes — no single mis-configured fuse can be
-overloaded.
-
-To raise the cap above 3000 W, **both** of the following are required:
-
-1. Edit `config.toml`:
-   ```toml
-   [safety]
-   max_total_w = 5000
-   acknowledged_higher_risk = true
-   acknowledged_separate_fuses = true
-   ```
-2. Or use the web UI's two-step confirm flow (Override active is shown
-   in the header). Runtime overrides are deliberately not persisted —
-   restarting always returns the system to the value in `config.toml`.
-
-The acknowledgements explicitly state:
-
-- `acknowledged_higher_risk`: I understand that going above 3000 W can
-  cause overload, equipment damage, or fire if the wiring isn't rated.
-- `acknowledged_separate_fuses`: every battery is on its **own**,
-  adequately rated protective device. No two batteries share a
-  protective device whose rated current is below their summed output.
-
-## Testing without batteries
-
-For development you can run the binary against a local-only smoke
-config:
+`marstek_calibrate.exe` (under `src/bin/marstek_calibrate.rs`) is a
+standalone Windows binary for empirically characterising a Marstek's
+pulse response. Build with:
 
 ```bash
-cargo run -- --config config.test.toml
-curl http://127.0.0.1:18080/api/health
+cargo build --release --bin marstek_calibrate
 ```
 
-The poller will log timeouts (no real Shelly at the configured IP) but
-all servers come up and the web UI works.
+Run it on a PC on the same LAN as the Marstek; it announces itself as
+a Shelly Pro 3EM via mDNS so the Marstek auto-discovers it. Send
+manual pulses (`set -100 3` etc.) and observe the resulting charge
+change in the Marstek app. The empirically measured numbers used by
+the production dispatcher are documented in `memory/marstek_empirical.md`.
 
 ## License
 
