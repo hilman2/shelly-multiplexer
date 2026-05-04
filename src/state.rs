@@ -1,13 +1,21 @@
-use std::collections::HashMap;
+//! Runtime state for the pulse dispatcher.
+//!
+//! Each battery owns a virtual integrator (`commanded_w`) whose value is the
+//! cumulative sum of every delta pulse we have committed to that Marstek's
+//! internal integrator. Marstek hardware integrates the same pulses on its
+//! end; our `commanded_w` is what we *expect* it to be. The Shelly Plug
+//! reading (`last_plug_w`) is the ground truth that resolves disagreements
+//! and detects saturation.
+
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
-use crate::config::{SafetyConfig, SAFETY_DEFAULT_CAP_W};
+use crate::config::{BatteryConfig, CircuitConfig, Config};
 use crate::rpc::EmStatusIncoming;
 
 /// Snapshot of the real Shelly's last successful poll.
@@ -17,266 +25,196 @@ pub struct EmSnapshot {
     pub age: Option<Instant>,
 }
 
-/// Per-battery allocation produced by the dispatcher. Multipliers are
-/// applied per phase: `0.5` means "this battery sees 50% of the real
-/// power on that phase". A battery on a single phase will have a
-/// non-zero factor only on its phase and `0.0` on the others.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PhaseFactors {
-    pub a: f64,
-    pub b: f64,
-    pub c: f64,
-}
+/// Sign convention everywhere in this app:
+///   - positive = battery DISCHARGES (power flowing out toward house/grid)
+///   - negative = battery CHARGES   (power flowing in from grid)
+///
+/// CT signal we present to a Marstek follows the same convention: sending
+/// a positive value tells the Marstek "the grid is importing this many W,
+/// please discharge to compensate". The Marstek treats each value as a
+/// delta to its internal target (no decay) — see memory/marstek_empirical.md.
 
-impl PhaseFactors {
-    pub const fn uniform(f: f64) -> Self {
-        Self { a: f, b: f, c: f }
-    }
-}
-
-/// Per-phase battery allocation in watts. Sign follows the Shelly
-/// convention: positive = battery discharges into that phase, negative
-/// = battery charges from that phase's surplus.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PhaseWatts {
-    pub a: f64,
-    pub b: f64,
-    pub c: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct Allocation {
-    pub battery_id: String,
-    pub factors: PhaseFactors,
-    /// Per-phase allocation in watts (same sign convention as the
-    /// Shelly: + = discharge, − = charge). This is what the battery
-    /// actually sees per phase via `EM.GetStatus`.
-    pub phase_w: PhaseWatts,
-    /// Net DC-side allocation (= a + b + c). On a battery that is
-    /// charging on one phase and discharging on another, this can be
-    /// near zero even though the battery is doing work — use
-    /// `phase_w` and `magnitude_w` to see the actual activity.
-    pub allocated_w: f64,
-    /// Sum of |a| + |b| + |c|. Visible measure of how hard the battery
-    /// is working, regardless of whether different phases cancel out.
-    pub magnitude_w: f64,
+#[derive(Debug)]
+pub struct BatteryState {
+    pub id: String,
     pub circuit: String,
-    /// True if this battery is suspended by the multiplex layer (not
-    /// the lead of its circuit). virtual_shelly will drop polls from
-    /// this battery so the inverter's CT-watchdog shuts it off.
-    pub multiplex_inactive: bool,
-    /// Why the allocation is what it is — populated by the dispatcher
-    /// for cases the user might find non-obvious (battery full, empty,
-    /// rate-limited, etc.).
-    pub note: Option<String>,
+    pub address: IpAddr,
+
+    pub max_charge_w: f64,
+    pub max_discharge_w: f64,
+    pub capacity_wh: f64,
+    pub priority_weight: f64,
+
+    /// Our virtual integrator. Hardware-clamped to
+    /// [-max_charge_w, +max_discharge_w].
+    pub commanded_w: f64,
+
+    /// FIFO of pulse values still to drain on subsequent Marstek polls.
+    pub pulse_queue: VecDeque<f64>,
+
+    /// Latest plug reading (signed, our convention).
+    pub last_plug_w: Option<f64>,
+    pub last_plug_at: Option<Instant>,
+
+    /// Diagnostics: when this Marstek last polled the virtual Shelly.
+    pub last_marstek_poll_at: Option<Instant>,
+
+    /// Saturation: battery cannot reach commanded_w (full / empty / hardware
+    /// limited). Detected when |commanded_w| > |plug_w| + saturation_gap_w
+    /// for more than saturation_window_s. Causes the dispatcher to reduce
+    /// commanded_w to the observed ceiling and redispatch the missing watts
+    /// to siblings.
+    pub saturated: bool,
+    pub saturation_ceiling_w: Option<f64>,
+    pub saturation_since: Option<Instant>,
+
+    /// Telemetry sourced from the Marstek itself (or HA).
+    pub soc_pct: Option<f64>,
+    pub soc_at: Option<Instant>,
+
+    /// Last error from any subsystem, surfaced in the UI.
+    pub last_error: Option<String>,
 }
 
-/// Shared, lock-light state passed to all subsystems.
-pub struct AppState {
-    /// Last successful real-Shelly snapshot. Lock-free read via ArcSwap.
-    pub snapshot: ArcSwap<EmSnapshot>,
-    /// Allocations keyed by battery IP. Read on every UDP request, written
-    /// by the dispatcher; an RwLock is fine — read is a quick HashMap lookup.
-    pub allocations: RwLock<HashMap<IpAddr, Allocation>>,
-    /// Time of last poll request received from a battery, keyed by IP.
-    /// Written exclusively by `virtual_shelly` on each incoming request,
-    /// read by `http_admin` for status display. Kept separate from
-    /// `allocations` so the dispatcher's full-map replacement on every
-    /// tick doesn't race with poll-time updates.
-    pub last_poll_at: RwLock<HashMap<IpAddr, Instant>>,
-    /// Per-battery telemetry (SoC, actual power, flags) keyed by battery id.
-    pub telemetry: RwLock<HashMap<String, BatteryTelemetry>>,
-    /// Cumulative energy counters (Wh) integrated from observed power.
-    pub energy: RwLock<EnergyCounters>,
-    /// Runtime-mutable safety cap. Initialised from `config.safety` at
-    /// startup and adjustable via the admin UI's two-step confirm flow.
-    /// Not persisted on purpose: a restart resets to the TOML value, so
-    /// an emergency reboot always lands on a known-safe configuration.
-    pub safety: RwLock<RuntimeSafety>,
-    /// Per-circuit lead state. Dispatcher updates this each tick.
-    pub circuits: RwLock<HashMap<String, CircuitState>>,
-    /// Manual "test deactivate" requests. Battery id → Instant until
-    /// which the multiplex layer treats this battery as forced-inactive
-    /// regardless of normal lead picking. Used by the UI Test button.
-    pub force_inactive_until: RwLock<HashMap<String, Instant>>,
-    /// True while phase-detection is actively driving batteries — the
-    /// dispatcher skips its loop in this case so it doesn't fight the
-    /// detection routine.
-    pub detection_active: AtomicBool,
-    /// Rolling 10-minute responsiveness statistics per battery, used
-    /// for passive "stuck" detection. Updated by the dispatcher
-    /// whenever it issues a non-trivial command and observes the CT
-    /// reaction.
-    pub responsiveness: RwLock<HashMap<String, ResponsivenessTracker>>,
-    pub started_at: Instant,
-}
-
-/// Live safety state. The dispatcher reads `effective_cap_w` on every tick.
-#[derive(Debug, Clone)]
-pub struct RuntimeSafety {
-    pub effective_cap_w: f64,
-    pub acknowledged_higher_risk: bool,
-    pub acknowledged_separate_fuses: bool,
-    /// Where the current cap came from: `"config"` or `"runtime"`.
-    pub source: &'static str,
-    pub last_changed_at: Option<Instant>,
-}
-
-impl RuntimeSafety {
-    pub fn from_config(c: &SafetyConfig) -> Self {
+impl BatteryState {
+    pub fn from_config(cfg: &BatteryConfig) -> Self {
         Self {
-            effective_cap_w: c.effective_cap_w(),
-            acknowledged_higher_risk: c.acknowledged_higher_risk,
-            acknowledged_separate_fuses: c.acknowledged_separate_fuses,
-            source: "config",
-            last_changed_at: None,
+            id: cfg.id.clone(),
+            circuit: cfg.circuit.clone(),
+            address: cfg.address,
+            max_charge_w: cfg.max_charge_w,
+            max_discharge_w: cfg.max_discharge_w,
+            capacity_wh: if cfg.capacity_wh > 0.0 {
+                cfg.capacity_wh
+            } else {
+                cfg.max_charge_w + cfg.max_discharge_w
+            },
+            priority_weight: cfg.priority_weight,
+            commanded_w: 0.0,
+            pulse_queue: VecDeque::new(),
+            last_plug_w: None,
+            last_plug_at: None,
+            last_marstek_poll_at: None,
+            saturated: false,
+            saturation_ceiling_w: None,
+            saturation_since: None,
+            soc_pct: None,
+            soc_at: None,
+            last_error: None,
         }
     }
 
-    pub fn override_active(&self) -> bool {
-        self.effective_cap_w > SAFETY_DEFAULT_CAP_W
+    /// Has the previous pulse landed (plug reads close to commanded_w)?
+    /// Used to enforce "no new pulse while previous is still in flight".
+    pub fn pulse_settled(&self, hit_tolerance_w: f64) -> bool {
+        if !self.pulse_queue.is_empty() {
+            return false;
+        }
+        let Some(plug) = self.last_plug_w else {
+            return false;
+        };
+        if (plug - self.commanded_w).abs() <= hit_tolerance_w {
+            return true;
+        }
+        // If we've concluded the battery is saturated and the plug confirms
+        // we're parked at the ceiling, treat the previous pulse as landed.
+        if self.saturated {
+            if let Some(ceiling) = self.saturation_ceiling_w {
+                if (plug - ceiling).abs() <= hit_tolerance_w {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn is_plug_fresh(&self, now: Instant, stale_s: f64) -> bool {
+        match self.last_plug_at {
+            Some(t) => now.duration_since(t).as_secs_f64() <= stale_s,
+            None => false,
+        }
     }
 }
 
-/// Per-circuit lead-tracking state. The dispatcher keeps one of
-/// these per circuit, evolves it each tick:
-///   * `current_lead`: which battery currently gets the CT signal in
-///     this circuit (None = no eligible battery available).
-///   * `last_switch_at`: when we last changed the lead, used for
-///     min-lock to keep the round-robin from oscillating.
-///   * `direction_hint`: the dispatcher's most recent guess at which
-///     way real_total trends, used to bias SoC-based lead selection
-///     (high SoC for discharge, low SoC for charge). Soft signal,
-///     never a safety constraint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct CircuitState {
-    pub current_lead: Option<String>,
-    pub last_switch_at: Option<Instant>,
-    pub direction_hint: DirectionHint,
-    /// While set in the future: the circuit is in transition between
-    /// leads. NO battery is active (old one is letting its CT-watchdog
-    /// time out, new one isn't activated yet) so we can't briefly
-    /// overload the shared protective device.
-    pub transition_until: Option<Instant>,
+    pub config: CircuitConfig,
+    pub member_ids: Vec<String>,
+    /// Set when any plug in the circuit has been stale long enough that we
+    /// can't trust the cap math. While set, virtual_shelly drops responses
+    /// to all members so their watchdogs clear (60 s by default), then we
+    /// resume only once plugs are healthy again.
+    pub silent_until: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DirectionHint {
-    #[default]
-    Idle,
-    Charging,
-    Discharging,
+impl CircuitState {
+    pub fn cap_w(&self) -> f64 {
+        self.config.cap_w()
+    }
 }
 
-/// Rolling-window evidence of how well one battery is responding to
-/// the dispatcher's commands. We don't have direct telemetry of
-/// *what the inverter actually does*, so the heuristic is: whenever
-/// we issue a step change in factor, the CT phase that the battery
-/// sits on should react proportionally a few seconds later. If many
-/// such expected reactions don't materialise over a 10-minute window,
-/// the battery is probably saturated (full when charging, empty when
-/// discharging — or just hung).
-///
-/// This struct holds raw observations; the verdict (stuck / fine /
-/// unknown) is computed on demand from them.
-#[derive(Debug, Clone, Default)]
-pub struct ResponsivenessTracker {
-    pub battery_id: String,
-    /// Append-only ring of recent step events. Pruned to the last
-    /// 10 minutes on every insert.
-    pub events: std::collections::VecDeque<StepEvent>,
-    /// Direction the battery is currently believed to be stuck in,
-    /// derived once per minute by the dispatcher.
-    pub stuck_direction: Option<StuckDirection>,
-    /// When the verdict was last refreshed.
-    pub last_verdict_at: Option<Instant>,
+pub struct AppState {
+    pub snapshot: ArcSwap<EmSnapshot>,
+    pub batteries: RwLock<HashMap<String, BatteryState>>,
+    pub circuits: RwLock<HashMap<String, CircuitState>>,
+    /// Marstek IP -> battery_id, derived from config at startup so the UDP
+    /// responder can route polls to their pulse queues in O(1).
+    pub by_addr: HashMap<IpAddr, String>,
+    pub energy: RwLock<EnergyCounters>,
+    pub started_at: Instant,
 }
 
-/// One recorded "we asked for a change of X W and saw a CT swing of Y W"
-/// observation. Compared against an expected swing range to score it.
-#[derive(Debug, Clone, Copy)]
-pub struct StepEvent {
-    pub at: Instant,
-    /// Direction expected (charging = negative target, discharging = positive).
-    pub direction: StuckDirection,
-    /// Magnitude of the *commanded* step in W (always positive; the
-    /// direction field carries the sign).
-    pub commanded_step_w: f64,
-    /// Magnitude of the observed CT swing on the assigned phase, also
-    /// always positive.
-    pub observed_step_w: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StuckDirection {
-    Charging,
-    Discharging,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BatteryTelemetry {
-    pub battery_id: String,
-    /// Previous SoC reading kept for delta-based direction detection.
-    /// Updated by `marstek::run` / `ha::run` whenever `soc_percent`
-    /// changes meaningfully — used by the dispatcher to figure out
-    /// which way the active lead is actually moving (charging vs.
-    /// discharging) without having to trust the noisy CT signal.
-    pub previous_soc_percent: Option<f64>,
-    pub previous_soc_at: Option<Instant>,
-    /// State of charge in percent. The only piece of telemetry the
-    /// dispatcher consumes — used for the min/max SoC eligibility gate.
-    pub soc_percent: Option<f64>,
-    pub last_update: Option<Instant>,
-    pub last_error: Option<String>,
+impl AppState {
+    pub fn from_config(cfg: &Config) -> Arc<Self> {
+        let mut batteries = HashMap::new();
+        let mut by_addr = HashMap::new();
+        for b in &cfg.batteries {
+            let st = BatteryState::from_config(b);
+            by_addr.insert(st.address, st.id.clone());
+            batteries.insert(st.id.clone(), st);
+        }
+        let mut circuits = HashMap::new();
+        for c in &cfg.circuits {
+            let members: Vec<String> = cfg
+                .batteries
+                .iter()
+                .filter(|b| b.circuit == c.id)
+                .map(|b| b.id.clone())
+                .collect();
+            circuits.insert(
+                c.id.clone(),
+                CircuitState {
+                    config: c.clone(),
+                    member_ids: members,
+                    silent_until: None,
+                },
+            );
+        }
+        Arc::new(Self {
+            snapshot: ArcSwap::from_pointee(EmSnapshot::default()),
+            batteries: RwLock::new(batteries),
+            circuits: RwLock::new(circuits),
+            by_addr,
+            energy: RwLock::new(EnergyCounters::default()),
+            started_at: Instant::now(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnergyCounters {
-    pub a_consumed_wh: f64,
-    pub a_returned_wh: f64,
-    pub b_consumed_wh: f64,
-    pub b_returned_wh: f64,
-    pub c_consumed_wh: f64,
-    pub c_returned_wh: f64,
+    pub consumed_wh: f64,
+    pub returned_wh: f64,
 }
 
 impl EnergyCounters {
-    /// Integrate one sample. `dt_seconds` is the elapsed time since the
-    /// previous integration; energy adds in Wh.
     pub fn integrate(&mut self, snap: &EmStatusIncoming, dt_seconds: f64) {
         let dt_h = dt_seconds / 3600.0;
-        for (power, consumed, returned) in [
-            (snap.a_act_power, &mut self.a_consumed_wh, &mut self.a_returned_wh),
-            (snap.b_act_power, &mut self.b_consumed_wh, &mut self.b_returned_wh),
-            (snap.c_act_power, &mut self.c_consumed_wh, &mut self.c_returned_wh),
-        ] {
-            if let Some(p) = power {
-                if p >= 0.0 {
-                    *consumed += p * dt_h;
-                } else {
-                    *returned += -p * dt_h;
-                }
-            }
+        let total = snap.total_act_power.unwrap_or(0.0);
+        if total >= 0.0 {
+            self.consumed_wh += total * dt_h;
+        } else {
+            self.returned_wh += -total * dt_h;
         }
-    }
-}
-
-impl AppState {
-    pub fn new(safety: &SafetyConfig) -> Arc<Self> {
-        Arc::new(Self {
-            snapshot: ArcSwap::from_pointee(EmSnapshot::default()),
-            allocations: RwLock::new(HashMap::new()),
-            last_poll_at: RwLock::new(HashMap::new()),
-            telemetry: RwLock::new(HashMap::new()),
-            energy: RwLock::new(EnergyCounters::default()),
-            safety: RwLock::new(RuntimeSafety::from_config(safety)),
-            circuits: RwLock::new(HashMap::new()),
-            force_inactive_until: RwLock::new(HashMap::new()),
-            detection_active: AtomicBool::new(false),
-            responsiveness: RwLock::new(HashMap::new()),
-            started_at: Instant::now(),
-        })
     }
 }

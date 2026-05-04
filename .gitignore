@@ -5,5 +5,6 @@ config.local.toml
 config.test.toml
 .idea/
 .vscode/
+.claude/
 # Third-party reference material kept locally (not redistributed).
 /reference/

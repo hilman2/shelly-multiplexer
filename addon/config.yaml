@@ -1,11 +1,13 @@
 ---
 name: Shelly Multiplexer
-version: "0.1.23"
+version: "0.2.0"
 slug: shelly_multiplexer
 description: >-
-  Emulates a Shelly Pro 3EM and saldiert (sum-balances) the real meter's
-  power across several battery storages (Marstek Venus E, Hoymiles HM/HMS
-  in CT mode). Includes a built-in web UI for live tuning.
+  Pulse-based dispatcher: emulates a Shelly Pro 3EM and steers multiple
+  battery storages (Marstek Venus E) via per-poll delta pulses. Each
+  battery REQUIRES a Shelly Plug PM Gen3 for safety-critical cap
+  enforcement. Status UI shows live commanded vs measured power, pulse
+  queue and saturation per battery.
 arch:
   - amd64
   - aarch64

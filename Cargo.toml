@@ -1,9 +1,9 @@
 [package]
 name = "shelly-multiplexer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
-description = "Splits one Shelly 3EM grid measurement across multiple battery storage systems with group/fuse-aware load allocation"
+description = "Pulse-based dispatcher emulating a Shelly Pro 3EM that steers multiple Marstek Venus E batteries with per-battery Shelly Plug PM Gen3 feedback"
 license = "Apache-2.0"
 
 [dependencies]

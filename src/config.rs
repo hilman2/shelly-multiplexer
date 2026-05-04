@@ -1,3 +1,9 @@
+//! TOML configuration for the pulse-based multi-battery dispatcher.
+//!
+//! Green-field schema: no compatibility with previous multiplex configs.
+//! Every battery MUST have a Shelly Plug PM Gen3 — plug measurements are
+//! the authoritative ground truth for circuit-cap enforcement.
+
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -9,42 +15,197 @@ pub struct Config {
     pub real_shelly: RealShellyConfig,
     pub virtual_shelly: VirtualShellyConfig,
     pub management: ManagementConfig,
-    pub dispatcher: DispatcherConfig,
-    /// Kept as a deprecated section for backwards compatibility — the
-    /// dispatcher no longer reads it. Safety is now enforced
-    /// physically: max 1 battery active per circuit, with circuits
-    /// validating that no member exceeds the circuit's cap.
     #[serde(default)]
-    pub safety: SafetyConfig,
+    pub dispatcher: DispatcherConfig,
     #[serde(default)]
     pub home_assistant: HomeAssistantConfig,
-    /// `[[circuits]]` is the new name; `[[groups]]` still parses for
-    /// backwards compatibility (deserde alias). Output writes always
-    /// use the new key.
-    #[serde(default, alias = "groups")]
+    #[serde(default)]
     pub circuits: Vec<CircuitConfig>,
     #[serde(default)]
     pub batteries: Vec<BatteryConfig>,
 }
 
-/// Optional bridge to a Home Assistant instance. When `enabled` and a
-/// battery has `soc_entity_id` set, we read SoC from HA via its REST
-/// API instead of polling the inverter directly. Useful when HA already
-/// owns the inverter's UDP port (e.g. an HA Marstek integration is
-/// running) — the multiplexer doesn't need to compete for it.
+// ---------------------------------------------------------------------------
+// Real Shelly (grid measurement source)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RealShellyConfig {
+    pub host: IpAddr,
+    pub udp_port: u16,
+    #[serde(default = "default_real_poll_interval")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_ms: u64,
+}
+
+fn default_real_poll_interval() -> u64 {
+    250
+}
+fn default_request_timeout() -> u64 {
+    1000
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Shelly (the face we present to the Marsteks)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VirtualShellyConfig {
+    #[serde(default = "default_bind_interface")]
+    pub bind_interface: String,
+    #[serde(default = "default_virtual_udp_port")]
+    pub udp_port: u16,
+    #[serde(default = "default_virtual_http_port")]
+    pub http_port: u16,
+    #[serde(default)]
+    pub device_mac: String,
+    #[serde(default)]
+    pub device_hostname: String,
+    #[serde(default = "default_firmware")]
+    pub firmware: String,
+    #[serde(default = "default_enable_mdns")]
+    pub enable_mdns: bool,
+}
+
+fn default_bind_interface() -> String {
+    "0.0.0.0".into()
+}
+fn default_virtual_udp_port() -> u16 {
+    1010
+}
+fn default_virtual_http_port() -> u16 {
+    80
+}
+fn default_firmware() -> String {
+    "1.4.4".into()
+}
+fn default_enable_mdns() -> bool {
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Management UI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManagementConfig {
+    #[serde(default = "default_management_bind")]
+    pub bind_address: String,
+}
+
+fn default_management_bind() -> String {
+    "0.0.0.0:8080".into()
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher (pulse-based)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DispatcherConfig {
+    /// Recompute interval for desired_w + pulse generation.
+    #[serde(default = "default_cycle_ms")]
+    pub cycle_ms: u64,
+    /// Δ below this is ignored — Marstek-quantisation noise.
+    #[serde(default = "default_deadband_w")]
+    pub deadband_w: f64,
+    /// |commanded − measured| ≤ this counts as "pulse landed".
+    /// Marstek typically undershoots ~5 W due to conversion losses.
+    #[serde(default = "default_hit_tolerance_w")]
+    pub hit_tolerance_w: f64,
+    /// Pulses sent per delta change. Marstek needs ≥2; 3 = safety margin.
+    #[serde(default = "default_pulse_count")]
+    pub pulse_count: u32,
+    /// SoC at/above which charging is skipped for the battery.
+    #[serde(default = "default_soc_full")]
+    pub soc_full_pct: f64,
+    /// SoC at/below which discharging is skipped for the battery.
+    #[serde(default = "default_soc_empty")]
+    pub soc_empty_pct: f64,
+    /// Plug silent for this long → group goes safe.
+    #[serde(default = "default_plug_stale_s")]
+    pub plug_stale_s: f64,
+    /// After a stale plug recovers, mute the group's CT signal for this
+    /// long (Marstek watchdog clears integrator) before resuming.
+    #[serde(default = "default_group_silent_s")]
+    pub group_silent_after_stale_s: f64,
+    /// Use only this fraction of the circuit cap (95 %) — jitter buffer.
+    #[serde(default = "default_circuit_headroom")]
+    pub circuit_headroom: f64,
+    /// Saturation detection: if commanded_w exceeds plug_w by this much
+    /// and stays there for `saturation_window_s`, the battery is treated
+    /// as saturated and the missing watts are redispatched to siblings.
+    #[serde(default = "default_saturation_gap_w")]
+    pub saturation_gap_w: f64,
+    #[serde(default = "default_saturation_window_s")]
+    pub saturation_window_s: f64,
+}
+
+impl Default for DispatcherConfig {
+    fn default() -> Self {
+        Self {
+            cycle_ms: default_cycle_ms(),
+            deadband_w: default_deadband_w(),
+            hit_tolerance_w: default_hit_tolerance_w(),
+            pulse_count: default_pulse_count(),
+            soc_full_pct: default_soc_full(),
+            soc_empty_pct: default_soc_empty(),
+            plug_stale_s: default_plug_stale_s(),
+            group_silent_after_stale_s: default_group_silent_s(),
+            circuit_headroom: default_circuit_headroom(),
+            saturation_gap_w: default_saturation_gap_w(),
+            saturation_window_s: default_saturation_window_s(),
+        }
+    }
+}
+
+fn default_cycle_ms() -> u64 {
+    200
+}
+fn default_deadband_w() -> f64 {
+    30.0
+}
+fn default_hit_tolerance_w() -> f64 {
+    15.0
+}
+fn default_pulse_count() -> u32 {
+    3
+}
+fn default_soc_full() -> f64 {
+    95.0
+}
+fn default_soc_empty() -> f64 {
+    5.0
+}
+fn default_plug_stale_s() -> f64 {
+    2.0
+}
+fn default_group_silent_s() -> f64 {
+    60.0
+}
+fn default_circuit_headroom() -> f64 {
+    0.95
+}
+fn default_saturation_gap_w() -> f64 {
+    100.0
+}
+fn default_saturation_window_s() -> f64 {
+    8.0
+}
+
+// ---------------------------------------------------------------------------
+// Optional Home Assistant SoC source (no plug equivalent for SoC yet)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HomeAssistantConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Base URL of the HA Core API. Inside an HA add-on this is
-    /// `http://supervisor/core/api`; standalone setups use
-    /// `http://<ha-host>:8123/api`.
     #[serde(default = "default_ha_url")]
     pub url: String,
-    /// Long-lived access token (or `$SUPERVISOR_TOKEN` inside the add-on).
     #[serde(default)]
     pub token: String,
-    /// HTTP request timeout per state lookup.
     #[serde(default = "default_ha_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -61,11 +222,6 @@ impl Default for HomeAssistantConfig {
 }
 
 fn default_ha_url() -> String {
-    // We always run with host_network: true (HA add-on) or on
-    // separate hardware — never inside the hassio bridge — so the
-    // `supervisor` hostname is never resolvable. Default to the
-    // mDNS host name HA-OS publishes; user can override with a raw
-    // IP for setups where mDNS doesn't reach.
     "http://homeassistant.local:8123/api".into()
 }
 
@@ -73,169 +229,10 @@ fn default_ha_timeout_ms() -> u64 {
     3000
 }
 
-/// Global protective limit on the absolute sum of all battery
-/// allocations. Default: 3000 W. Going higher than 3000 W requires
-/// **both** acknowledgement flags to be set in the TOML *and* via the
-/// admin UI confirm flow.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SafetyConfig {
-    /// Maximum absolute sum of all battery allocations (W). Charging and
-    /// discharging are capped against the same value.
-    #[serde(default = "default_safety_cap")]
-    pub max_total_w: f64,
-    /// First acknowledgement: I understand that exceeding 3000 W can
-    /// cause overload, fire, or damage if the wiring is not rated for it.
-    #[serde(default)]
-    pub acknowledged_higher_risk: bool,
-    /// Second acknowledgement: I have verified that every battery is on
-    /// its OWN protective device (no two batteries share a fuse / RCD)
-    /// rated for the load it can produce.
-    #[serde(default)]
-    pub acknowledged_separate_fuses: bool,
-}
+// ---------------------------------------------------------------------------
+// Circuit (shared protective device) — now allows multiple active batteries
+// ---------------------------------------------------------------------------
 
-impl Default for SafetyConfig {
-    fn default() -> Self {
-        Self {
-            max_total_w: default_safety_cap(),
-            acknowledged_higher_risk: false,
-            acknowledged_separate_fuses: false,
-        }
-    }
-}
-
-fn default_safety_cap() -> f64 {
-    3000.0
-}
-
-pub const SAFETY_DEFAULT_CAP_W: f64 = 3000.0;
-
-impl SafetyConfig {
-    /// Returns the effective cap actually applied at runtime: the user's
-    /// requested cap if both acknowledgements are present and it is at
-    /// least equal to the default; otherwise the hard default of 3000 W.
-    pub fn effective_cap_w(&self) -> f64 {
-        if self.max_total_w <= SAFETY_DEFAULT_CAP_W {
-            // Lowering the cap is always allowed — never below 0 though.
-            self.max_total_w.max(0.0)
-        } else if self.acknowledged_higher_risk && self.acknowledged_separate_fuses {
-            self.max_total_w
-        } else {
-            SAFETY_DEFAULT_CAP_W
-        }
-    }
-
-    pub fn override_active(&self) -> bool {
-        self.max_total_w > SAFETY_DEFAULT_CAP_W
-            && self.acknowledged_higher_risk
-            && self.acknowledged_separate_fuses
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RealShellyConfig {
-    pub host: IpAddr,
-    pub udp_port: u16,
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_ms: u64,
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_ms: u64,
-}
-
-fn default_poll_interval() -> u64 {
-    250
-}
-fn default_request_timeout() -> u64 {
-    1000
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VirtualShellyConfig {
-    #[serde(default = "default_bind_interface")]
-    pub bind_interface: String,
-    #[serde(default = "default_virtual_udp_port")]
-    pub udp_port: u16,
-    #[serde(default = "default_virtual_http_port")]
-    pub http_port: u16,
-    #[serde(default = "default_min_sample_period")]
-    pub min_sample_period_ms: u64,
-    #[serde(default)]
-    pub device_mac: String,
-    #[serde(default)]
-    pub device_hostname: String,
-    #[serde(default = "default_firmware")]
-    pub firmware: String,
-    /// Advertise via mDNS so inverters can discover us as a Shelly.
-    /// Disabled by default in the HA add-on because HA OS already runs
-    /// Avahi on UDP/5353 and the mdns-sd daemon's worker thread dies
-    /// silently when it can't claim the multicast group.
-    #[serde(default = "default_enable_mdns")]
-    pub enable_mdns: bool,
-}
-
-fn default_bind_interface() -> String {
-    "0.0.0.0".into()
-}
-fn default_virtual_udp_port() -> u16 {
-    1010
-}
-fn default_virtual_http_port() -> u16 {
-    80
-}
-fn default_min_sample_period() -> u64 {
-    1000
-}
-fn default_firmware() -> String {
-    "1.4.4".into()
-}
-fn default_enable_mdns() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ManagementConfig {
-    #[serde(default = "default_management_bind")]
-    pub bind_address: String,
-}
-
-fn default_management_bind() -> String {
-    "0.0.0.0:8080".into()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DispatcherConfig {
-    #[serde(default = "default_strategy")]
-    pub strategy: AllocationStrategy,
-    #[serde(default)]
-    pub rate_limit_w_per_s: f64,
-    #[serde(default = "default_deadband")]
-    pub deadband_w: f64,
-}
-
-fn default_strategy() -> AllocationStrategy {
-    AllocationStrategy::Equal
-}
-fn default_deadband() -> f64 {
-    30.0
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AllocationStrategy {
-    Equal,
-    ByCapacity,
-    /// Soft priority based on SoC. When discharging, batteries with higher
-    /// SoC contribute more; when charging, batteries with lower SoC absorb
-    /// more. Falls back to `Equal` for batteries without SoC telemetry.
-    BySoc,
-    Priority,
-}
-
-/// A `Circuit` represents a shared protective device (MCB/RCD)
-/// downstream of which one or more batteries hang. The dispatcher
-/// guarantees that **at most one** battery in a circuit is active at
-/// a time, so the circuit's cap_w must only be ≥ the largest single
-/// member's max(charge_w, discharge_w). Validated at startup.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitConfig {
     pub id: String,
@@ -245,9 +242,6 @@ pub struct CircuitConfig {
     #[serde(default = "default_voltage")]
     pub voltage: f64,
 }
-
-/// Old name kept as an alias so existing configs still parse.
-pub type GroupConfig = CircuitConfig;
 
 fn default_phases() -> u8 {
     1
@@ -262,86 +256,55 @@ impl CircuitConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Battery
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BatteryConfig {
     pub id: String,
+    /// Static IP the Marstek polls us from. Used to route per-Marstek
+    /// pulse queues without parsing the Shelly src field.
     pub address: IpAddr,
-    #[serde(default = "default_vendor")]
-    pub vendor: BatteryVendor,
-    /// Circuit (= shared MCB downstream) the battery sits on.
-    /// Mandatory — drives the multiplex layer that guarantees max one
-    /// active battery per circuit. Old configs may still use `group`
-    /// (deserde alias).
-    #[serde(alias = "group")]
+    /// Circuit (= shared MCB) the battery and its plug sit on.
     pub circuit: String,
-    #[serde(default = "default_phase")]
-    pub phase: PhaseAssignment,
+    /// HTTP base URL of the dedicated Shelly Plug PM Gen3.
+    /// Mandatory: plug measurements are authoritative for circuit cap.
+    pub plug_url: String,
     pub max_charge_w: f64,
     pub max_discharge_w: f64,
-    /// Minimum SoC (%): once at or below this, the battery is excluded
-    /// from discharge allocations. Default 12 % — typical Marstek DoD.
-    #[serde(default = "default_min_soc")]
-    pub min_soc_percent: f64,
-    /// Maximum SoC (%): once at or above this, the battery is excluded
-    /// from charge allocations. Default 100 %.
-    #[serde(default = "default_max_soc")]
-    pub max_soc_percent: f64,
-    #[serde(default = "default_priority")]
-    pub priority: u32,
-    /// Marstek Open API UDP port (default 30000). Only used when vendor
-    /// is `marstek`. Marstek requires send and receive to use the same
-    /// configured port — see Marstek Open API docs.
+    /// Capacity-weighted distribution input. If unset, falls back to
+    /// max_charge_w + max_discharge_w as the proxy weight.
+    #[serde(default)]
+    pub capacity_wh: f64,
+    /// Manual weight multiplier on top of capacity (default 1.0).
+    #[serde(default = "default_priority_weight")]
+    pub priority_weight: f64,
+    /// Marstek vendor (drives SoC poll method only — pulses are universal).
+    #[serde(default = "default_vendor")]
+    pub vendor: BatteryVendor,
+    /// Marstek Open API UDP port for SoC reads (default 30000).
     #[serde(default = "default_marstek_port")]
     pub marstek_port: u16,
-    /// How often to poll the battery for SoC and actual power.
-    #[serde(default = "default_telemetry_interval_ms")]
-    pub telemetry_interval_ms: u64,
-    /// If set AND `home_assistant.enabled = true`, the multiplexer
-    /// reads this entity's state from HA instead of polling the
-    /// inverter directly — avoids fighting HA for the inverter's UDP
-    /// port. Example: `sensor.marstek_venus_e_battery_soc`.
+    /// SoC poll interval.
+    #[serde(default = "default_soc_interval_ms")]
+    pub soc_interval_ms: u64,
+    /// Optional HA entity for SoC (overrides direct Marstek read).
     #[serde(default)]
     pub soc_entity_id: Option<String>,
-    /// Result of the active phase-detection pass. Populated by the
-    /// detection routine and persisted so it survives restarts.
-    /// `phase` here is informational and may differ from the manually
-    /// configured `phase` field above (which is used by group-cap
-    /// estimation when set).
-    #[serde(default)]
-    pub detected_phase: Option<DetectedPhase>,
 }
 
-/// Outcome of a phase-detection probe for one battery.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DetectedPhase {
-    pub phase: PhaseAssignment,
-    /// 0.0 (not detected) to 1.0 (perfectly clear). Below ~0.5 the
-    /// detection should be considered unreliable.
-    pub confidence: f64,
-    /// ISO-8601 timestamp of the detection run.
-    pub detected_at: String,
-    /// Largest signed delta observed on each phase between charge and
-    /// discharge probes — useful for diagnosing low-confidence runs.
-    pub delta_a_w: f64,
-    pub delta_b_w: f64,
-    pub delta_c_w: f64,
+fn default_priority_weight() -> f64 {
+    1.0
 }
-
-fn default_min_soc() -> f64 {
-    12.0
-}
-fn default_max_soc() -> f64 {
-    100.0
-}
-
 fn default_vendor() -> BatteryVendor {
-    BatteryVendor::Generic
+    BatteryVendor::Marstek
 }
 fn default_marstek_port() -> u16 {
     30000
 }
-fn default_telemetry_interval_ms() -> u64 {
-    60000
+fn default_soc_interval_ms() -> u64 {
+    30000
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -352,21 +315,9 @@ pub enum BatteryVendor {
     Generic,
 }
 
-fn default_phase() -> PhaseAssignment {
-    PhaseAssignment::All
-}
-fn default_priority() -> u32 {
-    1
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum PhaseAssignment {
-    A,
-    B,
-    C,
-    All,
-}
+// ---------------------------------------------------------------------------
+// Loading + validation
+// ---------------------------------------------------------------------------
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -379,7 +330,6 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        // Circuits must be unique and well-formed.
         let mut seen_circuits = std::collections::HashSet::new();
         for c in &self.circuits {
             if !seen_circuits.insert(c.id.clone()) {
@@ -391,25 +341,19 @@ impl Config {
             if c.fuse_amps <= 0.0 {
                 anyhow::bail!("circuit {}: fuse_amps must be > 0", c.id);
             }
-            if c.voltage <= 0.0 {
-                anyhow::bail!("circuit {}: voltage must be > 0", c.id);
-            }
         }
 
-        // Batteries must each reference an existing circuit and stay
-        // within that circuit's cap on their own. The multiplex layer
-        // guarantees only one is ever active per circuit, so the cap
-        // is checked per-member, not per-sum.
         let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_addrs = std::collections::HashSet::new();
         for b in &self.batteries {
             if !seen_ids.insert(b.id.clone()) {
                 anyhow::bail!("duplicate battery id: {}", b.id);
             }
+            if !seen_addrs.insert(b.address) {
+                anyhow::bail!("duplicate battery address: {}", b.address);
+            }
             if b.circuit.trim().is_empty() {
-                anyhow::bail!(
-                    "battery {}: `circuit` is required (every battery must belong to a circuit)",
-                    b.id
-                );
+                anyhow::bail!("battery {}: `circuit` is required", b.id);
             }
             let Some(circuit) = self.circuits.iter().find(|c| c.id == b.circuit) else {
                 anyhow::bail!(
@@ -422,10 +366,7 @@ impl Config {
             let largest = b.max_charge_w.max(b.max_discharge_w);
             if largest > cap {
                 anyhow::bail!(
-                    "battery {} (max {} W) exceeds circuit '{}' cap ({} W) — the inverter \
-                     could overload the shared protective device on its own. Either lower \
-                     max_charge_w/max_discharge_w on the battery or move it to a circuit \
-                     with a larger fuse.",
+                    "battery {} (max {} W) exceeds circuit '{}' cap ({} W) on its own",
                     b.id,
                     largest,
                     b.circuit,
@@ -433,43 +374,38 @@ impl Config {
                 );
             }
             if b.max_charge_w < 0.0 || b.max_discharge_w < 0.0 {
-                anyhow::bail!("battery {} has negative power limits", b.id);
+                anyhow::bail!("battery {}: power limits must not be negative", b.id);
             }
-            if !(0.0..=100.0).contains(&b.min_soc_percent) {
+            if b.plug_url.trim().is_empty() {
                 anyhow::bail!(
-                    "battery {}: min_soc_percent must be in [0, 100], got {}",
-                    b.id,
-                    b.min_soc_percent
+                    "battery {}: plug_url is required (Shelly Plug PM Gen3 mandatory)",
+                    b.id
                 );
             }
-            if !(0.0..=100.0).contains(&b.max_soc_percent) {
-                anyhow::bail!(
-                    "battery {}: max_soc_percent must be in [0, 100], got {}",
-                    b.id,
-                    b.max_soc_percent
-                );
-            }
-            if b.min_soc_percent >= b.max_soc_percent {
-                anyhow::bail!(
-                    "battery {}: min_soc_percent ({}) must be strictly less than max_soc_percent ({})",
-                    b.id,
-                    b.min_soc_percent,
-                    b.max_soc_percent
-                );
-            }
-            if b.telemetry_interval_ms == 0 {
-                anyhow::bail!("battery {}: telemetry_interval_ms must be > 0", b.id);
+            if b.priority_weight <= 0.0 {
+                anyhow::bail!("battery {}: priority_weight must be > 0", b.id);
             }
             if b.marstek_port == 0 {
                 anyhow::bail!("battery {}: marstek_port must be > 0", b.id);
             }
+            if b.soc_interval_ms == 0 {
+                anyhow::bail!("battery {}: soc_interval_ms must be > 0", b.id);
+            }
         }
 
+        if self.dispatcher.cycle_ms == 0 {
+            anyhow::bail!("dispatcher.cycle_ms must be > 0");
+        }
         if self.dispatcher.deadband_w < 0.0 {
             anyhow::bail!("dispatcher.deadband_w must not be negative");
         }
-        if self.dispatcher.rate_limit_w_per_s < 0.0 {
-            anyhow::bail!("dispatcher.rate_limit_w_per_s must not be negative");
+        if self.dispatcher.pulse_count < 2 {
+            anyhow::bail!(
+                "dispatcher.pulse_count must be ≥ 2 (Marstek requires at least 2 polls to commit)"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.dispatcher.circuit_headroom) {
+            anyhow::bail!("dispatcher.circuit_headroom must be in [0, 1]");
         }
         if self.real_shelly.poll_interval_ms == 0 {
             anyhow::bail!("real_shelly.poll_interval_ms must be > 0");

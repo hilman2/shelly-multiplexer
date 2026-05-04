@@ -86,11 +86,12 @@ async fn get_shelly(
         params: None,
     };
     let cfg = ctx.config.load_full();
+    let _ = peer;
     let resp = virtual_shelly::build_response(
         &ctx.state,
         &cfg,
         &ctx.device,
-        peer.ip(),
+        0.0,
         req,
     );
     Json(resp.result.unwrap_or(json!({})))
@@ -124,11 +125,12 @@ async fn get_status(
         params: None,
     };
     let cfg = ctx.config.load_full();
+    let _ = peer;
     let resp = virtual_shelly::build_response(
         &ctx.state,
         &cfg,
         &ctx.device,
-        peer.ip(),
+        0.0,
         req,
     );
     Json(resp.result.unwrap_or(json!({})))
@@ -144,8 +146,8 @@ async fn post_rpc(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
     };
     let cfg = ctx.config.load_full();
-    let resp =
-        virtual_shelly::build_response(&ctx.state, &cfg, &ctx.device, peer.ip(), request);
+    let _ = peer;
+    let resp = virtual_shelly::build_response(&ctx.state, &cfg, &ctx.device, 0.0, request);
     Json(resp).into_response()
 }
 
@@ -175,8 +177,8 @@ async fn get_rpc_method(
         params: Some(Value::Object(params_value)),
     };
     let cfg = ctx.config.load_full();
-    let resp =
-        virtual_shelly::build_response(&ctx.state, &cfg, &ctx.device, peer.ip(), request);
+    let _ = peer;
+    let resp = virtual_shelly::build_response(&ctx.state, &cfg, &ctx.device, 0.0, request);
     match resp.result {
         Some(v) => Json(v).into_response(),
         None => (
@@ -201,7 +203,7 @@ async fn post_rpc_method(
         params: body,
     };
     let cfg = ctx.config.load_full();
-    let resp =
-        virtual_shelly::build_response(&ctx.state, &cfg, &ctx.device, peer.ip(), request);
+    let _ = peer;
+    let resp = virtual_shelly::build_response(&ctx.state, &cfg, &ctx.device, 0.0, request);
     Json(resp).into_response()
 }

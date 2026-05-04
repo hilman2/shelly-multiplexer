@@ -11,8 +11,7 @@ use tracing_subscriber::EnvFilter;
 use shelly_multiplexer::config::Config;
 use shelly_multiplexer::state::AppState;
 use shelly_multiplexer::{
-    dispatcher, ha, http_admin, http_shelly, marstek, mdns, real_shelly, stuck_detect,
-    virtual_shelly,
+    dispatcher, ha, http_admin, http_shelly, marstek, mdns, plug, real_shelly, virtual_shelly,
 };
 
 #[derive(Parser, Debug)]
@@ -38,8 +37,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // First line out of stderr before anything else happens. If the
-    // binary panics during init we want at least *this* in the log.
     eprintln!("shelly-multiplexer starting (pid {})", std::process::id());
 
     let cli = Cli::parse();
@@ -49,8 +46,6 @@ async fn main() -> Result<()> {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
-    // Write to stderr — Docker line-buffers stdout in 64 KB chunks, so
-    // a fast crash loses any tracing output. stderr is unbuffered.
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(true)
@@ -61,9 +56,6 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
     info!(path = %cli.config.display(), "config loaded");
 
-    // Apply CLI overrides for real_shelly connection details. The HA
-    // add-on passes these from the user's add-on options so changes
-    // there propagate without forcing a config-file edit.
     let mut cfg_dirty = false;
     if let Some(host) = cli.real_shelly_host
         && cfg.real_shelly.host != host
@@ -84,9 +76,6 @@ async fn main() -> Result<()> {
         cfg_dirty = true;
     }
 
-    // SUPERVISOR_TOKEN: injected by the HA add-on entry point; lets
-    // the multiplexer call the Core API without the user pasting a
-    // long-lived token into the config file.
     if let Ok(token) = std::env::var("SUPERVISOR_TOKEN")
         && !token.is_empty()
         && cfg.home_assistant.token.is_empty()
@@ -95,12 +84,11 @@ async fn main() -> Result<()> {
         info!("home_assistant.token sourced from SUPERVISOR_TOKEN");
     }
 
-    // Persist merged config so the web UI shows the effective values.
-    // Drop the SUPERVISOR_TOKEN before writing — secrets don't belong
-    // in a file the user might back up or share.
     if cfg_dirty {
         let mut for_disk = cfg.clone();
-        if std::env::var("SUPERVISOR_TOKEN").ok().as_deref() == Some(for_disk.home_assistant.token.as_str()) {
+        if std::env::var("SUPERVISOR_TOKEN").ok().as_deref()
+            == Some(for_disk.home_assistant.token.as_str())
+        {
             for_disk.home_assistant.token.clear();
         }
         match toml::to_string_pretty(&for_disk) {
@@ -124,12 +112,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let state = AppState::new(&cfg.safety);
+    let state = AppState::from_config(&cfg);
     let cfg_swap = Arc::new(ArcSwap::from_pointee(cfg));
 
     let mut tasks = tokio::task::JoinSet::new();
 
-    // Real-Shelly poller
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -139,7 +126,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Dispatcher (loops forever; never returns)
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -149,7 +135,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Virtual Shelly UDP server
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -159,7 +144,16 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Marstek telemetry (SoC + actual power) for redispatch
+    // Per-battery Shelly Plug PM Gen3 pollers (mandatory for safety).
+    {
+        let s = state.clone();
+        let c = cfg_swap.clone();
+        tasks.spawn(async move {
+            let r = plug::run(s, c).await;
+            log_task_exit("plug", r);
+        });
+    }
+
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -169,7 +163,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Home Assistant SoC poller (idle if home_assistant.enabled=false)
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -179,20 +172,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Passive stuck detector (10-min rolling window per battery).
-    {
-        let s = state.clone();
-        let c = cfg_swap.clone();
-        tasks.spawn(async move {
-            let r = stuck_detect::run(s, c).await;
-            log_task_exit("stuck_detect", r);
-        });
-    }
-
-    // mDNS service advertisement (gated on virtual_shelly.enable_mdns).
-    // On HA OS the host's Avahi already owns UDP/5353 multicast and our
-    // mdns-sd daemon collides with it, so the default in the HA add-on
-    // is OFF. Standalone deployments can flip it on via the web UI.
     {
         let cfg_now = cfg_swap.load_full();
         if cfg_now.virtual_shelly.enable_mdns {
@@ -206,7 +185,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Virtual Shelly HTTP server
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -216,7 +194,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Management UI
     {
         let s = state.clone();
         let c = cfg_swap.clone();
@@ -235,10 +212,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ = wait_first(&mut tasks) => {
-            // A spawned task ended unexpectedly — that's a fatal error.
-            // Returning Err makes the process exit non-zero so the
-            // supervisor's restart loop is justified instead of looking
-            // like a clean shutdown.
             error!("a critical task exited; shutting down");
             eprintln!("FATAL: a critical task exited prematurely");
             anyhow::bail!("critical task exited prematurely")
@@ -246,9 +219,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Helper: every long-running task is supposed to loop forever. If one
-/// returns at all (Ok or Err), surface the task name and reason at
-/// ERROR so we can tell *which* component triggered the shutdown.
 fn log_task_exit<T: std::fmt::Debug>(name: &str, result: Result<T>) {
     match result {
         Ok(_) => {
