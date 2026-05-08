@@ -7,7 +7,7 @@
 //! reading (`last_plug_w`) is the ground truth that resolves disagreements
 //! and detects saturation.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,8 +49,13 @@ pub struct BatteryState {
     /// [-max_charge_w, +max_discharge_w].
     pub commanded_w: f64,
 
-    /// FIFO of pulse values still to drain on subsequent Marstek polls.
-    pub pulse_queue: VecDeque<f64>,
+    /// Single CT value to send to the Marstek on the next poll(s).
+    /// We never queue multiple delta values — if the dispatcher
+    /// recomputes mid-pulse the previous (stale) delta is overwritten,
+    /// not appended. `pulse_remaining` says how many more polls keep
+    /// sending this value before the response reverts to 0.
+    pub pending_pulse_w: f64,
+    pub pulse_remaining: u32,
 
     /// Latest plug reading (signed, our convention).
     pub last_plug_w: Option<f64>,
@@ -91,7 +96,8 @@ impl BatteryState {
             },
             priority_weight: cfg.priority_weight,
             commanded_w: 0.0,
-            pulse_queue: VecDeque::new(),
+            pending_pulse_w: 0.0,
+            pulse_remaining: 0,
             last_plug_w: None,
             last_plug_at: None,
             last_marstek_poll_at: None,
@@ -107,7 +113,7 @@ impl BatteryState {
     /// Has the previous pulse landed (plug reads close to commanded_w)?
     /// Used to enforce "no new pulse while previous is still in flight".
     pub fn pulse_settled(&self, hit_tolerance_w: f64) -> bool {
-        if !self.pulse_queue.is_empty() {
+        if self.pulse_remaining > 0 {
             return false;
         }
         let Some(plug) = self.last_plug_w else {

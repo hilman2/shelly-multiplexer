@@ -140,7 +140,7 @@ function renderBatteriesStatus(batteries) {
         stateCell = `<span class="state warn" title="reached at ${fmtW(b.saturation_ceiling_w)} W">saturated</span>`;
       else if (b.plug_age_ms == null || b.plug_age_ms > 2000)
         stateCell = '<span class="state warn">plug stale</span>';
-      else if (b.pulse_queue_len > 0)
+      else if (b.pulse_remaining > 0)
         stateCell = '<span class="state pulsing">pulsing</span>';
       else stateCell = '<span class="state ok">idle</span>';
 
@@ -151,8 +151,8 @@ function renderBatteriesStatus(batteries) {
           ? '<span class="dir-tag dir-charge">charge</span>'
           : "";
       const queue =
-        b.pulse_queue_len > 0
-          ? `<span class="pulses">${b.pulse_queue_len}</span>`
+        b.pulse_remaining > 0
+          ? `<span class="pulses" title="${escapeAttr(fmtW(b.pending_pulse_w))} W × ${b.pulse_remaining} polls">${b.pulse_remaining}×${fmtW(b.pending_pulse_w)}W</span>`
           : '<span class="dim">–</span>';
       return `<tr>
         <td><strong>${escapeHtml(b.id)}</strong> ${dir}</td>

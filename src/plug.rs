@@ -88,8 +88,13 @@ async fn poll_plug_loop(
                 if let Some(b) = bats.get_mut(&battery_id) {
                     b.last_plug_w = Some(signed_w);
                     b.last_plug_at = Some(now);
-                    if b.last_error.as_deref() == Some("plug unreachable") {
-                        b.last_error = None;
+                    // Any previous error is now stale — the plug is reachable
+                    // again and the marstek SoC poller has its own clearing
+                    // logic, so leaving its message would be misleading.
+                    if let Some(e) = &b.last_error {
+                        if e.starts_with("plug ") {
+                            b.last_error = None;
+                        }
                     }
                 }
                 debug!(battery = %battery_id, apower, signed_w, "plug reading");

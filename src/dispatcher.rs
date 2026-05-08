@@ -114,127 +114,125 @@ fn compute_desired(
     let bats = state.batteries.read();
     let circuits = state.circuits.read();
 
-    // The desired battery output (sum across all batteries) is whatever
-    // would zero out the grid. Positive grid_w (importing) -> we want
-    // batteries to discharge a total of +grid_w. Negative -> charge.
-    let target_total = grid_w;
+    // SALDIERENDE control loop:
+    // The Shelly grid reading is what's left AFTER the batteries already
+    // acted on the grid. So `grid_w` is the *residual* error we need to
+    // compensate for, NOT the absolute target. To bring grid to zero,
+    // total battery output must change by `grid_w`, on top of where it is.
+    //
+    // Convention: positive grid_w = importing => batteries should
+    // discharge MORE (commanded += positive). Negative grid_w = exporting
+    // => charge MORE (commanded += negative).
+    let correction_total = grid_w;
 
+    // Default: keep every battery exactly where it is.
     let mut desired: HashMap<String, f64> = HashMap::new();
     for b in bats.values() {
-        desired.insert(b.id.clone(), 0.0);
+        desired.insert(b.id.clone(), b.commanded_w);
     }
 
-    let charging = target_total < 0.0;
-    let discharging = target_total > 0.0;
-
-    let mut eligible: Vec<&BatteryState> = bats
-        .values()
-        .filter(|b| {
-            // Skip batteries on a muted circuit -- pulses won't be sent
-            // to them anyway.
-            let circuit_silent = circuits
-                .get(&b.circuit)
-                .and_then(|c| c.silent_until)
-                .map(|t| t > now)
-                .unwrap_or(false);
-            if circuit_silent {
-                return false;
-            }
-            if charging {
-                if b.max_charge_w <= 0.0 {
-                    return false;
-                }
-                if let Some(soc) = b.soc_pct {
-                    if soc >= dcfg.soc_full_pct {
-                        return false;
-                    }
-                }
-                true
-            } else if discharging {
-                if b.max_discharge_w <= 0.0 {
-                    return false;
-                }
-                if let Some(soc) = b.soc_pct {
-                    if soc <= dcfg.soc_empty_pct {
-                        return false;
-                    }
-                }
-                true
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    if eligible.is_empty() || target_total.abs() < 1e-3 {
+    if correction_total.abs() < dcfg.deadband_w {
         return desired;
     }
 
-    let weight_of = |b: &BatteryState| -> f64 {
-        let dir_cap = if charging {
-            b.max_charge_w
-        } else {
-            b.max_discharge_w
-        };
-        b.priority_weight * dir_cap.max(1.0)
+    let need_more_discharge = correction_total > 0.0;
+
+    let muted_circuit = |cid: &str| -> bool {
+        circuits
+            .get(cid)
+            .and_then(|c| c.silent_until)
+            .map(|t| t > now)
+            .unwrap_or(false)
     };
 
-    let total_w: f64 = eligible.iter().map(|b| weight_of(b)).sum();
-    let mut shares: HashMap<String, f64> = HashMap::new();
-    for b in &eligible {
-        let s = target_total * weight_of(b) / total_w;
-        shares.insert(b.id.clone(), s);
-    }
-
-    // Battery hardware + saturation clamp. Track unallocated remainder
-    // and hand it to siblings (grid balance > SoC balance).
-    loop {
-        let mut overflow = 0.0;
-        let mut clamped_ids: Vec<String> = Vec::new();
-        for b in &eligible {
-            let s = shares.get(&b.id).copied().unwrap_or(0.0);
-            let mut limited = if charging {
-                s.max(-b.max_charge_w)
+    // Eligibility: skip muted circuits and batteries that physically can't
+    // absorb correction in the needed direction.
+    let mut eligible: Vec<&BatteryState> = bats
+        .values()
+        .filter(|b| {
+            if muted_circuit(&b.circuit) {
+                return false;
+            }
+            if need_more_discharge {
+                if b.commanded_w >= b.max_discharge_w - 1.0 {
+                    return false;
+                }
+                if let Some(soc) = b.soc_pct {
+                    if soc <= dcfg.soc_empty_pct && b.commanded_w <= 0.0 {
+                        return false;
+                    }
+                }
             } else {
-                s.min(b.max_discharge_w)
-            };
-            if let Some(c) = b.saturation_ceiling_w {
-                if charging {
-                    limited = limited.max(c);
-                } else {
-                    limited = limited.min(c);
+                if b.commanded_w <= -b.max_charge_w + 1.0 {
+                    return false;
+                }
+                if let Some(soc) = b.soc_pct {
+                    if soc >= dcfg.soc_full_pct && b.commanded_w >= 0.0 {
+                        return false;
+                    }
                 }
             }
-            if (limited - s).abs() > 1e-3 {
-                overflow += s - limited;
-                shares.insert(b.id.clone(), limited);
+            true
+        })
+        .collect();
+
+    if eligible.is_empty() {
+        return desired;
+    }
+
+    // Weight by priority × directional headroom (how much room each
+    // battery still has to absorb correction in the needed direction).
+    let headroom_of = |b: &BatteryState| -> f64 {
+        let h = if need_more_discharge {
+            b.max_discharge_w - b.commanded_w
+        } else {
+            b.max_charge_w + b.commanded_w
+        };
+        h.max(0.0)
+    };
+    let weight_of = |b: &BatteryState| -> f64 { b.priority_weight * headroom_of(b).max(1.0) };
+
+    // Distribute correction with overflow redistribution: if a battery
+    // clamps before absorbing its full share, the leftover goes to
+    // siblings with remaining headroom (grid balance > SoC balance).
+    let mut remaining = correction_total;
+    for _ in 0..6 {
+        if remaining.abs() < 1e-3 || eligible.is_empty() {
+            break;
+        }
+        let total_w: f64 = eligible.iter().map(|b| weight_of(b)).sum();
+        if total_w <= 0.0 {
+            break;
+        }
+        let mut clamped_ids: Vec<String> = Vec::new();
+        for b in &eligible {
+            let share = remaining * weight_of(b) / total_w;
+            let prev = *desired.get(&b.id).unwrap();
+            let proposed = prev + share;
+            let mut clamped = proposed.max(-b.max_charge_w).min(b.max_discharge_w);
+            if let Some(c) = b.saturation_ceiling_w {
+                if need_more_discharge {
+                    clamped = clamped.min(c);
+                } else {
+                    clamped = clamped.max(c);
+                }
+            }
+            desired.insert(b.id.clone(), clamped);
+            if (clamped - proposed).abs() > 1e-3 {
                 clamped_ids.push(b.id.clone());
             }
         }
-        if overflow.abs() < 1e-3 {
-            break;
-        }
-        let receivers: Vec<&BatteryState> = eligible
-            .iter()
-            .copied()
-            .filter(|b| !clamped_ids.contains(&b.id))
-            .collect();
-        if receivers.is_empty() {
-            break;
-        }
-        let recv_total_w: f64 = receivers.iter().map(|b| weight_of(b)).sum();
-        if recv_total_w <= 0.0 {
-            break;
-        }
-        for r in &receivers {
-            let extra = overflow * weight_of(r) / recv_total_w;
-            *shares.entry(r.id.clone()).or_insert(0.0) += extra;
-        }
+        let applied: f64 = bats
+            .values()
+            .map(|b| desired.get(&b.id).copied().unwrap_or(b.commanded_w) - b.commanded_w)
+            .sum();
+        remaining = correction_total - applied;
         eligible.retain(|b| !clamped_ids.contains(&b.id));
     }
 
-    // Per-circuit cap from PLUG measurements. Plug-measured |sum| of all
-    // batteries on a circuit must stay below cap_w * circuit_headroom.
+    // Per-circuit cap enforcement on the desired values. Plug-measured
+    // |sum| of all batteries on a circuit must stay below cap × headroom;
+    // we use whichever of (desired_sum, measured_sum) is bigger.
     for cs in circuits.values() {
         let members: Vec<&BatteryState> = cs
             .member_ids
@@ -244,29 +242,23 @@ fn compute_desired(
         if members.is_empty() {
             continue;
         }
-        let proposed_sum: f64 = members
+        let desired_sum: f64 = members
             .iter()
-            .map(|b| shares.get(&b.id).copied().unwrap_or(0.0))
+            .map(|b| desired.get(&b.id).copied().unwrap_or(b.commanded_w))
             .sum();
-        let measured_sum: f64 = members
-            .iter()
-            .map(|b| b.last_plug_w.unwrap_or(0.0))
-            .sum();
+        let measured_sum: f64 = members.iter().map(|b| b.last_plug_w.unwrap_or(0.0)).sum();
         let cap = cs.cap_w() * dcfg.circuit_headroom;
-        let limit = proposed_sum.abs().max(measured_sum.abs());
+        let limit = desired_sum.abs().max(measured_sum.abs());
         if limit > cap && limit > 0.0 {
             let scale = cap / limit;
             for b in &members {
-                if let Some(s) = shares.get_mut(&b.id) {
-                    *s *= scale;
+                if let Some(d) = desired.get_mut(&b.id) {
+                    *d *= scale;
                 }
             }
         }
     }
 
-    for (id, s) in shares {
-        desired.insert(id, s);
-    }
     desired
 }
 
@@ -290,12 +282,11 @@ fn queue_pulses(
             .map(|t| t > now)
             .unwrap_or(false);
         if circuit_silent {
-            // Drop any pending pulses; reset commanded_w to 0 so when the
+            // Drop any pending pulse; reset commanded_w to 0 so when the
             // circuit comes back we start from a known state. The Marstek
             // watchdog will have cleared its integrator during the silence.
-            if !b.pulse_queue.is_empty() {
-                b.pulse_queue.clear();
-            }
+            b.pending_pulse_w = 0.0;
+            b.pulse_remaining = 0;
             b.commanded_w = 0.0;
             continue;
         }
@@ -307,7 +298,7 @@ fn queue_pulses(
             continue;
         }
 
-        let want = desired.get(&b.id).copied().unwrap_or(0.0);
+        let want = *desired.get(&b.id).unwrap_or(&b.commanded_w);
         let delta = want - b.commanded_w;
         if delta.abs() < dcfg.deadband_w {
             continue;
@@ -322,15 +313,16 @@ fn queue_pulses(
         }
 
         b.commanded_w = new_commanded;
-        for _ in 0..dcfg.pulse_count {
-            b.pulse_queue.push_back(actual_delta);
-        }
+        // Replace any stale value (none should be there given pulse_settled)
+        // with the fresh delta and arm the per-poll counter.
+        b.pending_pulse_w = actual_delta;
+        b.pulse_remaining = dcfg.pulse_count;
         debug!(
             battery = %b.id,
             delta = actual_delta,
             commanded_w = b.commanded_w,
             pulses = dcfg.pulse_count,
-            "queued pulse"
+            "armed pulse"
         );
     }
 }

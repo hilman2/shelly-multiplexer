@@ -123,7 +123,7 @@ async fn handle_request(
         }
     }
 
-    // Pop pulse value (or 0 if queue empty / battery unknown).
+    // Drain one pulse for this battery (or 0 if no pulse pending / battery unknown).
     let (pulse_value_w, was_silent) = {
         let prev = {
             let bats = state.batteries.read();
@@ -139,8 +139,13 @@ async fn handle_request(
             let mut bats = state.batteries.write();
             if let Some(b) = bats.get_mut(bid) {
                 b.last_marstek_poll_at = Some(now);
-                if let Some(v) = b.pulse_queue.pop_front() {
-                    value = v;
+                if b.pulse_remaining > 0 {
+                    value = b.pending_pulse_w;
+                    b.pulse_remaining -= 1;
+                    if b.pulse_remaining == 0 {
+                        // Reset stored value so a stale read can't reappear.
+                        b.pending_pulse_w = 0.0;
+                    }
                 }
             }
         }
