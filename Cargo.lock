@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "shelly-multiplexer"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -306,6 +306,10 @@
             <label>Saturation window (s)
               <input name="saturation_window_s" type="number" min="0" step="any" required>
             </label>
+            <label>Grid bias (W)
+              <input name="grid_bias_w" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">never cross 0: import side when discharging, export side when charging</small>
+            </label>
           </div>
           <div class="form-actions">
             <button type="submit" class="primary">Save</button>

@@ -140,6 +140,14 @@ pub struct DispatcherConfig {
     pub saturation_gap_w: f64,
     #[serde(default = "default_saturation_window_s")]
     pub saturation_window_s: f64,
+    /// Asymmetric grid target bias. The dispatcher never tries to bring
+    /// grid_w to 0 — it leaves a margin of `grid_bias_w` on the import
+    /// side when discharging (so an unmodelled load doesn't push us into
+    /// export) and on the export side when charging (so we don't
+    /// accidentally pay for a few watts of grid import while charging).
+    /// Set to 0 to dispatch to exact 0.
+    #[serde(default = "default_grid_bias_w")]
+    pub grid_bias_w: f64,
 }
 
 impl Default for DispatcherConfig {
@@ -156,6 +164,7 @@ impl Default for DispatcherConfig {
             circuit_headroom: default_circuit_headroom(),
             saturation_gap_w: default_saturation_gap_w(),
             saturation_window_s: default_saturation_window_s(),
+            grid_bias_w: default_grid_bias_w(),
         }
     }
 }
@@ -192,6 +201,9 @@ fn default_saturation_gap_w() -> f64 {
 }
 fn default_saturation_window_s() -> f64 {
     8.0
+}
+fn default_grid_bias_w() -> f64 {
+    30.0
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +418,9 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.dispatcher.circuit_headroom) {
             anyhow::bail!("dispatcher.circuit_headroom must be in [0, 1]");
+        }
+        if self.dispatcher.grid_bias_w < 0.0 {
+            anyhow::bail!("dispatcher.grid_bias_w must not be negative");
         }
         if self.real_shelly.poll_interval_ms == 0 {
             anyhow::bail!("real_shelly.poll_interval_ms must be > 0");

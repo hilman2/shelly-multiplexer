@@ -123,7 +123,20 @@ fn compute_desired(
     // Convention: positive grid_w = importing => batteries should
     // discharge MORE (commanded += positive). Negative grid_w = exporting
     // => charge MORE (commanded += negative).
-    let correction_total = grid_w;
+    //
+    // Asymmetric bias: shrink the correction by `grid_bias_w` toward zero
+    // and clamp so it never crosses zero. Effect: when discharging we
+    // leave a small import margin (cheap insurance against accidentally
+    // pushing into export), and when charging we leave a small export
+    // margin (no accidental grid draw to top up the battery).
+    let raw = grid_w;
+    let correction_total = if raw > 0.0 {
+        (raw - dcfg.grid_bias_w).max(0.0)
+    } else if raw < 0.0 {
+        (raw + dcfg.grid_bias_w).min(0.0)
+    } else {
+        0.0
+    };
 
     // Default: keep every battery exactly where it is.
     let mut desired: HashMap<String, f64> = HashMap::new();
