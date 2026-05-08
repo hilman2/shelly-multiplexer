@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
 use tokio::time;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -50,8 +50,17 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
         }));
     }
 
-    // Wait forever — if any plug task ends, we just keep going. The
-    // dispatcher will mute the affected circuit when its plug data goes stale.
+    if handles.is_empty() {
+        // Empty template / no batteries yet — idle forever instead of
+        // bailing, so the rest of the add-on (UI, real-shelly poller,
+        // dispatcher idling at zero) keeps running.
+        info!("no batteries configured — plug poller idle");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
+    // Wait forever — each poll_plug_loop loops infinitely; if one ever
+    // ends we'd want to know.
     for h in handles {
         let _ = h.await;
     }

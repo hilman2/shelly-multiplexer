@@ -91,6 +91,14 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
         }));
     }
 
+    if handles.is_empty() {
+        // No batteries configured for direct polling — empty template,
+        // or all batteries have soc_entity_id and HA is enabled. Idle.
+        info!("no batteries to poll for SoC — marstek task idle");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     for h in handles {
         let _ = h.await;
     }
