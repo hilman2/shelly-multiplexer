@@ -11,29 +11,11 @@ REAL_HOST=$(bashio::config 'real_shelly_host')
 REAL_PORT=$(bashio::config 'real_shelly_udp_port')
 LOG_LEVEL=$(bashio::config 'log_level')
 
-# If an existing config.toml is from the v0.1.x multiplex schema (which
-# is incompatible with v0.2.0+), back it up and let the seed branch below
-# write a fresh template. Detection markers are very specific to v0.1
-# (the [safety] section we removed and the old [[batteries]] table-name
-# spelling that v0.2 renamed to [[battery]]).
-if [ -f "${CONFIG_FILE}" ]; then
-    if grep -qE '^\[safety\]|^\[\[batteries\]\]' "${CONFIG_FILE}"; then
-        BACKUP="${CONFIG_FILE}.v01-backup-$(date +%Y%m%d-%H%M%S)"
-        bashio::log.warning "==============================================================================="
-        bashio::log.warning "v0.1 config detected at ${CONFIG_FILE}"
-        bashio::log.warning "v0.2 has a NEW SCHEMA (pulse-mode, plug_url mandatory per battery)."
-        bashio::log.warning "Backing up old config to ${BACKUP}"
-        bashio::log.warning "and writing a fresh v0.2 template. Edit it via Studio Code Server."
-        bashio::log.warning "==============================================================================="
-        mv "${CONFIG_FILE}" "${BACKUP}"
-    fi
-fi
-
-# Seed config.toml on first start (or after the v0.1 backup above) with a
-# placeholder pulse-mode template. The user MUST edit this to add at
-# least one circuit + battery (with a Shelly Plug PM Gen3) before the
-# dispatcher does anything useful. real_shelly host/port are passed as
-# CLI flags on every start so the HA Configuration tab always wins.
+# Seed config.toml on first start with a placeholder pulse-mode template.
+# The user MUST edit it via the web UI to add at least one circuit +
+# battery (with a Shelly Plug PM Gen3) before the dispatcher does anything
+# useful. real_shelly host/port are passed as CLI flags on every start so
+# the HA Configuration tab always wins.
 if [ ! -f "${CONFIG_FILE}" ]; then
     bashio::log.warning "No config.toml found - writing placeholder. EDIT IT before relying on the add-on!"
     mkdir -p /config
@@ -90,9 +72,11 @@ url = "http://homeassistant.local:8123/api"
 token = ""
 timeout_ms = 3000
 
-# ----- Add at least one circuit and one battery below. -----
+# ----- Add at least one circuit and one battery below via the web UI. -----
 # A circuit is a shared protective device (MCB/RCD); the dispatcher
 # enforces (sum of plug power on members) <= cap_w * circuit_headroom.
+# Each battery REQUIRES a dedicated Shelly Plug PM Gen3 - the plug is
+# the safety ground truth.
 #
 # [[circuits]]
 # id = "1"
@@ -100,11 +84,7 @@ timeout_ms = 3000
 # voltage = 230
 # phases = 1
 #
-# Each battery REQUIRES a dedicated Shelly Plug PM Gen3. The plug is
-# the safety ground truth - without fresh data the entire circuit goes
-# silent (CT muted, Marstek watchdog clears integrator).
-#
-# [[battery]]
+# [[batteries]]
 # id = "A"
 # address = "192.168.1.61"               # static IP of the Marstek
 # circuit = "1"

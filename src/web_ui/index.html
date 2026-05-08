@@ -37,111 +37,319 @@
     </div>
   </header>
 
+  <nav>
+    <button data-view="status" class="active">Status</button>
+    <button data-view="batteries">Circuits &amp; Batteries</button>
+    <button data-view="config">Configuration</button>
+  </nav>
+
   <main>
-    <section class="card">
-      <h2>Grid</h2>
-      <div class="grid-row">
-        <div class="big">
-          <div class="label">Real Shelly total</div>
-          <div class="value" id="grid-w">–</div>
-          <div class="unit">W</div>
-          <div class="sub" id="grid-direction">–</div>
+    <!-- ============================ STATUS VIEW ============================ -->
+    <section id="view-status" class="view active">
+      <div class="card">
+        <h2>Grid</h2>
+        <div class="grid-row">
+          <div class="big">
+            <div class="label">Real Shelly total</div>
+            <div class="value" id="grid-w">–</div>
+            <div class="unit">W</div>
+            <div class="sub" id="grid-direction">–</div>
+          </div>
+          <div class="ages">
+            <div><span class="label">Grid sample age</span><span class="value-small" id="grid-age">–</span></div>
+          </div>
         </div>
-        <div class="ages">
-          <div><span class="label">Grid sample age</span><span class="value-small" id="grid-age">–</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Circuits</h2>
+        <p class="hint">
+          Cap is enforced from the live plug measurements (signed sum).
+          If any plug in a circuit goes stale &gt; <strong>plug_stale_s</strong>,
+          the entire circuit is muted: CT silent for
+          <strong>group_silent_after_stale_s</strong> so every Marstek's
+          watchdog clears its integrator.
+        </p>
+        <table class="data-table">
+          <colgroup>
+            <col class="col-id">
+            <col class="col-w">
+            <col class="col-w">
+            <col class="col-w">
+            <col class="col-w">
+            <col class="col-status">
+            <col class="col-members">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Circuit</th>
+              <th>Fuse cap</th>
+              <th>Commanded sum</th>
+              <th>Measured sum</th>
+              <th>Headroom</th>
+              <th>State</th>
+              <th>Members</th>
+            </tr>
+          </thead>
+          <tbody id="circuits-status-body"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Batteries</h2>
+        <p class="hint">
+          Each battery has its own virtual integrator (<code>commanded</code>),
+          updated by every delta pulse we commit to its Marstek. The
+          plug reading (<code>plug</code>) is ground truth.
+        </p>
+        <table class="data-table">
+          <colgroup>
+            <col class="col-id">
+            <col class="col-id">
+            <col class="col-ip">
+            <col class="col-w">
+            <col class="col-w">
+            <col class="col-pulse">
+            <col class="col-soc">
+            <col class="col-status">
+            <col class="col-status">
+            <col class="col-status">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Battery</th>
+              <th>Circuit</th>
+              <th>IP</th>
+              <th>Commanded</th>
+              <th>Plug</th>
+              <th>Pulse&nbsp;queue</th>
+              <th>SoC</th>
+              <th>Plug age</th>
+              <th>Last poll</th>
+              <th>State</th>
+            </tr>
+          </thead>
+          <tbody id="batteries-status-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============================ BATTERIES VIEW ============================ -->
+    <section id="view-batteries" class="view">
+      <div class="card" id="form-circuits-wrap">
+        <h3>Circuits</h3>
+        <p class="hint">
+          A circuit is a shared protective device (MCB/RCD).
+          <code>cap_w = phases × fuse_amps × voltage</code>. Each battery
+          on its own must stay within the cap; the dispatcher enforces
+          the live sum from the plug measurements.
+          <span class="restart-tag">restart required</span>
+        </p>
+        <table class="editor-table">
+          <thead>
+            <tr><th>id</th><th>fuse_amps</th><th>phases</th><th>voltage</th><th>cap (W)</th><th></th></tr>
+          </thead>
+          <tbody id="circuits-body"></tbody>
+        </table>
+        <div class="form-actions">
+          <button type="button" class="secondary" id="btn-add-circuit">+ Add circuit</button>
+          <button type="button" class="primary" id="btn-save-circuits">Save circuits</button>
+          <span class="form-status" id="status-circuits"></span>
+        </div>
+      </div>
+
+      <div class="card" id="form-batteries-wrap">
+        <h3>Batteries</h3>
+        <p class="hint">
+          Each battery requires a dedicated Shelly Plug PM Gen3 — the
+          plug is the safety ground truth for the circuit cap. Without
+          a fresh plug reading the entire circuit goes silent.
+          <span class="restart-tag">restart required</span>
+        </p>
+        <div id="batteries-list"></div>
+        <div class="form-actions">
+          <button type="button" class="secondary" id="btn-add-battery">+ Add battery</button>
+          <button type="button" class="primary" id="btn-save-batteries">Save batteries</button>
+          <span class="form-status" id="status-batteries"></span>
         </div>
       </div>
     </section>
 
-    <section class="card">
-      <h2>Circuits</h2>
-      <p class="hint">
-        Cap is enforced from the live plug measurements (signed sum).
-        If any plug in a circuit goes stale &gt; <strong>plug_stale_s</strong>,
-        the entire circuit is muted: CT silent for
-        <strong>group_silent_after_stale_s</strong> so every Marstek's
-        watchdog clears its integrator. Resumes once plugs are healthy
-        again.
-      </p>
-      <table class="data-table">
-        <colgroup>
-          <col class="col-id">
-          <col class="col-w">
-          <col class="col-w">
-          <col class="col-w">
-          <col class="col-w">
-          <col class="col-status">
-          <col class="col-members">
-        </colgroup>
-        <thead>
-          <tr>
-            <th>Circuit</th>
-            <th>Fuse cap</th>
-            <th>Commanded sum</th>
-            <th>Measured sum</th>
-            <th>Headroom</th>
-            <th>State</th>
-            <th>Members</th>
-          </tr>
-        </thead>
-        <tbody id="circuits-body"></tbody>
-      </table>
-    </section>
+    <!-- ============================ CONFIG VIEW ============================ -->
+    <section id="view-config" class="view">
+      <div class="card">
+        <h2>Configuration</h2>
+        <p class="hint">
+          Edits are validated, persisted to <code id="cfg-path">–</code>
+          and applied live where possible. Settings tagged
+          <span class="restart-tag">restart required</span> are written
+          to disk but only take effect after an add-on restart. TOML
+          comments are not preserved.
+        </p>
 
-    <section class="card">
-      <h2>Batteries</h2>
-      <p class="hint">
-        Each battery has its own virtual integrator (<code>commanded</code>),
-        the cumulative sum of every delta we have pulsed to its Marstek.
-        The Shelly Plug PM Gen3 reading (<code>plug</code>) is the ground
-        truth: drift between commanded and plug for &gt;
-        <strong>saturation_window_s</strong> triggers saturation, which
-        caps the battery at the observed ceiling and redispatches the
-        slack to siblings.
-      </p>
-      <table class="data-table">
-        <colgroup>
-          <col class="col-id">
-          <col class="col-id">
-          <col class="col-ip">
-          <col class="col-w">
-          <col class="col-w">
-          <col class="col-pulse">
-          <col class="col-soc">
-          <col class="col-status">
-          <col class="col-status">
-          <col class="col-status">
-        </colgroup>
-        <thead>
-          <tr>
-            <th>Battery</th>
-            <th>Circuit</th>
-            <th>IP</th>
-            <th title="What we have committed to the Marstek's internal integrator">Commanded</th>
-            <th title="Live reading from the Shelly Plug PM Gen3">Plug</th>
-            <th title="Pulses still queued for the next Marstek polls">Pulse&nbsp;queue</th>
-            <th>SoC</th>
-            <th>Plug age</th>
-            <th>Last poll</th>
-            <th>State</th>
-          </tr>
-        </thead>
-        <tbody id="batteries-body"></tbody>
-      </table>
-    </section>
+        <form id="form-real_shelly" class="cfg-form" data-section="real_shelly">
+          <h3>Real Shelly</h3>
+          <div class="form-grid">
+            <label>Host (IP)
+              <input name="host" type="text" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>UDP port
+              <input name="udp_port" type="number" min="1" max="65535" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>Poll interval (ms)
+              <input name="poll_interval_ms" type="number" min="50" max="60000" required>
+            </label>
+            <label>Request timeout (ms)
+              <input name="request_timeout_ms" type="number" min="50" max="60000" required>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
 
-    <section class="card">
-      <h2>Configuration</h2>
-      <p class="hint">
-        Pulse-mode config is file-based (read on start). Edit
-        <code id="cfg-path">/config/config.toml</code> via the Studio Code
-        Server add-on, then restart this add-on to apply. Live editing in
-        the UI was removed with the multiplex layer — the new architecture
-        depends on a static plug/circuit topology.
-      </p>
-      <pre class="config" id="config-dump">loading…</pre>
+        <form id="form-virtual_shelly" class="cfg-form" data-section="virtual_shelly">
+          <h3>Virtual Shelly</h3>
+          <div class="form-grid">
+            <label>Bind interface
+              <input name="bind_interface" type="text" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>UDP port
+              <input name="udp_port" type="number" min="1" max="65535" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>HTTP port (0 = off)
+              <input name="http_port" type="number" min="0" max="65535" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>Device MAC (hex 12 chars; empty = derive)
+              <input name="device_mac" type="text" pattern="^$|^[0-9A-Fa-f]{12}$">
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>Device hostname (empty = derive)
+              <input name="device_hostname" type="text">
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>Firmware version
+              <input name="firmware" type="text" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label class="checkbox">
+              <input name="enable_mdns" type="checkbox">
+              <span>enable mDNS <span class="restart-tag">restart required</span></span>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
+
+        <form id="form-management" class="cfg-form" data-section="management">
+          <h3>Management UI</h3>
+          <div class="form-grid">
+            <label>Bind address (host:port)
+              <input name="bind_address" type="text" required>
+              <span class="restart-tag">restart required</span>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
+
+        <form id="form-dispatcher" class="cfg-form" data-section="dispatcher">
+          <h3>Dispatcher (pulse-mode)</h3>
+          <p class="hint">
+            Each battery has its own virtual integrator. The dispatcher
+            emits <code>pulse_count</code> delta pulses per change >
+            <code>deadband_w</code>; the next pulse only queues once the
+            previous has landed (|commanded − plug| ≤
+            <code>hit_tolerance_w</code>).
+          </p>
+          <div class="form-grid">
+            <label>Cycle (ms)
+              <input name="cycle_ms" type="number" min="50" max="5000" required>
+            </label>
+            <label>Deadband (W)
+              <input name="deadband_w" type="number" min="0" step="any" required>
+            </label>
+            <label>Hit tolerance (W)
+              <input name="hit_tolerance_w" type="number" min="0" step="any" required>
+            </label>
+            <label>Pulse count
+              <input name="pulse_count" type="number" min="2" max="10" required>
+            </label>
+            <label>SoC full (%)
+              <input name="soc_full_pct" type="number" min="0" max="100" step="any" required>
+            </label>
+            <label>SoC empty (%)
+              <input name="soc_empty_pct" type="number" min="0" max="100" step="any" required>
+            </label>
+            <label>Plug stale (s)
+              <input name="plug_stale_s" type="number" min="0" step="any" required>
+            </label>
+            <label>Group silent (s)
+              <input name="group_silent_after_stale_s" type="number" min="0" step="any" required>
+            </label>
+            <label>Circuit headroom (0–1)
+              <input name="circuit_headroom" type="number" min="0" max="1" step="any" required>
+            </label>
+            <label>Saturation gap (W)
+              <input name="saturation_gap_w" type="number" min="0" step="any" required>
+            </label>
+            <label>Saturation window (s)
+              <input name="saturation_window_s" type="number" min="0" step="any" required>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
+
+        <form id="form-home_assistant" class="cfg-form" data-section="home_assistant">
+          <h3>Home Assistant integration</h3>
+          <p class="hint">
+            Optional: read battery SoC from HA entities instead of
+            polling the inverter directly. Useful when an HA integration
+            already owns the inverter's UDP port. Token can be left blank
+            inside the add-on — it's then taken from
+            <code>$SUPERVISOR_TOKEN</code>.
+            <span class="restart-tag">restart required</span>
+          </p>
+          <div class="form-grid">
+            <label class="checkbox">
+              <input name="enabled" type="checkbox">
+              <span>enabled <span class="restart-tag">restart required</span></span>
+            </label>
+            <label>URL
+              <input name="url" type="text" placeholder="http://homeassistant.local:8123/api">
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>Token (long-lived; blank → SUPERVISOR_TOKEN)
+              <input name="token" type="password" autocomplete="off">
+              <span class="restart-tag">restart required</span>
+            </label>
+            <label>Request timeout (ms)
+              <input name="timeout_ms" type="number" min="100" max="30000" required>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
+      </div>
     </section>
   </main>
+
+  <div id="toast"></div>
 
   <script src="app.js"></script>
 </body>

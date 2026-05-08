@@ -1,9 +1,4 @@
 //! Web UI + management API on a separate port.
-//!
-//! Minimal version for the pulse-based dispatcher: serves the embedded
-//! web UI and exposes a `/api/status` endpoint that surfaces per-battery
-//! commanded vs measured power, pulse queue depth, plug freshness, and
-//! per-circuit silence state.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,12 +11,12 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::Json;
 use rust_embed::Embed;
 use serde::Serialize;
-use serde_json::Value;
-use tracing::info;
+use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -34,7 +29,6 @@ struct WebAssets;
 struct AdminCtx {
     state: Arc<AppState>,
     config: Arc<ArcSwap<Config>>,
-    #[allow(dead_code)]
     config_path: PathBuf,
 }
 
@@ -55,6 +49,8 @@ pub async fn run(
     let router = Router::new()
         .route("/", get(serve_index))
         .route("/api/status", get(api_status))
+        .route("/api/config", get(api_get_config).put(api_put_config))
+        .route("/api/config/section/{name}", put(api_put_section))
         .route("/api/health", get(api_health))
         .route("/{*path}", get(serve_static))
         .with_state(ctx);
@@ -81,6 +77,10 @@ pub async fn run(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Static / index
+// ---------------------------------------------------------------------------
+
 async fn serve_index() -> Response {
     serve_embed("index.html")
 }
@@ -105,10 +105,15 @@ fn serve_embed(path: &str) -> Response {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /api/status — live runtime state
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize)]
 struct StatusResponse {
     grid_w: Option<f64>,
     grid_age_ms: Option<u128>,
+    config_path: String,
     batteries: Vec<BatteryInfo>,
     circuits: Vec<CircuitInfo>,
 }
@@ -215,17 +220,165 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
     Json(StatusResponse {
         grid_w,
         grid_age_ms,
+        config_path: ctx.config_path.display().to_string(),
         batteries,
         circuits: circuit_infos,
     })
 }
 
-async fn api_health(State(ctx): State<AdminCtx>) -> impl IntoResponse {
-    let _ = ctx.config.load();
-    Json(serde_json::json!({"status": "ok"}))
+async fn api_health() -> impl IntoResponse {
+    Json(json!({"status": "ok"}))
 }
 
-#[allow(dead_code)]
-fn _unused() -> Value {
-    serde_json::json!({})
+// ---------------------------------------------------------------------------
+// /api/config — read & write
+// ---------------------------------------------------------------------------
+
+async fn api_get_config(State(ctx): State<AdminCtx>) -> impl IntoResponse {
+    let cfg = ctx.config.load_full();
+    // Mask the SUPERVISOR_TOKEN if it's currently being used (we don't
+    // want to leak it to the browser). Detect by comparing to env var.
+    let mut value = serde_json::to_value(&*cfg).unwrap_or(json!({}));
+    if let Ok(env_tok) = std::env::var("SUPERVISOR_TOKEN") {
+        if !env_tok.is_empty() {
+            if let Some(ha) = value.get_mut("home_assistant") {
+                if let Some(tok) = ha.get_mut("token") {
+                    if tok.as_str().map(|s| s == env_tok).unwrap_or(false) {
+                        *tok = json!("");
+                    }
+                }
+            }
+        }
+    }
+    let body = json!({
+        "config_path": ctx.config_path.display().to_string(),
+        "config": value,
+    });
+    Json(body)
+}
+
+/// Replace the entire config. Validates, persists, swaps live config.
+async fn api_put_config(
+    State(ctx): State<AdminCtx>,
+    Json(body): Json<Value>,
+) -> Response {
+    let new_cfg: Config = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("parse: {e}")),
+    };
+    apply_new_config(&ctx, new_cfg).await
+}
+
+/// Replace one section by name. Body is the new value for that section.
+async fn api_put_section(
+    State(ctx): State<AdminCtx>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    const SECTIONS: &[&str] = &[
+        "real_shelly",
+        "virtual_shelly",
+        "management",
+        "dispatcher",
+        "home_assistant",
+        "circuits",
+        "batteries",
+    ];
+    if !SECTIONS.contains(&name.as_str()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown section '{name}' (allowed: {SECTIONS:?})"),
+        );
+    }
+
+    let cfg = ctx.config.load_full();
+    let mut as_json = match serde_json::to_value(&*cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialise current config: {e}"),
+            );
+        }
+    };
+    if let Some(obj) = as_json.as_object_mut() {
+        obj.insert(name.clone(), body);
+    } else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config root is not an object".into(),
+        );
+    }
+    let new_cfg: Config = match serde_json::from_value(as_json) {
+        Ok(c) => c,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("parse: {e}")),
+    };
+    apply_new_config(&ctx, new_cfg).await
+}
+
+async fn apply_new_config(ctx: &AdminCtx, mut new_cfg: Config) -> Response {
+    if let Err(e) = new_cfg.validate() {
+        return error_response(StatusCode::BAD_REQUEST, format!("validation: {e:#}"));
+    }
+
+    // Re-inject the SUPERVISOR_TOKEN if the new config doesn't carry one
+    // and the env var has one — so flipping HA enabled in the UI doesn't
+    // require pasting a token in.
+    if new_cfg.home_assistant.token.trim().is_empty() {
+        if let Ok(env_tok) = std::env::var("SUPERVISOR_TOKEN") {
+            if !env_tok.is_empty() {
+                new_cfg.home_assistant.token = env_tok;
+            }
+        }
+    }
+
+    // Persist to disk. Drop SUPERVISOR_TOKEN before writing (don't put a
+    // secret into a file the user might back up).
+    let mut for_disk = new_cfg.clone();
+    if let Ok(env_tok) = std::env::var("SUPERVISOR_TOKEN") {
+        if !env_tok.is_empty() && for_disk.home_assistant.token == env_tok {
+            for_disk.home_assistant.token.clear();
+        }
+    }
+    let toml_str = match toml::to_string_pretty(&for_disk) {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialise to TOML: {e}"),
+            );
+        }
+    };
+    let tmp = ctx.config_path.with_extension("toml.tmp");
+    if let Err(e) = std::fs::write(&tmp, toml_str.as_bytes()) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", tmp.display()),
+        );
+    }
+    if let Err(e) = std::fs::rename(&tmp, &ctx.config_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "rename {} -> {}: {e}",
+                tmp.display(),
+                ctx.config_path.display()
+            ),
+        );
+    }
+
+    // Hot-swap the in-memory config so live-tunable fields apply
+    // immediately. AppState topology (batteries / circuits maps) was
+    // built at startup and is NOT rebuilt — adding a battery, removing
+    // one, or changing its IP / circuit / plug_url requires a restart.
+    ctx.config.store(Arc::new(new_cfg));
+    info!("config updated via admin UI");
+
+    Json(json!({"status": "ok"})).into_response()
+}
+
+fn error_response(status: StatusCode, message: String) -> Response {
+    warn!(status = %status, "config update rejected: {}", message);
+    (status, Json(json!({"error": message}))).into_response()
 }
