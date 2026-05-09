@@ -557,27 +557,28 @@ impl Config {
         if self.dispatcher.grid_bias_w < 0.0 {
             anyhow::bail!("dispatcher.grid_bias_w must not be negative");
         }
+        // Validation philosophy: only reject configurations that are
+        // mathematically meaningless (negative durations, ranges with
+        // empty interiors). "Suboptimal but functional" is left alone —
+        // existing user configs from older versions must keep loading.
         if self.dispatcher.hit_tolerance_w < 0.0 {
             anyhow::bail!("dispatcher.hit_tolerance_w must not be negative");
         }
-        if self.dispatcher.hit_tolerance_w > self.dispatcher.deadband_w {
-            anyhow::bail!(
-                "dispatcher.hit_tolerance_w ({}) must be ≤ deadband_w ({}) — every issued pulse must move the plug by at least the movement threshold",
-                self.dispatcher.hit_tolerance_w,
-                self.dispatcher.deadband_w
-            );
+        // Note: hit_tolerance_w > deadband_w is suboptimal (the
+        // movement-based settle path can never trigger, so settle_timeout_s
+        // takes over) but not broken. We deliberately allow it so v0.3
+        // configs with manually raised hit_tolerance_w still load.
+        if self.dispatcher.plug_stale_s < 0.0 {
+            anyhow::bail!("dispatcher.plug_stale_s must not be negative");
         }
-        if self.dispatcher.plug_stale_s <= 0.0 {
-            anyhow::bail!("dispatcher.plug_stale_s must be > 0");
-        }
-        if self.dispatcher.grid_stale_s <= 0.0 {
-            anyhow::bail!("dispatcher.grid_stale_s must be > 0");
+        if self.dispatcher.grid_stale_s < 0.0 {
+            anyhow::bail!("dispatcher.grid_stale_s must not be negative");
         }
         if self.dispatcher.group_silent_after_stale_s < 0.0 {
             anyhow::bail!("dispatcher.group_silent_after_stale_s must not be negative");
         }
-        if self.dispatcher.settle_timeout_s <= 0.0 {
-            anyhow::bail!("dispatcher.settle_timeout_s must be > 0");
+        if self.dispatcher.settle_timeout_s < 0.0 {
+            anyhow::bail!("dispatcher.settle_timeout_s must not be negative");
         }
         if !(0.0..=100.0).contains(&self.dispatcher.soc_full_pct) {
             anyhow::bail!("dispatcher.soc_full_pct must be in [0, 100]");
@@ -596,5 +597,161 @@ impl Config {
             anyhow::bail!("real_shelly.poll_interval_ms must be > 0");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Load a TOML string and run the full validate(). This is the exact
+    /// pipeline used at startup, so anything that passes here will load
+    /// inside the add-on too.
+    fn load_str(s: &str) -> Result<Config> {
+        let cfg: Config = toml::from_str(s).context("parse")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Regression test for v0.4.0 → v0.4.1: a user had `hit_tolerance_w = 50`
+    /// in their v0.3-era config (where the field was unused). v0.4.0 added
+    /// a `hit_tolerance_w ≤ deadband_w` constraint that made the add-on
+    /// fail to start on update. This must keep loading.
+    #[test]
+    fn loads_v03_config_with_hit_tolerance_above_deadband() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[dispatcher]
+deadband_w = 30
+hit_tolerance_w = 50
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+"#,
+        );
+        assert!(cfg.is_ok(), "expected valid config; got {:?}", cfg.err());
+    }
+
+    /// A config that uses every dispatcher field at its v0.3 default
+    /// values must still load on v0.4+. This catches regressions where
+    /// new validation accidentally rejects historical defaults.
+    #[test]
+    fn loads_v03_default_dispatcher_values() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+http_port = 0
+
+[management]
+
+[dispatcher]
+cycle_ms = 200
+deadband_w = 30
+hit_tolerance_w = 15
+pulse_count = 3
+soc_full_pct = 95
+soc_empty_pct = 5
+plug_stale_s = 2.0
+group_silent_after_stale_s = 60.0
+circuit_headroom = 0.95
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+"#,
+        );
+        assert!(cfg.is_ok(), "expected valid config; got {:?}", cfg.err());
+    }
+
+    /// Mathematically meaningless values still rejected. Negative durations
+    /// would underflow or panic later in the pipeline.
+    #[test]
+    fn rejects_negative_durations() {
+        let bad = r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[dispatcher]
+plug_stale_s = -1.0
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+"#;
+        assert!(load_str(bad).is_err());
+    }
+
+    /// soc_empty must remain strictly less than soc_full — empty interval
+    /// would make the SoC gates contradict each other.
+    #[test]
+    fn rejects_inverted_soc_bounds() {
+        let bad = r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[dispatcher]
+soc_full_pct = 5
+soc_empty_pct = 95
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+"#;
+        assert!(load_str(bad).is_err());
     }
 }
