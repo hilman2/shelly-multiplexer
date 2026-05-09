@@ -96,9 +96,11 @@
       <div class="card">
         <h2>Batteries</h2>
         <p class="hint">
-          Each battery has its own virtual integrator (<code>commanded</code>),
-          updated by every delta pulse we commit to its Marstek. The
-          plug reading (<code>plug</code>) is ground truth.
+          Plug reading (<code>plug</code>) is the only ground truth.
+          Each cycle the dispatcher computes a per-battery delta from
+          grid_w and queues it as a CT-pulse burst; the next pulse only
+          arms once the plug has moved by <code>hit_tolerance_w</code>
+          or <code>settle_timeout_s</code> has elapsed.
         </p>
         <table class="data-table">
           <colgroup>
@@ -264,11 +266,13 @@
         <form id="form-dispatcher" class="cfg-form" data-section="dispatcher">
           <h3>Dispatcher (pulse-mode)</h3>
           <p class="hint">
-            Each battery has its own virtual integrator. The dispatcher
-            emits <code>pulse_count</code> delta pulses per change >
-            <code>deadband_w</code>; the next pulse only queues once the
-            previous has landed (|commanded − plug| ≤
-            <code>hit_tolerance_w</code>).
+            The dispatcher emits <code>pulse_count</code> delta pulses
+            per change &gt; <code>deadband_w</code>; the next pulse only
+            queues once the plug has moved by
+            <code>hit_tolerance_w</code> or
+            <code>settle_timeout_s</code> has elapsed. If grid_w stays
+            silent for <code>grid_stale_s</code>, every circuit goes
+            silent until the real Shelly recovers.
           </p>
           <div class="form-grid">
             <label>Cycle (ms)
@@ -276,9 +280,11 @@
             </label>
             <label>Deadband (W)
               <input name="deadband_w" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">minimum pulse magnitude AND noise floor</small>
             </label>
             <label>Hit tolerance (W)
               <input name="hit_tolerance_w" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">plug-movement threshold for "pulse landed". Must be ≤ deadband_w</small>
             </label>
             <label>Pulse count
               <input name="pulse_count" type="number" min="2" max="10" required>
@@ -291,18 +297,18 @@
             </label>
             <label>Plug stale (s)
               <input name="plug_stale_s" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">plug silent this long → mute its circuit</small>
+            </label>
+            <label>Grid stale (s)
+              <input name="grid_stale_s" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">real Shelly silent this long → mute every circuit</small>
             </label>
             <label>Group silent (s)
               <input name="group_silent_after_stale_s" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">how long to stay muted after recovery (Marstek watchdog clears at ~60 s)</small>
             </label>
             <label>Circuit headroom (0–1)
               <input name="circuit_headroom" type="number" min="0" max="1" step="any" required>
-            </label>
-            <label>Saturation gap (W)
-              <input name="saturation_gap_w" type="number" min="0" step="any" required>
-            </label>
-            <label>Saturation window (s)
-              <input name="saturation_window_s" type="number" min="0" step="any" required>
             </label>
             <label>Grid bias (W)
               <input name="grid_bias_w" type="number" min="0" step="any" required>
@@ -310,7 +316,7 @@
             </label>
             <label>Settle timeout (s)
               <input name="settle_timeout_s" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">if plug doesn't converge within hit_tolerance after this long, accept and move on</small>
+              <small style="color:var(--fg-faint);font-size:11px">if plug doesn't move by hit_tolerance after this long, accept and move on</small>
             </label>
           </div>
           <div class="form-actions">

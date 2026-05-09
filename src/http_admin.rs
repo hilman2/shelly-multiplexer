@@ -125,10 +125,18 @@ struct BatteryInfo {
     address: String,
     max_charge_w: f64,
     max_discharge_w: f64,
+    /// SoC-aware effective caps. Equal to the hardware caps unless a
+    /// taper is configured AND currently engaged.
+    effective_max_charge_w: f64,
+    effective_max_discharge_w: f64,
     capacity_wh: f64,
     priority_weight: f64,
     soc_full_pct: Option<f64>,
     soc_empty_pct: Option<f64>,
+    charge_taper_soc_pct: Option<f64>,
+    charge_taper_w: Option<f64>,
+    discharge_taper_soc_pct: Option<f64>,
+    discharge_taper_w: Option<f64>,
     plug_w: Option<f64>,
     plug_age_ms: Option<u128>,
     pulse_remaining: u32,
@@ -139,6 +147,20 @@ struct BatteryInfo {
     soc_source: Option<String>,
     last_marstek_poll_ms_ago: Option<u128>,
     last_error: Option<String>,
+    /// Operational state flags — derived in `api_status` from the
+    /// raw fields above. The frontend renders one pill per true flag.
+    /// Multiple can be true at once (e.g. tapered AND at_limit when
+    /// the battery is doing all the (reduced) power it can).
+    charge_tapered: bool,
+    discharge_tapered: bool,
+    at_charge_limit: bool,
+    at_discharge_limit: bool,
+    soc_full_gated: bool,
+    soc_empty_gated: bool,
+    /// Circuit-level mute (plug or grid stale) — surfaced here too
+    /// so the per-battery row can show "silent" without the user
+    /// having to cross-reference the circuit table.
+    circuit_silent: bool,
 }
 
 #[derive(Serialize)]
@@ -155,6 +177,8 @@ struct CircuitInfo {
 
 async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
     let now = std::time::Instant::now();
+    let cfg = ctx.config.load_full();
+    let dcfg = &cfg.dispatcher;
     let snap = ctx.state.snapshot.load_full();
     let grid_w = snap.status.total_act_power;
     let grid_age_ms = snap.age.map(|t| now.duration_since(t).as_millis());
@@ -164,30 +188,50 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
 
     let batteries: Vec<BatteryInfo> = bats
         .values()
-        .map(|b| BatteryInfo {
-            id: b.id.clone(),
-            circuit: b.circuit.clone(),
-            address: b.address.to_string(),
-            max_charge_w: b.max_charge_w,
-            max_discharge_w: b.max_discharge_w,
-            capacity_wh: b.capacity_wh,
-            priority_weight: b.priority_weight,
-            soc_full_pct: b.soc_full_pct,
-            soc_empty_pct: b.soc_empty_pct,
-            plug_w: b.last_plug_w,
-            plug_age_ms: b.last_plug_at.map(|t| now.duration_since(t).as_millis()),
-            pulse_remaining: b.pulse_remaining,
-            pending_pulse_w: b.pending_pulse_w,
-            plug_w_at_pulse_send: b.plug_w_at_pulse_send,
-            last_pulse_completed_ms_ago: b
-                .last_pulse_completed_at
-                .map(|t| now.duration_since(t).as_millis()),
-            soc_pct: b.soc_pct,
-            soc_source: b.soc_source.clone(),
-            last_marstek_poll_ms_ago: b
-                .last_marstek_poll_at
-                .map(|t| now.duration_since(t).as_millis()),
-            last_error: b.last_error.clone(),
+        .map(|b| {
+            let circuit_silent = circuits
+                .get(&b.circuit)
+                .and_then(|c| c.silent_until)
+                .map(|t| t > now)
+                .unwrap_or(false);
+            BatteryInfo {
+                id: b.id.clone(),
+                circuit: b.circuit.clone(),
+                address: b.address.to_string(),
+                max_charge_w: b.max_charge_w,
+                max_discharge_w: b.max_discharge_w,
+                effective_max_charge_w: b.effective_max_charge_w(),
+                effective_max_discharge_w: b.effective_max_discharge_w(),
+                capacity_wh: b.capacity_wh,
+                priority_weight: b.priority_weight,
+                soc_full_pct: b.soc_full_pct,
+                soc_empty_pct: b.soc_empty_pct,
+                charge_taper_soc_pct: b.charge_taper_soc_pct,
+                charge_taper_w: b.charge_taper_w,
+                discharge_taper_soc_pct: b.discharge_taper_soc_pct,
+                discharge_taper_w: b.discharge_taper_w,
+                plug_w: b.last_plug_w,
+                plug_age_ms: b.last_plug_at.map(|t| now.duration_since(t).as_millis()),
+                pulse_remaining: b.pulse_remaining,
+                pending_pulse_w: b.pending_pulse_w,
+                plug_w_at_pulse_send: b.plug_w_at_pulse_send,
+                last_pulse_completed_ms_ago: b
+                    .last_pulse_completed_at
+                    .map(|t| now.duration_since(t).as_millis()),
+                soc_pct: b.soc_pct,
+                soc_source: b.soc_source.clone(),
+                last_marstek_poll_ms_ago: b
+                    .last_marstek_poll_at
+                    .map(|t| now.duration_since(t).as_millis()),
+                last_error: b.last_error.clone(),
+                charge_tapered: b.is_charge_tapered(),
+                discharge_tapered: b.is_discharge_tapered(),
+                at_charge_limit: b.is_at_charge_limit(),
+                at_discharge_limit: b.is_at_discharge_limit(),
+                soc_full_gated: b.is_soc_full_gated(dcfg.soc_full_pct),
+                soc_empty_gated: b.is_soc_empty_gated(dcfg.soc_empty_pct),
+                circuit_silent,
+            }
         })
         .collect();
 

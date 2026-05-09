@@ -112,6 +112,8 @@ main {
 .col-pulse { width: 90px; }
 .col-soc { width: 70px; }
 .col-status { width: 110px; }
+/* Battery-row state cell can hold several pills; let them wrap. */
+.data-table td.state-cell { white-space: normal; line-height: 1.8; }
 .col-members { width: auto; }
 
 .dim { color: var(--fg-faint); }
@@ -130,6 +132,12 @@ main {
 .state.err { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
 .state.silent { background: rgba(245, 158, 11, 0.18); color: var(--silent); }
 .state.pulsing { background: rgba(192, 132, 252, 0.18); color: var(--pulsing); }
+/* Taper = SoC-derated cap is in effect (cosmetic, informational) */
+.state.taper { background: rgba(74, 158, 255, 0.18); color: var(--accent); }
+/* At limit = plug at ≥ 95 % of effective cap; battery is doing all it can */
+.state.limit { background: rgba(255, 154, 74, 0.18); color: var(--accent-warm); }
+/* Pills wrap onto multiple lines if several flags are active. */
+td .state + .state { margin-left: 4px; }
 
 .dir-tag {
   display: inline-block; padding: 1px 6px; border-radius: 8px;

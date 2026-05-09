@@ -107,11 +107,16 @@ pub struct DispatcherConfig {
     /// Recompute interval for desired_w + pulse generation.
     #[serde(default = "default_cycle_ms")]
     pub cycle_ms: u64,
-    /// Δ below this is ignored — Marstek-quantisation noise.
+    /// Δ below this is ignored — Marstek-quantisation noise. Also the
+    /// minimum pulse magnitude the dispatcher will issue.
     #[serde(default = "default_deadband_w")]
     pub deadband_w: f64,
-    /// |commanded − measured| ≤ this counts as "pulse landed".
-    /// Marstek typically undershoots ~5 W due to conversion losses.
+    /// Plug-movement threshold that counts the previous pulse as
+    /// "landed", so the dispatcher is free to queue the next pulse.
+    /// Smaller than `deadband_w` on purpose — every pulse we issue is
+    /// at least `deadband_w` in magnitude, so any landed pulse moves
+    /// the plug by more than this. Marstek typically undershoots ~5 W
+    /// due to conversion losses; 15 W is a safe noise floor.
     #[serde(default = "default_hit_tolerance_w")]
     pub hit_tolerance_w: f64,
     /// Pulses sent per delta change. Marstek needs ≥2; 3 = safety margin.
@@ -126,6 +131,11 @@ pub struct DispatcherConfig {
     /// Plug silent for this long → group goes safe.
     #[serde(default = "default_plug_stale_s")]
     pub plug_stale_s: f64,
+    /// Real-Shelly snapshot silent for this long → ALL circuits muted
+    /// (we can't trust grid_w any more). Symmetric to plug_stale_s for
+    /// the upstream measurement.
+    #[serde(default = "default_grid_stale_s")]
+    pub grid_stale_s: f64,
     /// After a stale plug recovers, mute the group's CT signal for this
     /// long (Marstek watchdog clears integrator) before resuming.
     #[serde(default = "default_group_silent_s")]
@@ -133,13 +143,6 @@ pub struct DispatcherConfig {
     /// Use only this fraction of the circuit cap (95 %) — jitter buffer.
     #[serde(default = "default_circuit_headroom")]
     pub circuit_headroom: f64,
-    /// Saturation detection: if commanded_w exceeds plug_w by this much
-    /// and stays there for `saturation_window_s`, the battery is treated
-    /// as saturated and the missing watts are redispatched to siblings.
-    #[serde(default = "default_saturation_gap_w")]
-    pub saturation_gap_w: f64,
-    #[serde(default = "default_saturation_window_s")]
-    pub saturation_window_s: f64,
     /// Asymmetric grid target bias. The dispatcher never tries to bring
     /// grid_w to 0 — it leaves a margin of `grid_bias_w` on the import
     /// side when discharging (so an unmodelled load doesn't push us into
@@ -149,11 +152,10 @@ pub struct DispatcherConfig {
     #[serde(default = "default_grid_bias_w")]
     pub grid_bias_w: f64,
     /// Time-based pulse-settle fallback: even if the plug reading hasn't
-    /// converged within hit_tolerance_w, after this many seconds the
+    /// moved by `hit_tolerance_w` yet, after this many seconds the
     /// dispatcher accepts the cycle as done and is free to queue the
     /// next corrective pulse. Marstek typically reacts in 1-2 s; 5 s is
-    /// a safe upper bound. The saturation detection separately handles
-    /// persistent large gaps via ceiling/resync.
+    /// a safe upper bound that prevents lockups when a Marstek refuses.
     #[serde(default = "default_settle_timeout_s")]
     pub settle_timeout_s: f64,
 }
@@ -168,10 +170,9 @@ impl Default for DispatcherConfig {
             soc_full_pct: default_soc_full(),
             soc_empty_pct: default_soc_empty(),
             plug_stale_s: default_plug_stale_s(),
+            grid_stale_s: default_grid_stale_s(),
             group_silent_after_stale_s: default_group_silent_s(),
             circuit_headroom: default_circuit_headroom(),
-            saturation_gap_w: default_saturation_gap_w(),
-            saturation_window_s: default_saturation_window_s(),
             grid_bias_w: default_grid_bias_w(),
             settle_timeout_s: default_settle_timeout_s(),
         }
@@ -199,17 +200,14 @@ fn default_soc_empty() -> f64 {
 fn default_plug_stale_s() -> f64 {
     2.0
 }
+fn default_grid_stale_s() -> f64 {
+    5.0
+}
 fn default_group_silent_s() -> f64 {
     60.0
 }
 fn default_circuit_headroom() -> f64 {
     0.95
-}
-fn default_saturation_gap_w() -> f64 {
-    100.0
-}
-fn default_saturation_window_s() -> f64 {
-    8.0
 }
 fn default_grid_bias_w() -> f64 {
     30.0
@@ -325,6 +323,32 @@ pub struct BatteryConfig {
     pub soc_full_pct: Option<f64>,
     #[serde(default)]
     pub soc_empty_pct: Option<f64>,
+    /// SoC-based power tapering. Real batteries can't accept full
+    /// `max_charge_w` near 100 % SoC nor sustain full `max_discharge_w`
+    /// near the empty cutoff — the BMS tapers. Modelling this in the
+    /// dispatcher (rather than letting Marstek silently undershoot a
+    /// commanded value) keeps `headroom()` honest and prevents the
+    /// integrator-overcommit loop near the SoC edges.
+    ///
+    /// Semantics — both pairs are independent step functions:
+    ///   • SoC ≥ `charge_taper_soc_pct` → effective max charge is
+    ///     `charge_taper_w` instead of `max_charge_w`.
+    ///   • SoC ≤ `discharge_taper_soc_pct` → effective max discharge is
+    ///     `discharge_taper_w` instead of `max_discharge_w`.
+    ///   • At/past the hard `soc_full_pct` / `soc_empty_pct` the
+    ///     direction is fully gated to 0 W (unchanged from before).
+    ///
+    /// All four fields are optional. Setting one direction's pair
+    /// enables tapering for that direction; leaving both `_w` fields
+    /// at None falls back to the unmodified hardware caps.
+    #[serde(default)]
+    pub charge_taper_soc_pct: Option<f64>,
+    #[serde(default)]
+    pub charge_taper_w: Option<f64>,
+    #[serde(default)]
+    pub discharge_taper_soc_pct: Option<f64>,
+    #[serde(default)]
+    pub discharge_taper_w: Option<f64>,
 }
 
 fn default_priority_weight() -> f64 {
@@ -438,6 +462,76 @@ impl Config {
                     );
                 }
             }
+            // Taper validation: each direction's pair must be set together,
+            // taper_w must be > 0 and ≤ the hardware cap, and taper_soc must
+            // sit strictly between the empty and full cutoffs (otherwise the
+            // taper either shadows the hard gate or never triggers).
+            let effective_full = b
+                .soc_full_pct
+                .unwrap_or(self.dispatcher.soc_full_pct);
+            let effective_empty = b
+                .soc_empty_pct
+                .unwrap_or(self.dispatcher.soc_empty_pct);
+            match (b.charge_taper_soc_pct, b.charge_taper_w) {
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+                    "battery {}: charge_taper_soc_pct and charge_taper_w must both be set or both unset",
+                    b.id
+                ),
+                (Some(soc), Some(w)) => {
+                    if !(0.0..=100.0).contains(&soc) {
+                        anyhow::bail!("battery {}: charge_taper_soc_pct must be in [0, 100]", b.id);
+                    }
+                    if w <= 0.0 || w >= b.max_charge_w {
+                        anyhow::bail!(
+                            "battery {}: charge_taper_w ({}) must be in (0, max_charge_w={})",
+                            b.id, w, b.max_charge_w
+                        );
+                    }
+                    if soc >= effective_full {
+                        anyhow::bail!(
+                            "battery {}: charge_taper_soc_pct ({}) must be < soc_full_pct ({})",
+                            b.id, soc, effective_full
+                        );
+                    }
+                    if soc <= effective_empty {
+                        anyhow::bail!(
+                            "battery {}: charge_taper_soc_pct ({}) must be > soc_empty_pct ({})",
+                            b.id, soc, effective_empty
+                        );
+                    }
+                }
+            }
+            match (b.discharge_taper_soc_pct, b.discharge_taper_w) {
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+                    "battery {}: discharge_taper_soc_pct and discharge_taper_w must both be set or both unset",
+                    b.id
+                ),
+                (Some(soc), Some(w)) => {
+                    if !(0.0..=100.0).contains(&soc) {
+                        anyhow::bail!("battery {}: discharge_taper_soc_pct must be in [0, 100]", b.id);
+                    }
+                    if w <= 0.0 || w >= b.max_discharge_w {
+                        anyhow::bail!(
+                            "battery {}: discharge_taper_w ({}) must be in (0, max_discharge_w={})",
+                            b.id, w, b.max_discharge_w
+                        );
+                    }
+                    if soc <= effective_empty {
+                        anyhow::bail!(
+                            "battery {}: discharge_taper_soc_pct ({}) must be > soc_empty_pct ({})",
+                            b.id, soc, effective_empty
+                        );
+                    }
+                    if soc >= effective_full {
+                        anyhow::bail!(
+                            "battery {}: discharge_taper_soc_pct ({}) must be < soc_full_pct ({})",
+                            b.id, soc, effective_full
+                        );
+                    }
+                }
+            }
             if b.marstek_port == 0 {
                 anyhow::bail!("battery {}: marstek_port must be > 0", b.id);
             }
@@ -462,6 +556,41 @@ impl Config {
         }
         if self.dispatcher.grid_bias_w < 0.0 {
             anyhow::bail!("dispatcher.grid_bias_w must not be negative");
+        }
+        if self.dispatcher.hit_tolerance_w < 0.0 {
+            anyhow::bail!("dispatcher.hit_tolerance_w must not be negative");
+        }
+        if self.dispatcher.hit_tolerance_w > self.dispatcher.deadband_w {
+            anyhow::bail!(
+                "dispatcher.hit_tolerance_w ({}) must be ≤ deadband_w ({}) — every issued pulse must move the plug by at least the movement threshold",
+                self.dispatcher.hit_tolerance_w,
+                self.dispatcher.deadband_w
+            );
+        }
+        if self.dispatcher.plug_stale_s <= 0.0 {
+            anyhow::bail!("dispatcher.plug_stale_s must be > 0");
+        }
+        if self.dispatcher.grid_stale_s <= 0.0 {
+            anyhow::bail!("dispatcher.grid_stale_s must be > 0");
+        }
+        if self.dispatcher.group_silent_after_stale_s < 0.0 {
+            anyhow::bail!("dispatcher.group_silent_after_stale_s must not be negative");
+        }
+        if self.dispatcher.settle_timeout_s <= 0.0 {
+            anyhow::bail!("dispatcher.settle_timeout_s must be > 0");
+        }
+        if !(0.0..=100.0).contains(&self.dispatcher.soc_full_pct) {
+            anyhow::bail!("dispatcher.soc_full_pct must be in [0, 100]");
+        }
+        if !(0.0..=100.0).contains(&self.dispatcher.soc_empty_pct) {
+            anyhow::bail!("dispatcher.soc_empty_pct must be in [0, 100]");
+        }
+        if self.dispatcher.soc_empty_pct >= self.dispatcher.soc_full_pct {
+            anyhow::bail!(
+                "dispatcher.soc_empty_pct ({}) must be < soc_full_pct ({})",
+                self.dispatcher.soc_empty_pct,
+                self.dispatcher.soc_full_pct
+            );
         }
         if self.real_shelly.poll_interval_ms == 0 {
             anyhow::bail!("real_shelly.poll_interval_ms must be > 0");

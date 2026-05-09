@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::config::{BatteryConfig, CircuitConfig, Config};
 use crate::rpc::EmStatusIncoming;
@@ -52,6 +52,11 @@ pub struct BatteryState {
     /// Per-battery SoC limits (None = inherit dispatcher defaults).
     pub soc_full_pct: Option<f64>,
     pub soc_empty_pct: Option<f64>,
+    /// SoC-based power tapering. See `BatteryConfig` for semantics.
+    pub charge_taper_soc_pct: Option<f64>,
+    pub charge_taper_w: Option<f64>,
+    pub discharge_taper_soc_pct: Option<f64>,
+    pub discharge_taper_w: Option<f64>,
 
     /// Single CT value to send to the Marstek on the next poll(s).
     /// Replaced on every new dispatch decision (not appended).
@@ -104,6 +109,10 @@ impl BatteryState {
             priority_weight: cfg.priority_weight,
             soc_full_pct: cfg.soc_full_pct,
             soc_empty_pct: cfg.soc_empty_pct,
+            charge_taper_soc_pct: cfg.charge_taper_soc_pct,
+            charge_taper_w: cfg.charge_taper_w,
+            discharge_taper_soc_pct: cfg.discharge_taper_soc_pct,
+            discharge_taper_w: cfg.discharge_taper_w,
             pending_pulse_w: 0.0,
             pulse_remaining: 0,
             plug_w_at_pulse_send: None,
@@ -121,13 +130,13 @@ impl BatteryState {
     /// Is the battery ready for a new pulse to be queued?
     ///
     /// Conditions for "yes":
-    ///   1. No pulse in flight (pulse_remaining == 0).
-    ///   2. AND one of:
-    ///      a. We never sent a pulse yet (initial state).
-    ///      b. The plug has moved by >= movement_threshold_w since the
-    ///         pulse cycle started — battery responded.
-    ///      c. settle_timeout_s elapsed since the pulse cycle finished
-    ///         — battery didn't respond, but we can't wait forever.
+    ///   1. No pulse in flight (pulse_remaining == 0), AND
+    ///   2. one of:
+    ///      (a) we never sent a pulse yet (initial state),
+    ///      (b) the plug has moved by >= movement_threshold_w since the
+    ///      pulse cycle started (battery responded), or
+    ///      (c) settle_timeout_s elapsed since the pulse cycle finished
+    ///      (battery didn't respond, but we can't wait forever).
     pub fn pulse_settled(&self, movement_threshold_w: f64, settle_timeout_s: f64) -> bool {
         if self.pulse_remaining > 0 {
             return false;
@@ -164,6 +173,89 @@ impl BatteryState {
     pub fn effective_soc_empty_pct(&self, fallback: f64) -> f64 {
         self.soc_empty_pct.unwrap_or(fallback)
     }
+
+    /// Effective max charge power given the current SoC. Above the taper
+    /// SoC the BMS would taper anyway; we model it explicitly so the
+    /// dispatcher's `headroom()` is honest.
+    pub fn effective_max_charge_w(&self) -> f64 {
+        match (self.soc_pct, self.charge_taper_soc_pct, self.charge_taper_w) {
+            (Some(soc), Some(taper_soc), Some(taper_w)) if soc >= taper_soc => taper_w,
+            _ => self.max_charge_w,
+        }
+    }
+
+    /// Effective max discharge power given the current SoC. Below the
+    /// taper SoC the battery can't sustain full output; we cap it
+    /// upstream so the integrator never overcommits.
+    pub fn effective_max_discharge_w(&self) -> f64 {
+        match (
+            self.soc_pct,
+            self.discharge_taper_soc_pct,
+            self.discharge_taper_w,
+        ) {
+            (Some(soc), Some(taper_soc), Some(taper_w)) if soc <= taper_soc => taper_w,
+            _ => self.max_discharge_w,
+        }
+    }
+
+    /// True iff the charge taper is currently active (SoC high enough
+    /// that we cap charge below the hardware max). Used for UI display.
+    pub fn is_charge_tapered(&self) -> bool {
+        self.effective_max_charge_w() < self.max_charge_w
+    }
+
+    /// True iff the discharge taper is currently active (SoC low enough
+    /// that we cap discharge below the hardware max).
+    pub fn is_discharge_tapered(&self) -> bool {
+        self.effective_max_discharge_w() < self.max_discharge_w
+    }
+
+    /// True iff SoC is at or above the hard full cutoff — charge
+    /// direction is fully gated to 0 W.
+    pub fn is_soc_full_gated(&self, fallback_full_pct: f64) -> bool {
+        match self.soc_pct {
+            Some(soc) => soc >= self.effective_soc_full_pct(fallback_full_pct),
+            None => false,
+        }
+    }
+
+    /// True iff SoC is at or below the hard empty cutoff — discharge
+    /// direction is fully gated to 0 W.
+    pub fn is_soc_empty_gated(&self, fallback_empty_pct: f64) -> bool {
+        match self.soc_pct {
+            Some(soc) => soc <= self.effective_soc_empty_pct(fallback_empty_pct),
+            None => false,
+        }
+    }
+
+    /// True iff the plug is currently at ≥ 95 % of the effective max
+    /// in the active direction. Operator-facing "the battery is doing
+    /// everything it can right now" indicator. The 95 % threshold is
+    /// hardcoded — this is purely cosmetic, not a control input.
+    pub fn is_at_charge_limit(&self) -> bool {
+        let plug = match self.last_plug_w {
+            Some(p) => p,
+            None => return false,
+        };
+        // Charging = negative plug. At limit when |plug| ≥ 95% of cap.
+        if plug >= 0.0 {
+            return false;
+        }
+        let cap = self.effective_max_charge_w();
+        cap > 0.0 && -plug >= cap * 0.95
+    }
+
+    pub fn is_at_discharge_limit(&self) -> bool {
+        let plug = match self.last_plug_w {
+            Some(p) => p,
+            None => return false,
+        };
+        if plug <= 0.0 {
+            return false;
+        }
+        let cap = self.effective_max_discharge_w();
+        cap > 0.0 && plug >= cap * 0.95
+    }
 }
 
 #[derive(Debug)]
@@ -192,6 +284,9 @@ pub struct AppState {
     pub by_addr: HashMap<IpAddr, String>,
     pub energy: RwLock<EnergyCounters>,
     pub started_at: Instant,
+    /// Throttle for the grid-stale warning so a long real-Shelly outage
+    /// doesn't spam the log.
+    pub last_grid_stale_warn: Mutex<Option<Instant>>,
 }
 
 impl AppState {
@@ -227,6 +322,7 @@ impl AppState {
             by_addr,
             energy: RwLock::new(EnergyCounters::default()),
             started_at: Instant::now(),
+            last_grid_stale_warn: Mutex::new(None),
         })
     }
 }
@@ -246,5 +342,248 @@ impl EnergyCounters {
         } else {
             self.returned_wh += -total * dt_h;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_battery(plug_w: Option<f64>) -> BatteryState {
+        BatteryState {
+            id: "test".into(),
+            circuit: "c1".into(),
+            address: "127.0.0.1".parse().unwrap(),
+            max_charge_w: 2500.0,
+            max_discharge_w: 800.0,
+            capacity_wh: 2500.0,
+            priority_weight: 1.0,
+            soc_full_pct: None,
+            soc_empty_pct: None,
+            charge_taper_soc_pct: None,
+            charge_taper_w: None,
+            discharge_taper_soc_pct: None,
+            discharge_taper_w: None,
+            pending_pulse_w: 0.0,
+            pulse_remaining: 0,
+            plug_w_at_pulse_send: None,
+            last_pulse_completed_at: None,
+            last_plug_w: plug_w,
+            last_plug_at: plug_w.map(|_| Instant::now()),
+            last_marstek_poll_at: None,
+            soc_pct: None,
+            soc_at: None,
+            soc_source: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn pulse_settled_initial_state() {
+        let b = make_battery(None);
+        // No prior pulse → settled.
+        assert!(b.pulse_settled(15.0, 5.0));
+    }
+
+    #[test]
+    fn pulse_settled_in_flight() {
+        let mut b = make_battery(Some(0.0));
+        b.pulse_remaining = 2;
+        // Pulse still going out → not settled.
+        assert!(!b.pulse_settled(15.0, 5.0));
+    }
+
+    #[test]
+    fn pulse_settled_when_plug_moved() {
+        let mut b = make_battery(Some(120.0));
+        b.plug_w_at_pulse_send = Some(0.0);
+        b.last_pulse_completed_at = Some(Instant::now());
+        // Movement well above threshold → settled.
+        assert!(b.pulse_settled(15.0, 5.0));
+    }
+
+    #[test]
+    fn pulse_settled_blocked_when_plug_didnt_move() {
+        let mut b = make_battery(Some(2.0));
+        b.plug_w_at_pulse_send = Some(0.0);
+        b.last_pulse_completed_at = Some(Instant::now());
+        // 2 W movement < 15 W threshold, and not enough time passed → blocked.
+        assert!(!b.pulse_settled(15.0, 5.0));
+    }
+
+    #[test]
+    fn pulse_settled_via_timeout() {
+        let mut b = make_battery(Some(2.0));
+        b.plug_w_at_pulse_send = Some(0.0);
+        // Pretend the pulse completed long ago.
+        b.last_pulse_completed_at = Some(Instant::now() - Duration::from_secs(10));
+        assert!(b.pulse_settled(15.0, 5.0));
+    }
+
+    #[test]
+    fn effective_max_charge_w_below_taper_soc_returns_full() {
+        let mut b = make_battery(Some(0.0));
+        b.charge_taper_soc_pct = Some(95.0);
+        b.charge_taper_w = Some(1000.0);
+        b.soc_pct = Some(80.0);
+        assert_eq!(b.effective_max_charge_w(), 2500.0);
+    }
+
+    #[test]
+    fn effective_max_charge_w_at_or_above_taper_soc_returns_taper() {
+        let mut b = make_battery(Some(0.0));
+        b.charge_taper_soc_pct = Some(95.0);
+        b.charge_taper_w = Some(1000.0);
+        b.soc_pct = Some(95.0);
+        assert_eq!(b.effective_max_charge_w(), 1000.0);
+        b.soc_pct = Some(98.0);
+        assert_eq!(b.effective_max_charge_w(), 1000.0);
+    }
+
+    #[test]
+    fn effective_max_charge_w_unset_returns_full() {
+        // No taper config → falls back to hardware cap regardless of SoC.
+        let mut b = make_battery(Some(0.0));
+        b.soc_pct = Some(99.0);
+        assert_eq!(b.effective_max_charge_w(), 2500.0);
+    }
+
+    #[test]
+    fn effective_max_discharge_w_above_taper_soc_returns_full() {
+        let mut b = make_battery(Some(0.0));
+        b.discharge_taper_soc_pct = Some(15.0);
+        b.discharge_taper_w = Some(400.0);
+        b.soc_pct = Some(50.0);
+        assert_eq!(b.effective_max_discharge_w(), 800.0);
+    }
+
+    #[test]
+    fn effective_max_discharge_w_at_or_below_taper_soc_returns_taper() {
+        let mut b = make_battery(Some(0.0));
+        b.discharge_taper_soc_pct = Some(15.0);
+        b.discharge_taper_w = Some(400.0);
+        b.soc_pct = Some(15.0);
+        assert_eq!(b.effective_max_discharge_w(), 400.0);
+        b.soc_pct = Some(8.0);
+        assert_eq!(b.effective_max_discharge_w(), 400.0);
+    }
+
+    #[test]
+    fn effective_max_without_soc_returns_full() {
+        // SoC unknown → can't apply the taper, return the hardware cap.
+        // The hard `soc_full_pct` / `soc_empty_pct` gate in dispatcher.rs
+        // also returns the hardware cap when soc is None, so we stay
+        // consistent with the rest of the pipeline.
+        let mut b = make_battery(Some(0.0));
+        b.charge_taper_soc_pct = Some(95.0);
+        b.charge_taper_w = Some(1000.0);
+        b.discharge_taper_soc_pct = Some(15.0);
+        b.discharge_taper_w = Some(400.0);
+        b.soc_pct = None;
+        assert_eq!(b.effective_max_charge_w(), 2500.0);
+        assert_eq!(b.effective_max_discharge_w(), 800.0);
+    }
+
+    #[test]
+    fn is_charge_tapered_true_when_effective_below_hardware() {
+        let mut b = make_battery(Some(0.0));
+        b.charge_taper_soc_pct = Some(90.0);
+        b.charge_taper_w = Some(1000.0);
+        b.soc_pct = Some(92.0);
+        assert!(b.is_charge_tapered());
+        b.soc_pct = Some(80.0);
+        assert!(!b.is_charge_tapered());
+    }
+
+    #[test]
+    fn is_discharge_tapered_true_when_effective_below_hardware() {
+        let mut b = make_battery(Some(0.0));
+        b.discharge_taper_soc_pct = Some(15.0);
+        b.discharge_taper_w = Some(400.0);
+        b.soc_pct = Some(12.0);
+        assert!(b.is_discharge_tapered());
+        b.soc_pct = Some(50.0);
+        assert!(!b.is_discharge_tapered());
+    }
+
+    #[test]
+    fn is_soc_full_gated_uses_effective_threshold() {
+        let mut b = make_battery(Some(0.0));
+        b.soc_pct = Some(96.0);
+        // No per-battery override, fallback 95 → gated.
+        assert!(b.is_soc_full_gated(95.0));
+        b.soc_pct = Some(94.0);
+        assert!(!b.is_soc_full_gated(95.0));
+        // Per-battery override wins.
+        b.soc_full_pct = Some(98.0);
+        b.soc_pct = Some(96.0);
+        assert!(!b.is_soc_full_gated(95.0));
+    }
+
+    #[test]
+    fn is_soc_empty_gated_uses_effective_threshold() {
+        let mut b = make_battery(Some(0.0));
+        b.soc_pct = Some(4.0);
+        assert!(b.is_soc_empty_gated(5.0));
+        b.soc_pct = Some(6.0);
+        assert!(!b.is_soc_empty_gated(5.0));
+    }
+
+    #[test]
+    fn is_soc_gated_false_without_soc() {
+        let b = make_battery(Some(0.0));
+        assert!(!b.is_soc_full_gated(95.0));
+        assert!(!b.is_soc_empty_gated(5.0));
+    }
+
+    #[test]
+    fn is_at_charge_limit_when_plug_near_effective_cap() {
+        let mut b = make_battery(Some(-2400.0));
+        // No taper → cap is 2500 W, 2400 / 2500 = 96 % ≥ 95 % → at limit.
+        assert!(b.is_at_charge_limit());
+        b.last_plug_w = Some(-1000.0);
+        assert!(!b.is_at_charge_limit());
+        // Taper engaged → cap is 1000 W, -950 ≥ 95 % of 1000 → at limit.
+        b.charge_taper_soc_pct = Some(90.0);
+        b.charge_taper_w = Some(1000.0);
+        b.soc_pct = Some(92.0);
+        b.last_plug_w = Some(-960.0);
+        assert!(b.is_at_charge_limit());
+        // Plug positive (discharging) → not a charge-limit state.
+        b.last_plug_w = Some(500.0);
+        assert!(!b.is_at_charge_limit());
+    }
+
+    #[test]
+    fn is_at_discharge_limit_when_plug_near_effective_cap() {
+        let mut b = make_battery(Some(770.0));
+        // No taper → cap is 800 W, 770 / 800 = 96.25 % ≥ 95 % → at limit.
+        assert!(b.is_at_discharge_limit());
+        b.last_plug_w = Some(200.0);
+        assert!(!b.is_at_discharge_limit());
+        b.last_plug_w = Some(-500.0);
+        assert!(!b.is_at_discharge_limit());
+    }
+
+    #[test]
+    fn energy_integrate_consumed_and_returned() {
+        let mut e = EnergyCounters::default();
+        // Importing 1000 W for 1 hour → 1000 Wh consumed.
+        let snap_in = EmStatusIncoming {
+            total_act_power: Some(1000.0),
+            ..Default::default()
+        };
+        e.integrate(&snap_in, 3600.0);
+        assert!((e.consumed_wh - 1000.0).abs() < 0.001);
+        assert_eq!(e.returned_wh, 0.0);
+        // Exporting 500 W for 1 hour → 500 Wh returned.
+        let snap_out = EmStatusIncoming {
+            total_act_power: Some(-500.0),
+            ..Default::default()
+        };
+        e.integrate(&snap_out, 3600.0);
+        assert!((e.consumed_wh - 1000.0).abs() < 0.001);
+        assert!((e.returned_wh - 500.0).abs() < 0.001);
     }
 }
