@@ -99,7 +99,11 @@ main {
   font-weight: 600; color: var(--fg-dim); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.6px;
 }
-.data-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.data-table th.num,
+.data-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .data-table tr:last-child td { border-bottom: none; }
 
 .col-id { width: 80px; }

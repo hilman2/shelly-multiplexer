@@ -163,8 +163,8 @@ function renderBatteriesStatus(batteries) {
         <td class="num">${fmtW(b.plug_w)} W</td>
         <td class="num">${queue}</td>
         <td class="num">${socCell}</td>
-        <td>${fmtMs(b.plug_age_ms)}</td>
-        <td>${fmtMs(b.last_marstek_poll_ms_ago)}</td>
+        <td class="num">${fmtMs(b.plug_age_ms)}</td>
+        <td class="num">${fmtMs(b.last_marstek_poll_ms_ago)}</td>
         <td>${stateCell}</td>
       </tr>`;
     })
