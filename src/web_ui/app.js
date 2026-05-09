@@ -136,8 +136,6 @@ function renderBatteriesStatus(batteries) {
       let stateCell;
       if (b.last_error)
         stateCell = `<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`;
-      else if (b.saturated)
-        stateCell = `<span class="state warn" title="reached at ${fmtW(b.saturation_ceiling_w)} W">saturated</span>`;
       else if (b.plug_age_ms == null || b.plug_age_ms > 2000)
         stateCell = '<span class="state warn">plug stale</span>';
       else if (b.pulse_remaining > 0)

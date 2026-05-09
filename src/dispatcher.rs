@@ -250,13 +250,6 @@ fn compute_desired(
             if clamped < lb && lb <= prev {
                 clamped = lb.min(prev);
             }
-            if let Some(c) = b.saturation_ceiling_w {
-                if need_more_discharge {
-                    clamped = clamped.min(c);
-                } else {
-                    clamped = clamped.max(c);
-                }
-            }
             desired.insert(b.id.clone(), clamped);
             if (clamped - proposed).abs() > 1e-3 {
                 clamped_ids.push(b.id.clone());
@@ -331,7 +324,7 @@ fn queue_pulses(
             continue;
         }
 
-        update_saturation(b, dcfg, now);
+        resync_if_drifted(b, dcfg, now);
 
         // Sequencing: only queue a new pulse if the previous has settled.
         if !b.pulse_settled(dcfg.hit_tolerance_w) {
@@ -367,70 +360,41 @@ fn queue_pulses(
     }
 }
 
-fn update_saturation(b: &mut BatteryState, dcfg: &DispatcherConfig, now: Instant) {
+/// Resync our virtual integrator to the plug reading when the gap stays
+/// large for too long. This is NOT real "saturation" detection — true
+/// BMS saturation only happens at the SoC extremes (typically >98 %
+/// charging, <floor discharging) and is already handled by the SoC-aware
+/// soft bounds in compute_desired. What this function catches is
+/// communication drift: lost UDP pulses, the HACS Marstek plugin sending
+/// its own CT signal that overrides ours, or transient BMS refusals.
+/// In any of those cases the right move is to trust the plug as ground
+/// truth, set commanded := plug, and let the next dispatch tick queue
+/// a fresh corrective pulse from there.
+fn resync_if_drifted(b: &mut BatteryState, dcfg: &DispatcherConfig, now: Instant) {
     let Some(plug) = b.last_plug_w else {
         return;
     };
     let gap = b.commanded_w - plug;
-
-    // Within tolerance: clear any stale saturation state.
     if gap.abs() <= dcfg.saturation_gap_w {
-        if b.saturated {
-            info!(battery = %b.id, "battery saturation cleared");
-        }
         b.saturation_since = None;
         b.saturated = false;
         b.saturation_ceiling_w = None;
         return;
     }
-
-    // Gap is large — wait for it to persist before reacting.
     match b.saturation_since {
-        None => {
-            b.saturation_since = Some(now);
-        }
+        None => b.saturation_since = Some(now),
         Some(t) => {
-            if now.duration_since(t).as_secs_f64() < dcfg.saturation_window_s {
-                return;
-            }
-            // Persisted long enough — react.
-            let same_direction = (b.commanded_w >= 0.0 && plug >= 0.0)
-                || (b.commanded_w < 0.0 && plug < 0.0);
-            if same_direction {
-                // True saturation: battery moves in the commanded direction
-                // but can't reach the magnitude (e.g. commanded -2500 W
-                // charge but at 95 % SoC the BMS only allows -1800 W).
-                // Cap future commanded values at the observed ceiling.
-                if !b.saturated || b.saturation_ceiling_w.is_none() {
-                    b.saturated = true;
-                    b.saturation_ceiling_w = Some(plug);
-                    info!(
-                        battery = %b.id,
-                        ceiling_w = plug,
-                        "battery saturated (commanded direction respected, magnitude capped)"
-                    );
-                }
-                if (b.commanded_w - plug).abs() > dcfg.deadband_w {
-                    b.commanded_w = plug;
-                }
-            } else {
-                // Sign mismatch: battery moves OPPOSITE to commanded.
-                // Causes: UDP packet loss on our pulses, HACS Marstek
-                // plugin overriding our CT signal, Marstek BMS refusing
-                // (cell-balance / temp / floor protection). We can't
-                // distinguish, but we MUST resync our virtual integrator
-                // to reality, otherwise pulse_settled stays false forever
-                // and the dispatcher locks up.
+            if now.duration_since(t).as_secs_f64() >= dcfg.saturation_window_s {
                 info!(
                     battery = %b.id,
                     commanded_w = b.commanded_w,
                     plug_w = plug,
-                    "model/reality sign mismatch — resyncing commanded to plug"
+                    "model/reality drift — resyncing commanded to plug"
                 );
                 b.commanded_w = plug;
+                b.saturation_since = None;
                 b.saturated = false;
                 b.saturation_ceiling_w = None;
-                b.saturation_since = None;
             }
         }
     }

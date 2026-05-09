@@ -67,14 +67,20 @@ pub struct BatteryState {
     /// Diagnostics: when this Marstek last polled the virtual Shelly.
     pub last_marstek_poll_at: Option<Instant>,
 
-    /// Saturation: battery cannot reach commanded_w (full / empty / hardware
-    /// limited). Detected when |commanded_w| > |plug_w| + saturation_gap_w
-    /// for more than saturation_window_s. Causes the dispatcher to reduce
-    /// commanded_w to the observed ceiling and redispatch the missing watts
-    /// to siblings.
+    /// When the dispatcher first noticed |commanded_w − plug_w| exceeding
+    /// saturation_gap_w. After saturation_window_s of persistent drift the
+    /// dispatcher resyncs commanded_w to the plug reading. This isn't real
+    /// "saturation" (BMS taper at SoC extremes is handled by the SoC-aware
+    /// soft bounds in compute_desired); it catches communication drift —
+    /// lost UDP pulses, the HACS Marstek plugin overriding our CT signal,
+    /// or transient BMS refusals.
+    pub saturation_since: Option<Instant>,
+    /// Reserved (kept for /api/status backward compat). Always false / None
+    /// in v0.2.11+ — the BMS-saturation ceiling concept was retired because
+    /// the SoC-aware soft bounds already cap commanded above 98 % / below
+    /// floor and that's where the real BMS taper lives anyway.
     pub saturated: bool,
     pub saturation_ceiling_w: Option<f64>,
-    pub saturation_since: Option<Instant>,
 
     /// Telemetry sourced from the Marstek itself (or HA).
     pub soc_pct: Option<f64>,
@@ -131,19 +137,7 @@ impl BatteryState {
         let Some(plug) = self.last_plug_w else {
             return false;
         };
-        if (plug - self.commanded_w).abs() <= hit_tolerance_w {
-            return true;
-        }
-        // If we've concluded the battery is saturated and the plug confirms
-        // we're parked at the ceiling, treat the previous pulse as landed.
-        if self.saturated {
-            if let Some(ceiling) = self.saturation_ceiling_w {
-                if (plug - ceiling).abs() <= hit_tolerance_w {
-                    return true;
-                }
-            }
-        }
-        false
+        (plug - self.commanded_w).abs() <= hit_tolerance_w
     }
 
     pub fn is_plug_fresh(&self, now: Instant, stale_s: f64) -> bool {
