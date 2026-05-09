@@ -158,8 +158,27 @@ fn compute_desired(
             .unwrap_or(false)
     };
 
-    // Eligibility: skip muted circuits and batteries that physically can't
-    // absorb correction in the needed direction.
+    // SoC-aware soft bounds on commanded_w. An empty battery must never
+    // be DRIVEN into discharge (commanded > 0); a full one must never be
+    // driven into charge (commanded < 0). But it MUST be possible to
+    // unwind a previous command in the opposite direction (e.g. roll a
+    // -81 W charge command back to 0 when SoC is now 1 %).
+    let high_bound = |b: &BatteryState| -> f64 {
+        match b.soc_pct {
+            Some(soc) if soc <= dcfg.soc_empty_pct => 0.0,
+            _ => b.max_discharge_w,
+        }
+    };
+    let low_bound = |b: &BatteryState| -> f64 {
+        match b.soc_pct {
+            Some(soc) if soc >= dcfg.soc_full_pct => 0.0,
+            _ => -b.max_charge_w,
+        }
+    };
+
+    // Eligibility: skip only muted circuits and batteries with literally
+    // zero room to move in the needed direction. SoC limits no longer
+    // exclude here — they shape the per-battery clamp below.
     let mut eligible: Vec<&BatteryState> = bats
         .values()
         .filter(|b| {
@@ -167,22 +186,14 @@ fn compute_desired(
                 return false;
             }
             if need_more_discharge {
-                if b.commanded_w >= b.max_discharge_w - 1.0 {
+                let h = high_bound(b);
+                if b.commanded_w >= h - 1.0 {
                     return false;
-                }
-                if let Some(soc) = b.soc_pct {
-                    if soc <= dcfg.soc_empty_pct && b.commanded_w <= 0.0 {
-                        return false;
-                    }
                 }
             } else {
-                if b.commanded_w <= -b.max_charge_w + 1.0 {
+                let l = low_bound(b);
+                if b.commanded_w <= l + 1.0 {
                     return false;
-                }
-                if let Some(soc) = b.soc_pct {
-                    if soc >= dcfg.soc_full_pct && b.commanded_w >= 0.0 {
-                        return false;
-                    }
                 }
             }
             true
@@ -193,13 +204,14 @@ fn compute_desired(
         return desired;
     }
 
-    // Weight by priority × directional headroom (how much room each
-    // battery still has to absorb correction in the needed direction).
+    // Headroom = how much further each battery's commanded can move in
+    // the needed direction, respecting both hardware caps AND the
+    // SoC-aware soft bounds.
     let headroom_of = |b: &BatteryState| -> f64 {
         let h = if need_more_discharge {
-            b.max_discharge_w - b.commanded_w
+            high_bound(b) - b.commanded_w
         } else {
-            b.max_charge_w + b.commanded_w
+            b.commanded_w - low_bound(b)
         };
         h.max(0.0)
     };
@@ -222,7 +234,20 @@ fn compute_desired(
             let share = remaining * weight_of(b) / total_w;
             let prev = *desired.get(&b.id).unwrap();
             let proposed = prev + share;
+            // Hardware clamp first.
             let mut clamped = proposed.max(-b.max_charge_w).min(b.max_discharge_w);
+            // SoC-aware soft bounds. If we're outside the bounds (e.g.
+            // commanded was already negative when SoC dropped below
+            // empty) we ALLOW the proposed value if it moves toward 0;
+            // we just don't permit going PAST the bound away from 0.
+            let hb = high_bound(b);
+            let lb = low_bound(b);
+            if clamped > hb && hb >= prev {
+                clamped = hb.max(prev);
+            }
+            if clamped < lb && lb <= prev {
+                clamped = lb.min(prev);
+            }
             if let Some(c) = b.saturation_ceiling_w {
                 if need_more_discharge {
                     clamped = clamped.min(c);
