@@ -56,10 +56,11 @@ pulse_count = 3
 soc_full_pct = 95
 soc_empty_pct = 5
 plug_stale_s = 2.0
+grid_stale_s = 5.0
 group_silent_after_stale_s = 60.0
 circuit_headroom = 0.95
-saturation_gap_w = 100
-saturation_window_s = 8
+grid_bias_w = 30
+settle_timeout_s = 5.0
 
 [home_assistant]
 # Optional. If enabled, batteries with a soc_entity_id read SoC from HA

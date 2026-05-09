@@ -133,14 +133,45 @@ function renderBatteriesStatus(batteries) {
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id))
     .map((b) => {
-      let stateCell;
-      if (b.last_error)
-        stateCell = `<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`;
-      else if (b.plug_age_ms == null || b.plug_age_ms > 2000)
-        stateCell = '<span class="state warn">plug stale</span>';
-      else if (b.pulse_remaining > 0)
-        stateCell = '<span class="state pulsing">pulsing</span>';
-      else stateCell = '<span class="state ok">idle</span>';
+      // Multiple state pills can be true at once. Order matters: the
+      // first pill is the dominant one (error / silent / stale beat
+      // taper / limit annotations).
+      const pills = [];
+      if (b.last_error) {
+        pills.push(`<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`);
+      } else if (b.circuit_silent) {
+        pills.push('<span class="state silent" title="circuit muted (stale plug or grid)">silent</span>');
+      } else if (b.plug_age_ms == null || b.plug_age_ms > 2000) {
+        pills.push('<span class="state warn">plug stale</span>');
+      } else if (b.pulse_remaining > 0) {
+        pills.push('<span class="state pulsing">pulsing</span>');
+      } else {
+        pills.push('<span class="state ok">idle</span>');
+      }
+      // Annotation pills — additive, can stack with the dominant pill.
+      if (b.soc_full_gated) {
+        pills.push('<span class="state warn" title="SoC ≥ soc_full_pct: charging is fully gated to 0 W">SoC full</span>');
+      }
+      if (b.soc_empty_gated) {
+        pills.push('<span class="state warn" title="SoC ≤ soc_empty_pct: discharging is fully gated to 0 W">SoC empty</span>');
+      }
+      if (b.charge_tapered) {
+        const cap = Math.round(b.effective_max_charge_w);
+        pills.push(`<span class="state taper" title="charge cap reduced to ${cap} W (BMS taper near full SoC)">charge taper ${cap} W</span>`);
+      }
+      if (b.discharge_tapered) {
+        const cap = Math.round(b.effective_max_discharge_w);
+        pills.push(`<span class="state taper" title="discharge cap reduced to ${cap} W (BMS taper near empty SoC)">discharge taper ${cap} W</span>`);
+      }
+      if (b.at_charge_limit) {
+        const cap = Math.round(b.effective_max_charge_w);
+        pills.push(`<span class="state limit" title="plug at ≥ 95 % of effective charge cap (${cap} W)">at charge max</span>`);
+      }
+      if (b.at_discharge_limit) {
+        const cap = Math.round(b.effective_max_discharge_w);
+        pills.push(`<span class="state limit" title="plug at ≥ 95 % of effective discharge cap (${cap} W)">at discharge max</span>`);
+      }
+      const stateCell = pills.join(" ");
 
       const plug = b.plug_w == null ? 0 : b.plug_w;
       const dir =
@@ -176,7 +207,7 @@ function renderBatteriesStatus(batteries) {
         <td class="num">${socCell}</td>
         <td class="num">${fmtMs(b.plug_age_ms)}</td>
         <td class="num">${fmtMs(b.last_marstek_poll_ms_ago)}</td>
-        <td>${stateCell}</td>
+        <td class="state-cell">${stateCell}</td>
       </tr>`;
     })
     .join("");
@@ -416,6 +447,10 @@ function addBatteryCard(b = {}) {
       <label>soc_interval_ms<input data-f="soc_interval_ms" type="number" min="1000" max="600000" value="${b.soc_interval_ms ?? 30000}"></label>
       <label>soc_full_pct (override; blank = dispatcher default)<input data-f="soc_full_pct" type="number" min="0" max="100" step="any" value="${b.soc_full_pct == null ? "" : b.soc_full_pct}"></label>
       <label>soc_empty_pct (override; blank = dispatcher default)<input data-f="soc_empty_pct" type="number" min="0" max="100" step="any" value="${b.soc_empty_pct == null ? "" : b.soc_empty_pct}"></label>
+      <label>charge_taper_soc_pct (cap charge above this SoC)<input data-f="charge_taper_soc_pct" type="number" min="0" max="100" step="any" value="${b.charge_taper_soc_pct == null ? "" : b.charge_taper_soc_pct}"></label>
+      <label>charge_taper_w (cap to this many W)<input data-f="charge_taper_w" type="number" min="0" step="any" value="${b.charge_taper_w == null ? "" : b.charge_taper_w}"></label>
+      <label>discharge_taper_soc_pct (cap discharge below this SoC)<input data-f="discharge_taper_soc_pct" type="number" min="0" max="100" step="any" value="${b.discharge_taper_soc_pct == null ? "" : b.discharge_taper_soc_pct}"></label>
+      <label>discharge_taper_w (cap to this many W)<input data-f="discharge_taper_w" type="number" min="0" step="any" value="${b.discharge_taper_w == null ? "" : b.discharge_taper_w}"></label>
       <label>soc_entity_id (HA, optional)<input data-f="soc_entity_id" type="text" placeholder="sensor.battery_a_soc" value="${escapeAttr(b.soc_entity_id || "")}"></label>
     </div>
     <div class="bat-actions">
@@ -458,6 +493,14 @@ function readBatteries() {
     if (socFull != null) out.soc_full_pct = socFull;
     const socEmpty = num("soc_empty_pct");
     if (socEmpty != null) out.soc_empty_pct = socEmpty;
+    const chargeTaperSoc = num("charge_taper_soc_pct");
+    if (chargeTaperSoc != null) out.charge_taper_soc_pct = chargeTaperSoc;
+    const chargeTaperW = num("charge_taper_w");
+    if (chargeTaperW != null) out.charge_taper_w = chargeTaperW;
+    const dischargeTaperSoc = num("discharge_taper_soc_pct");
+    if (dischargeTaperSoc != null) out.discharge_taper_soc_pct = dischargeTaperSoc;
+    const dischargeTaperW = num("discharge_taper_w");
+    if (dischargeTaperW != null) out.discharge_taper_w = dischargeTaperW;
     return out;
   });
 }

@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -47,6 +48,9 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
 
     let mut sockets_by_port: HashMap<u16, Arc<UdpSocket>> = HashMap::new();
     let mut blocked_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    // One global request-id counter per port. Shared across batteries on
+    // that port so we never collide on the `pending` map (which keys by id).
+    let mut id_counters: HashMap<u16, Arc<AtomicU64>> = HashMap::new();
 
     for battery in &config.batteries {
         if !needs_direct_poll(battery) {
@@ -68,6 +72,9 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
                     receive_loop(socket_c, pending_c).await;
                 });
                 sockets_by_port.insert(battery.marstek_port, socket);
+                id_counters
+                    .entry(battery.marstek_port)
+                    .or_insert_with(|| Arc::new(AtomicU64::new(1)));
             }
             Err(e) => {
                 warn!(local = %bind_addr, error = %e, "marstek SoC port unavailable - skipping batteries on this port");
@@ -88,11 +95,14 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
         let Some(socket) = sockets_by_port.get(&battery.marstek_port).cloned() else {
             continue;
         };
+        let Some(id_counter) = id_counters.get(&battery.marstek_port).cloned() else {
+            continue;
+        };
         let state = state.clone();
         let pending = pending.clone();
         let battery = battery.clone();
         handles.push(tokio::spawn(async move {
-            poll_battery_loop(state, socket, pending, battery).await;
+            poll_battery_loop(state, socket, pending, id_counter, battery).await;
         }));
     }
 
@@ -142,14 +152,16 @@ async fn poll_battery_loop(
     state: Arc<AppState>,
     socket: Arc<UdpSocket>,
     pending: Arc<Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>>,
+    id_counter: Arc<AtomicU64>,
     battery: BatteryConfig,
 ) {
-    let mut next_id: i64 = (battery.address.to_string().bytes().map(|b| b as i64).sum::<i64>() & 0xFFFF) + 1;
     let interval = Duration::from_millis(battery.soc_interval_ms.max(1000));
     let target = SocketAddr::new(battery.address, battery.marstek_port);
     loop {
         time::sleep(interval).await;
-        next_id = next_id.wrapping_add(1);
+        // Per-port atomic counter — never collides across batteries that
+        // share a UDP port and the `pending` map keyed by id.
+        let next_id = id_counter.fetch_add(1, Ordering::Relaxed) as i64;
         match request_soc(&socket, &pending, target, next_id).await {
             Ok(soc_pct) => {
                 let mut bats = state.batteries.write();
@@ -190,11 +202,27 @@ async fn request_soc(
     let body = serde_json::to_vec(&req).context("marstek req encode")?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     pending.lock().await.insert(id, tx);
+
+    // Ensure the pending entry is removed on every exit path (timeout,
+    // send failure, anywhere we early-return). Without this the map grew
+    // unboundedly whenever a Marstek went silent.
+    let pending_guard = pending.clone();
+    let cleanup = scopeguard::guard((), move |_| {
+        let pending_guard = pending_guard.clone();
+        tokio::spawn(async move {
+            pending_guard.lock().await.remove(&id);
+        });
+    });
+
     socket.send_to(&body, target).await.context("marstek send")?;
     let v = time::timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| anyhow!("timeout"))?
         .map_err(|_| anyhow!("oneshot dropped"))?;
+    // Got a response → the receive_loop already removed the entry. Defuse
+    // the cleanup so we don't spawn a redundant remove.
+    scopeguard::ScopeGuard::into_inner(cleanup);
+
     let soc = v
         .get("result")
         .and_then(|r| r.get("soc").or_else(|| r.get("battery_soc")))

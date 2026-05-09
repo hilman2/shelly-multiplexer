@@ -1,128 +1,140 @@
-# ShellyMultiplexer — example configuration
+# ShellyMultiplexer — example configuration (v0.4.0+, pulse architecture).
 #
 # Before starting the multiplexer the real Shelly Pro 3EM MUST be moved
-# off the default UDP-RPC port 1010 (here: 2020) so the multiplexer can
+# off the default UDP-RPC port 1010 (e.g. 2020) so the multiplexer can
 # bind 1010 itself without colliding with the real device.
+# In the Shelly: Settings → Advanced → Outbound RPC / UDP RPC.
 #
-# In the Shelly: Settings -> Advanced -> Outbound RPC / UDP RPC.
+# Every battery REQUIRES a dedicated Shelly Plug PM Gen3 (`plug_url`).
+# The plug is the single safety ground truth for circuit-cap enforcement.
 
 [real_shelly]
-# IP of the real Shelly Pro 3EM
+# IP of the real Shelly Pro 3EM (the grid measurement source)
 host = "192.168.1.50"
-# Reconfigured UDP-RPC port on the real Shelly
+# Reconfigured UDP-RPC port on the real Shelly (default 1010 is taken by us)
 udp_port = 2020
-# How often the multiplexer polls the real Shelly
+# How often we poll the real Shelly for grid_w
 poll_interval_ms = 250
-# Timeout per poll
+# Per-poll timeout
 request_timeout_ms = 1000
 
 [virtual_shelly]
 # Interface the virtual Shelly listens on; 0.0.0.0 = all
 bind_interface = "0.0.0.0"
-# Standard Shelly UDP-RPC port — batteries expect 1010
+# Standard Shelly UDP-RPC port — Marsteks expect 1010
 udp_port = 1010
-# HTTP port for REST/RPC endpoints (REST: /shelly, /settings; RPC: /rpc)
+# HTTP/REST/RPC port (0 = disable). Marstek-only setups can leave this off.
+# Some non-Marstek inverters need it.
 http_port = 80
-# Minimum spacing between two responses to the same client (throttling)
-min_sample_period_ms = 1000
-# Device identification
-device_mac = ""        # empty = derive from primary NIC
-device_hostname = ""   # empty = "shellypro3em-<MAC>"
+# MAC + hostname identification (empty = derive from primary NIC)
+device_mac = ""
+device_hostname = ""
 firmware = "1.4.4"
+# Advertise as `shellypro3em-<mac>` via mDNS so Marsteks auto-discover us.
+# Disable on hosts where Avahi already runs (HA OS).
+enable_mdns = true
 
 [management]
-# Separate port for the web UI and management API. Kept distinct from
-# the virtual Shelly so the UI is reachable even when the virtual Shelly
-# binds port 80.
+# Web UI + admin API. Distinct from the virtual Shelly so it stays
+# reachable even when the virtual Shelly binds port 80.
 bind_address = "0.0.0.0:8080"
 
 [dispatcher]
-# Allocation strategy:
-#   "equal"        – every battery in the group gets the same share
-#   "by_capacity"  – proportional to max charge / discharge limits
-#   "by_soc"       – discharging: prefer higher SoC; charging: prefer lower
-#   "priority"     – priority-tiered, lower number = first
-strategy = "equal"
-
-# Max change in allocated power per second per battery.
-# 0 disables the limit. 500-1500 W/s is a sensible anti-oscillation range.
-rate_limit_w_per_s = 1000
-
-# Don't split grid imports/exports below this threshold (deadband, watts)
+# Recompute interval for desired_w + pulse generation
+cycle_ms = 200
+# Δ below this is ignored (Marstek-quantisation noise) AND is the minimum
+# pulse magnitude we'll issue.
 deadband_w = 30
+# Plug-movement threshold that counts a previous pulse as "landed".
+# Must be ≤ deadband_w (every issued pulse moves the plug by at least this).
+hit_tolerance_w = 15
+# Pulses sent per delta change (Marstek needs ≥ 2; 3 = safety margin)
+pulse_count = 3
+# SoC eligibility gates (per-battery overrides under [[batteries]])
+soc_full_pct = 95
+soc_empty_pct = 5
+# Stale-measurement timeouts. If exceeded, the affected circuit (plug) /
+# all circuits (grid) go silent for `group_silent_after_stale_s` so the
+# Marstek watchdog clears its integrator.
+plug_stale_s = 2.0
+grid_stale_s = 5.0
+group_silent_after_stale_s = 60.0
+# Use only this fraction of the circuit fuse cap (jitter buffer)
+circuit_headroom = 0.95
+# Asymmetric grid bias: leave this many W on the import side when
+# discharging (avoid accidental export) and on the export side when
+# charging (avoid paying for grid). 0 = dispatch to exact 0.
+grid_bias_w = 30
+# Time-based pulse-settle fallback: if the plug hasn't moved by
+# hit_tolerance_w within this many seconds, accept and move on.
+settle_timeout_s = 5.0
 
-[safety]
-# Global hard cap on the absolute sum of all battery allocations
-# (charging + discharging share the same cap).
-#
-# DEFAULT 3000 W. Going higher requires BOTH acknowledgement flags
-# below to be true AND every battery to be on its own protective device.
-# A runtime override via the web UI is also possible but is not
-# persisted across restarts.
-max_total_w = 3000
-acknowledged_higher_risk = false
-acknowledged_separate_fuses = false
+[home_assistant]
+# Optional: read battery SoC from an HA entity instead of polling the
+# inverter directly. Useful when an HA integration owns the inverter's
+# UDP port. Token can be left blank inside the add-on (sourced from
+# $SUPERVISOR_TOKEN automatically).
+enabled = false
+url = "http://homeassistant.local:8123/api"
+token = ""
+timeout_ms = 3000
 
-# --- Groups ---
-# A group caps the sum of allocations of its member batteries (e.g. a
-# shared B16 fuse). Batteries with no group assignment are uncapped.
+# --- Circuits ---
+# A circuit is a shared protective device (MCB/RCD). The dispatcher
+# enforces (signed sum of plug_w on members) ≤ cap_w × circuit_headroom.
 
-[[groups]]
+[[circuits]]
 id = "basement"
 fuse_amps = 16
 phases = 1            # 1 = single-phase, 3 = three-phase
 voltage = 230
-# -> cap = 1 * 16 * 230 = 3680 W
-
-[[groups]]
-id = "garage"
-fuse_amps = 16
-phases = 3
-voltage = 230
-# -> cap = 3 * 16 * 230 = 11040 W
+# → cap = 1 × 16 × 230 = 3680 W
 
 # --- Batteries ---
-# Each battery is identified by its IP address. In the battery itself
-# point the "Shelly IP" setting at the multiplexer's IP.
+# Each battery is identified by its IP address. Point the battery's
+# "Shelly Pro 3EM" target at the multiplexer IP. plug_url is mandatory.
 
 [[batteries]]
-id = "marstek-basement-1"
-address = "192.168.1.51"
-vendor = "marstek"
-group = "basement"
-phase = "a"             # informational — saldierende inverters react to total, not per-phase
+id = "marstek-a"
+address = "192.168.1.51"           # static IP of the Marstek
+circuit = "basement"
+plug_url = "http://192.168.1.71"   # dedicated Shelly Plug PM Gen3
 max_charge_w = 2500
-max_discharge_w = 2500
-# SoC window — outside this range the battery is excluded from the
-# corresponding direction. Required: telemetry must be reachable.
-min_soc_percent = 12
-max_soc_percent = 100
-priority = 1
-marstek_port = 30000        # Marstek Open API UDP port (default 30000)
-telemetry_interval_ms = 60000
+max_discharge_w = 800
+capacity_wh = 2500
+priority_weight = 1.0
+vendor = "marstek"
+marstek_port = 30000               # Marstek Open API UDP port
+soc_interval_ms = 30000
+# SoC-based power tapering (optional). Real batteries can't accept
+# full max_charge_w near 100 % SoC nor sustain full max_discharge_w
+# near the empty cutoff — the BMS tapers internally. Modelling it here
+# keeps the dispatcher's headroom math honest and prevents the
+# "Marstek target wanders, plug doesn't follow" failure mode.
+# Step semantics (no interpolation): SoC ≥ taper_soc → use taper_w.
+charge_taper_soc_pct = 90          # at/above this SoC, cap charge…
+charge_taper_w = 1000              # …to this many watts
+discharge_taper_soc_pct = 15       # at/below this SoC, cap discharge…
+discharge_taper_w = 400            # …to this many watts
+# Optional per-battery SoC override (defaults to dispatcher.soc_full_pct/empty)
+# soc_full_pct = 95
+# soc_empty_pct = 5
+# Optional HA SoC source (overrides direct Marstek poll)
+# soc_entity_id = "sensor.marstek_a_soc"
 
 [[batteries]]
-id = "marstek-basement-2"
+id = "marstek-b"
 address = "192.168.1.52"
-vendor = "marstek"
-group = "basement"
-phase = "a"
+circuit = "basement"
+plug_url = "http://192.168.1.72"
 max_charge_w = 2500
-max_discharge_w = 2500
-min_soc_percent = 12
-max_soc_percent = 100
-priority = 1
+max_discharge_w = 800
+capacity_wh = 2500
+priority_weight = 1.0
+vendor = "marstek"
 marstek_port = 30000
-telemetry_interval_ms = 60000
-
-[[batteries]]
-id = "hoymiles-garage-1"
-address = "192.168.1.61"
-vendor = "hoymiles"
-group = "garage"
-phase = "all"
-max_charge_w = 1920
-max_discharge_w = 1920
-min_soc_percent = 12
-max_soc_percent = 100
-priority = 2
+soc_interval_ms = 30000
+charge_taper_soc_pct = 90
+charge_taper_w = 1000
+discharge_taper_soc_pct = 15
+discharge_taper_w = 400

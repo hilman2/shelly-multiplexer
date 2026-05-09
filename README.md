@@ -37,23 +37,30 @@ measurements, never from "what we think we asked for".
   that integrate via Shelly Pro 3EM emulation.
 - **Discoverable via mDNS** as a real Pro 3EM (`_shelly._tcp.local`,
   `_http._tcp.local`, with the right TXT records).
-- **Per-battery virtual integrator** + delta pulse queue. Hardware-
-  clamped to each battery's `max_charge_w` / `max_discharge_w`.
-- **Plug-driven circuit cap** — the sum of plug readings on a circuit
-  must stay below `cap_w * circuit_headroom`. Violations scale down
-  the affected circuit's targets.
-- **Saturation detection** — when the plug stays below commanded for
-  more than `saturation_window_s`, the battery is parked at the
-  observed ceiling and the unmet watts redispatch to siblings. The
-  battery un-saturates automatically when it can keep up again.
-- **Group failure mode** — if any plug in a circuit goes silent for
-  more than `plug_stale_s`, the whole circuit is muted (CT silent for
-  `group_silent_after_stale_s`), forcing every Marstek's watchdog to
-  clear its integrator. Resumes once plugs are healthy again.
-- **Capacity-weighted distribution** — `priority_weight × directional
-  hardware cap` per battery. Falls back gracefully when a battery is
-  full / empty / saturated by handing the slack to siblings (grid
-  balance > SoC balance).
+- **Per-battery delta pulse queue.** Hardware-clamped to each battery's
+  `max_charge_w` / `max_discharge_w`. No virtual integrator: every cycle
+  recomputes a one-shot delta from the live plug reading.
+- **Plug-driven circuit cap** — the signed sum of plug readings on a
+  circuit, plus any pending deltas, must stay below `cap_w *
+  circuit_headroom`. Violations shrink the deltas toward 0; the
+  dispatcher never flips direction to "fix" an over-cap state.
+- **Stale-measurement safety** — if any plug in a circuit goes silent
+  for more than `plug_stale_s`, that circuit is muted; if the real
+  Shelly grid measurement goes silent for more than `grid_stale_s`,
+  *every* circuit is muted. CT signal goes dead for
+  `group_silent_after_stale_s` (≥ 60 s) so every Marstek's watchdog
+  clears its integrator. Resumes once measurements are healthy again.
+- **Capacity-weighted distribution** — `priority_weight × headroom`
+  per battery, where headroom is the live distance from the plug
+  reading to the directional hardware/SoC bound. Falls back gracefully
+  when a battery is full / empty by handing the slack to siblings
+  (grid balance > SoC balance).
+- **SoC-aware power tapering** — optional per-battery `charge_taper_*`
+  and `discharge_taper_*` knobs cap effective charge/discharge near
+  the full/empty edges (e.g. `charge_taper_soc_pct = 90` →
+  `charge_taper_w = 1000` reduces the effective max charge to 1000 W
+  once SoC ≥ 90 %). Models real BMS tapering so the dispatcher's
+  headroom math doesn't try to push more than the battery accepts.
 - **Marstek SoC poller** — used only for the `soc_full_pct` /
   `soc_empty_pct` eligibility gate. Power telemetry is no longer read
   from the Marstek (the plug is faster and authoritative).
@@ -151,26 +158,36 @@ On Windows, run as Administrator or change the ports in `config.toml`.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `cycle_ms` | 200 | how often the dispatcher recomputes desired_w |
-| `deadband_w` | 30 | minimum delta before a new pulse queues |
-| `hit_tolerance_w` | 15 | `\|commanded - plug\|` ≤ this counts as "pulse landed" |
+| `cycle_ms` | 200 | how often the dispatcher recomputes deltas |
+| `deadband_w` | 30 | minimum pulse magnitude (also Marstek-quantisation noise floor) |
+| `hit_tolerance_w` | 15 | plug-movement threshold for "pulse landed". Must be ≤ `deadband_w` |
 | `pulse_count` | 3 | pulses per delta change (Marstek needs ≥ 2) |
 | `soc_full_pct` | 95 | skip charging at or above this SoC |
 | `soc_empty_pct` | 5 | skip discharging at or below this SoC |
-| `plug_stale_s` | 2.0 | plug silent this long → mute circuit |
-| `group_silent_after_stale_s` | 60.0 | how long the muted circuit stays muted after recovery |
+| `plug_stale_s` | 2.0 | plug silent this long → mute its circuit |
+| `grid_stale_s` | 5.0 | real Shelly silent this long → mute every circuit |
+| `group_silent_after_stale_s` | 60.0 | post-recovery mute hold (≥ Marstek watchdog timeout) |
 | `circuit_headroom` | 0.95 | use only this fraction of fuse cap |
-| `saturation_gap_w` | 100 | `\|commanded - plug\|` > this triggers saturation tracking |
-| `saturation_window_s` | 8.0 | gap must persist this long to mark saturated |
+| `grid_bias_w` | 30 | asymmetric setpoint margin (no zero crossing) |
+| `settle_timeout_s` | 5.0 | accept a pulse cycle as done after this long, even if plug didn't move |
 
-## Migrating from v0.1.x
+## Migrating from v0.1.x / v0.2.x / v0.3.x
 
-The schema changed completely. After updating, the dispatcher refuses
-to start with `battery X: plug_url is required`. Either delete
-`config.toml` (the HA add-on writes a v0.2.0 template on next start)
-or manually adapt: drop the `[safety]` section, drop per-battery
-`min_soc_percent` / `max_soc_percent` / `phase` / `priority`, add
-`plug_url` to every battery and renew `[dispatcher]`.
+The schema has changed substantially across major versions. After
+updating, the dispatcher refuses to start with clear validation errors
+(e.g. `battery X: plug_url is required`). Easiest path: delete
+`config.toml`; the HA add-on writes a current template on next start.
+
+Manual adaptation from v0.3.x:
+- Remove `saturation_gap_w` and `saturation_window_s` (deprecated;
+  saturation now falls out of the headroom math automatically).
+- Add `grid_stale_s` to `[dispatcher]` (default 5.0 s).
+- `hit_tolerance_w` is now active again as the plug-movement settle
+  threshold. Keep it ≤ `deadband_w`.
+
+From v0.1.x: drop the `[safety]` section, drop per-battery
+`min_soc_percent` / `max_soc_percent` / `phase` / `priority`, rename
+`[[groups]]` to `[[circuits]]`, add `plug_url` to every battery.
 
 ## Calibration tool
 

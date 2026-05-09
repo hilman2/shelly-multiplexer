@@ -34,6 +34,10 @@ use crate::state::AppState;
 
 const RECV_BUF: usize = 16 * 1024;
 const RECONNECT_THRESHOLD: Duration = Duration::from_secs(30);
+/// Maximum number of (peer.ip, method) entries we track for response
+/// counting. Sized for "many batteries × many methods" with churn margin
+/// — not a security limit, just a memory-leak guard.
+const MAX_RESPONSE_COUNTERS: usize = 1024;
 
 pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<()> {
     let initial = config.load_full();
@@ -193,6 +197,17 @@ async fn handle_request(
 
     let count = {
         let mut map = response_counters.lock();
+        if map.len() >= MAX_RESPONSE_COUNTERS
+            && !map.contains_key(&(peer.ip(), method.clone()))
+        {
+            // Drop an arbitrary entry (HashMap's iteration order is
+            // randomised, so this is effectively random eviction). We
+            // only do this when the new key isn't already present, so
+            // existing battery counters are stable across the eviction.
+            if let Some(victim_key) = map.keys().next().cloned() {
+                map.remove(&victim_key);
+            }
+        }
         let counter = map
             .entry((peer.ip(), method.clone()))
             .or_insert_with(|| AtomicU64::new(0));
@@ -296,19 +311,19 @@ fn dispatch_method(
     pulse_value_w: f64,
     request: &RequestFrame,
 ) -> Result<Value, RpcError> {
-    let _ = config;
+    let grid_stale_s = config.dispatcher.grid_stale_s;
     let method_lc = request.method.to_lowercase();
     match method_lc.as_str() {
-        "em.getstatus" => Ok(serde_json::to_value(em_get_status(state, pulse_value_w)?).unwrap()),
+        "em.getstatus" => Ok(serde_json::to_value(em_get_status(state, pulse_value_w, grid_stale_s)?).unwrap()),
         "em.getconfig" => Ok(serde_json::to_value(EmConfig::default_em0()).unwrap()),
         "emdata.getstatus" => Ok(serde_json::to_value(emdata_status(state)).unwrap()),
         "emdata.getconfig" => Ok(serde_json::to_value(EmDataConfig { id: 0 }).unwrap()),
         "shelly.getdeviceinfo" => Ok(serde_json::to_value(device_info(device)).unwrap()),
         "shelly.getstatus" => {
-            Ok(serde_json::to_value(shelly_status(state, device, pulse_value_w)?).unwrap())
+            Ok(serde_json::to_value(shelly_status(state, device, pulse_value_w, grid_stale_s)?).unwrap())
         }
         "shelly.getconfig" => Ok(shelly_get_config(device)),
-        "shelly.getcomponents" => Ok(shelly_get_components(state, device, pulse_value_w)?),
+        "shelly.getcomponents" => Ok(shelly_get_components(state, device, pulse_value_w, grid_stale_s)?),
         "shelly.reboot" => Ok(json!({})),
         "sys.getstatus" => Ok(serde_json::to_value(sys_status(state, device)).unwrap()),
         "sys.getconfig" => Ok(sys_config(device)),
@@ -336,13 +351,31 @@ fn dispatch_method(
     }
 }
 
-fn em_get_status(state: &AppState, pulse_value_w: f64) -> Result<EmStatus, RpcError> {
+fn em_get_status(
+    state: &AppState,
+    pulse_value_w: f64,
+    grid_stale_s: f64,
+) -> Result<EmStatus, RpcError> {
     let snap = state.snapshot.load_full();
-    if snap.age.is_none() {
-        return Err(RpcError {
-            code: error_codes::NO_POWER_DATA,
-            message: "no power data from real shelly yet".into(),
-        });
+    let now = Instant::now();
+    match snap.age {
+        None => {
+            return Err(RpcError {
+                code: error_codes::NO_POWER_DATA,
+                message: "no power data from real shelly yet".into(),
+            });
+        }
+        Some(t) if now.duration_since(t).as_secs_f64() > grid_stale_s => {
+            // Returning an error here makes the Marstek's CT input go silent
+            // exactly like our circuit-mute path — same safety effect,
+            // tighter response time than waiting for the dispatcher cycle.
+            let age = now.duration_since(t).as_secs_f64();
+            return Err(RpcError {
+                code: error_codes::NO_POWER_DATA,
+                message: format!("real shelly snapshot stale ({age:.1}s old)"),
+            });
+        }
+        _ => {}
     }
     let s = &snap.status;
 
@@ -403,8 +436,9 @@ fn shelly_status(
     state: &AppState,
     device: &DeviceContext,
     pulse_value_w: f64,
+    grid_stale_s: f64,
 ) -> Result<ShellyStatus, RpcError> {
-    let em_0 = em_get_status(state, pulse_value_w)?;
+    let em_0 = em_get_status(state, pulse_value_w, grid_stale_s)?;
     let emdata_0 = emdata_status(state);
     Ok(ShellyStatus {
         ble: BleStatus {},
@@ -446,8 +480,9 @@ fn shelly_get_components(
     state: &AppState,
     device: &DeviceContext,
     pulse_value_w: f64,
+    grid_stale_s: f64,
 ) -> Result<Value, RpcError> {
-    let em = em_get_status(state, pulse_value_w)?;
+    let em = em_get_status(state, pulse_value_w, grid_stale_s)?;
     let emdata = emdata_status(state);
     Ok(json!({
         "components": [

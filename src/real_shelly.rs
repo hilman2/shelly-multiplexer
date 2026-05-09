@@ -46,6 +46,10 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     let mut consecutive_errors: u32 = 0;
     let mut tick_count: u64 = 0;
     let mut buf = vec![0u8; RECV_BUF];
+    // Track previous successful tick for energy integration. None on the
+    // first poll or after a recovery (we don't extrapolate energy across
+    // outage gaps).
+    let mut last_success: Option<Instant> = None;
 
     loop {
         // Re-read config each tick so changes from the admin UI are
@@ -70,9 +74,21 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
                         "real shelly poll tick"
                     );
                 }
+                let now = Instant::now();
+                if let Some(prev) = last_success {
+                    let dt = now.duration_since(prev).as_secs_f64();
+                    // Only integrate over short, contiguous gaps. A poll
+                    // failure or a long pause means we don't actually know
+                    // what happened in between, so we skip rather than
+                    // assume the last reading held.
+                    if dt > 0.0 && dt < 5.0 {
+                        state.energy.write().integrate(&status, dt);
+                    }
+                }
+                last_success = Some(now);
                 state.snapshot.store(Arc::new(EmSnapshot {
                     status,
-                    age: Some(Instant::now()),
+                    age: Some(now),
                 }));
                 if consecutive_errors > 0 {
                     info!("real shelly recovered after {consecutive_errors} failed polls");
@@ -81,6 +97,9 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
             }
             Err(e) => {
                 consecutive_errors += 1;
+                // Reset integration anchor — we'll re-anchor on the next
+                // successful poll instead of integrating across the outage.
+                last_success = None;
                 if last_log.elapsed() > Duration::from_secs(5) {
                     warn!(error = %e, errors = consecutive_errors, "real shelly poll failed");
                     last_log = Instant::now();
