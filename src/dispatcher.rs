@@ -372,38 +372,66 @@ fn update_saturation(b: &mut BatteryState, dcfg: &DispatcherConfig, now: Instant
         return;
     };
     let gap = b.commanded_w - plug;
-    let same_sign =
-        (b.commanded_w >= 0.0 && plug >= 0.0) || (b.commanded_w < 0.0 && plug < 0.0);
-    let saturated_now = same_sign && gap.abs() > dcfg.saturation_gap_w;
 
-    if saturated_now {
-        match b.saturation_since {
-            None => b.saturation_since = Some(now),
-            Some(t) => {
-                if now.duration_since(t).as_secs_f64() >= dcfg.saturation_window_s
-                    && (!b.saturated || b.saturation_ceiling_w.is_none())
-                {
-                    b.saturated = true;
-                    b.saturation_ceiling_w = Some(plug);
-                    // Reduce our virtual integrator to physical reality so
-                    // the next dispatch round redistributes the slack.
-                    if (b.commanded_w - plug).abs() > dcfg.deadband_w {
-                        b.commanded_w = plug;
-                    }
-                    info!(
-                        battery = %b.id,
-                        ceiling_w = plug,
-                        "battery saturated"
-                    );
-                }
-            }
-        }
-    } else {
+    // Within tolerance: clear any stale saturation state.
+    if gap.abs() <= dcfg.saturation_gap_w {
         if b.saturated {
             info!(battery = %b.id, "battery saturation cleared");
         }
         b.saturation_since = None;
         b.saturated = false;
         b.saturation_ceiling_w = None;
+        return;
+    }
+
+    // Gap is large — wait for it to persist before reacting.
+    match b.saturation_since {
+        None => {
+            b.saturation_since = Some(now);
+        }
+        Some(t) => {
+            if now.duration_since(t).as_secs_f64() < dcfg.saturation_window_s {
+                return;
+            }
+            // Persisted long enough — react.
+            let same_direction = (b.commanded_w >= 0.0 && plug >= 0.0)
+                || (b.commanded_w < 0.0 && plug < 0.0);
+            if same_direction {
+                // True saturation: battery moves in the commanded direction
+                // but can't reach the magnitude (e.g. commanded -2500 W
+                // charge but at 95 % SoC the BMS only allows -1800 W).
+                // Cap future commanded values at the observed ceiling.
+                if !b.saturated || b.saturation_ceiling_w.is_none() {
+                    b.saturated = true;
+                    b.saturation_ceiling_w = Some(plug);
+                    info!(
+                        battery = %b.id,
+                        ceiling_w = plug,
+                        "battery saturated (commanded direction respected, magnitude capped)"
+                    );
+                }
+                if (b.commanded_w - plug).abs() > dcfg.deadband_w {
+                    b.commanded_w = plug;
+                }
+            } else {
+                // Sign mismatch: battery moves OPPOSITE to commanded.
+                // Causes: UDP packet loss on our pulses, HACS Marstek
+                // plugin overriding our CT signal, Marstek BMS refusing
+                // (cell-balance / temp / floor protection). We can't
+                // distinguish, but we MUST resync our virtual integrator
+                // to reality, otherwise pulse_settled stays false forever
+                // and the dispatcher locks up.
+                info!(
+                    battery = %b.id,
+                    commanded_w = b.commanded_w,
+                    plug_w = plug,
+                    "model/reality sign mismatch — resyncing commanded to plug"
+                );
+                b.commanded_w = plug;
+                b.saturated = false;
+                b.saturation_ceiling_w = None;
+                b.saturation_since = None;
+            }
+        }
     }
 }
