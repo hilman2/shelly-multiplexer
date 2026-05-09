@@ -154,6 +154,7 @@ function renderBatteriesStatus(batteries) {
         b.pulse_remaining > 0
           ? `<span class="pulses" title="${escapeAttr(fmtW(b.pending_pulse_w))} W × ${b.pulse_remaining} polls">${b.pulse_remaining}×${fmtW(b.pending_pulse_w)}W</span>`
           : '<span class="dim">–</span>';
+      const socCell = `<span title="${escapeAttr(b.soc_source || "no source yet")}">${fmtPct(b.soc_pct)}</span>`;
       return `<tr>
         <td><strong>${escapeHtml(b.id)}</strong> ${dir}</td>
         <td>${escapeHtml(b.circuit)}</td>
@@ -161,7 +162,7 @@ function renderBatteriesStatus(batteries) {
         <td class="num">${fmtW(b.commanded_w)} W</td>
         <td class="num">${fmtW(b.plug_w)} W</td>
         <td class="num">${queue}</td>
-        <td class="num">${fmtPct(b.soc_pct)}</td>
+        <td class="num">${socCell}</td>
         <td>${fmtMs(b.plug_age_ms)}</td>
         <td>${fmtMs(b.last_marstek_poll_ms_ago)}</td>
         <td>${stateCell}</td>

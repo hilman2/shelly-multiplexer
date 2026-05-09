@@ -35,9 +35,14 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     let pending: Arc<Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Direct Marstek poll runs ONLY for batteries that have no
+    // soc_entity_id configured. If the user pointed us at an HA entity,
+    // they are signalling "HA is the SoC source" — even if the HA poll
+    // is currently failing we MUST NOT also bang on the Marstek's UDP
+    // port: the user's HACS Marstek integration probably owns it
+    // already and the device's API doesn't tolerate two clients well.
     let needs_direct_poll = |b: &BatteryConfig| {
-        b.vendor == BatteryVendor::Marstek
-            && !(config.home_assistant.enabled && b.soc_entity_id.is_some())
+        b.vendor == BatteryVendor::Marstek && b.soc_entity_id.is_none()
     };
 
     let mut sockets_by_port: HashMap<u16, Arc<UdpSocket>> = HashMap::new();
@@ -151,6 +156,7 @@ async fn poll_battery_loop(
                 if let Some(b) = bats.get_mut(&battery.id) {
                     b.soc_pct = Some(soc_pct);
                     b.soc_at = Some(std::time::Instant::now());
+                    b.soc_source = Some("marstek-direct".into());
                     if let Some(e) = &b.last_error {
                         if e.starts_with("marstek ") {
                             b.last_error = None;

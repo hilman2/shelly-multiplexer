@@ -137,6 +137,7 @@ struct BatteryInfo {
     saturated: bool,
     saturation_ceiling_w: Option<f64>,
     soc_pct: Option<f64>,
+    soc_source: Option<String>,
     last_marstek_poll_ms_ago: Option<u128>,
     last_error: Option<String>,
 }
@@ -183,6 +184,7 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
             saturated: b.saturated,
             saturation_ceiling_w: b.saturation_ceiling_w,
             soc_pct: b.soc_pct,
+            soc_source: b.soc_source.clone(),
             last_marstek_poll_ms_ago: b
                 .last_marstek_poll_at
                 .map(|t| now.duration_since(t).as_millis()),

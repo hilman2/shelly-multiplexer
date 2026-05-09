@@ -97,6 +97,7 @@ async fn poll_loop(
                 if let Some(b) = bats.get_mut(&battery_id) {
                     b.soc_pct = Some(soc);
                     b.soc_at = Some(std::time::Instant::now());
+                    b.soc_source = Some(format!("ha:{entity_id}"));
                     if let Some(e) = &b.last_error {
                         if e.starts_with("ha ") {
                             b.last_error = None;

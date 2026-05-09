@@ -79,6 +79,12 @@ pub struct BatteryState {
     /// Telemetry sourced from the Marstek itself (or HA).
     pub soc_pct: Option<f64>,
     pub soc_at: Option<Instant>,
+    /// Where the current SoC value came from (e.g. "ha:sensor.marstek_soc"
+    /// or "marstek-direct"). Surfaced in /api/status so the user can see
+    /// at a glance whether the dispatcher is reading the value they think
+    /// it is — important when an HA HACS plugin and our direct poll could
+    /// each return different numbers.
+    pub soc_source: Option<String>,
 
     /// Last error from any subsystem, surfaced in the UI.
     pub last_error: Option<String>,
@@ -111,6 +117,7 @@ impl BatteryState {
             saturation_since: None,
             soc_pct: None,
             soc_at: None,
+            soc_source: None,
             last_error: None,
         }
     }
