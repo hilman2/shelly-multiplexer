@@ -1,11 +1,16 @@
 //! Runtime state for the pulse dispatcher.
 //!
-//! Each battery owns a virtual integrator (`commanded_w`) whose value is the
-//! cumulative sum of every delta pulse we have committed to that Marstek's
-//! internal integrator. Marstek hardware integrates the same pulses on its
-//! end; our `commanded_w` is what we *expect* it to be. The Shelly Plug
-//! reading (`last_plug_w`) is the ground truth that resolves disagreements
-//! and detects saturation.
+//! Architecture (v0.3.0+):
+//!   - We do NOT track a virtual integrator any more. The grid reading
+//!     from the real Shelly is the residual error; the plug reading per
+//!     battery is the ground truth for cap and headroom calculations.
+//!   - Each dispatcher tick computes a one-shot delta per battery from
+//!     the current grid_w, weighted by available headroom (plug_w + SoC
+//!     limits). The delta is sent as a pulse_count-long CT burst.
+//!   - A new pulse only queues once the previous has "landed" — defined
+//!     as the plug having moved by >= deadband_w from the snapshot taken
+//!     at pulse send. A settle_timeout_s fallback prevents lockups when
+//!     the Marstek refuses to respond.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -48,17 +53,20 @@ pub struct BatteryState {
     pub soc_full_pct: Option<f64>,
     pub soc_empty_pct: Option<f64>,
 
-    /// Our virtual integrator. Hardware-clamped to
-    /// [-max_charge_w, +max_discharge_w].
-    pub commanded_w: f64,
-
     /// Single CT value to send to the Marstek on the next poll(s).
-    /// We never queue multiple delta values — if the dispatcher
-    /// recomputes mid-pulse the previous (stale) delta is overwritten,
-    /// not appended. `pulse_remaining` says how many more polls keep
-    /// sending this value before the response reverts to 0.
+    /// Replaced on every new dispatch decision (not appended).
     pub pending_pulse_w: f64,
     pub pulse_remaining: u32,
+    /// Plug reading at the moment the current/most-recent pulse cycle
+    /// started. The next dispatch tick may only run once the plug has
+    /// moved by >= deadband_w from this value (or the settle_timeout_s
+    /// has elapsed).
+    pub plug_w_at_pulse_send: Option<f64>,
+    /// When pulse_remaining last decremented to 0 (the last pulse went
+    /// out on the wire). Combined with plug_w_at_pulse_send, this lets
+    /// pulse_settled wait for actual battery response and time-bound
+    /// the wait so a refusing Marstek doesn't lock the dispatcher.
+    pub last_pulse_completed_at: Option<Instant>,
 
     /// Latest plug reading (signed, our convention).
     pub last_plug_w: Option<f64>,
@@ -67,33 +75,13 @@ pub struct BatteryState {
     /// Diagnostics: when this Marstek last polled the virtual Shelly.
     pub last_marstek_poll_at: Option<Instant>,
 
-    /// True saturation: battery moves in the commanded direction but can't
-    /// hit the magnitude (e.g. commanded -2500 W charge but BMS taper near
-    /// 100 % SoC only allows -1000 W). When detected, saturation_ceiling_w
-    /// caps further commanded values for this battery and the dispatcher's
-    /// overflow loop redispatches the unmet watts to siblings with headroom.
-    pub saturated: bool,
-    pub saturation_ceiling_w: Option<f64>,
-    /// When the dispatcher first noticed |commanded_w − plug_w| exceeding
-    /// saturation_gap_w. After saturation_window_s the dispatcher reacts:
-    ///   - same_sign  -> set saturation flag + ceiling (BMS taper)
-    ///   - opposite   -> resync commanded := plug (drift / lost packet)
-    pub saturation_since: Option<Instant>,
-    /// When pulse_remaining last decremented to 0 (i.e. when the last
-    /// pulse cycle of CT replies finished going out). Used by
-    /// pulse_settled to time-bound the wait for plug convergence: even if
-    /// the gap stays larger than hit_tolerance_w, after ~5 s the battery
-    /// has clearly stopped ramping and we let the next dispatch tick fire.
-    pub last_pulse_completed_at: Option<Instant>,
-
     /// Telemetry sourced from the Marstek itself (or HA).
     pub soc_pct: Option<f64>,
     pub soc_at: Option<Instant>,
     /// Where the current SoC value came from (e.g. "ha:sensor.marstek_soc"
     /// or "marstek-direct"). Surfaced in /api/status so the user can see
     /// at a glance whether the dispatcher is reading the value they think
-    /// it is — important when an HA HACS plugin and our direct poll could
-    /// each return different numbers.
+    /// it is.
     pub soc_source: Option<String>,
 
     /// Last error from any subsystem, surfaced in the UI.
@@ -116,16 +104,13 @@ impl BatteryState {
             priority_weight: cfg.priority_weight,
             soc_full_pct: cfg.soc_full_pct,
             soc_empty_pct: cfg.soc_empty_pct,
-            commanded_w: 0.0,
             pending_pulse_w: 0.0,
             pulse_remaining: 0,
+            plug_w_at_pulse_send: None,
+            last_pulse_completed_at: None,
             last_plug_w: None,
             last_plug_at: None,
             last_marstek_poll_at: None,
-            saturated: false,
-            saturation_ceiling_w: None,
-            saturation_since: None,
-            last_pulse_completed_at: None,
             soc_pct: None,
             soc_at: None,
             soc_source: None,
@@ -133,39 +118,31 @@ impl BatteryState {
         }
     }
 
-    /// Has the previous pulse landed (plug reads close to commanded_w)?
-    /// Used to enforce "no new pulse while previous is still in flight".
+    /// Is the battery ready for a new pulse to be queued?
     ///
-    /// Two ways to count as settled:
-    ///   1. The plug reading is within hit_tolerance_w of commanded_w
-    ///      (clean landing — Marstek absorbed our delta cleanly).
-    ///   2. settle_timeout_s has elapsed since the last pulse cycle
-    ///      finished (the battery has had time to ramp; if it didn't
-    ///      converge the saturation/drift detection will deal with it
-    ///      separately, we don't want to lock up the dispatcher).
-    pub fn pulse_settled(&self, hit_tolerance_w: f64, settle_timeout_s: f64) -> bool {
+    /// Conditions for "yes":
+    ///   1. No pulse in flight (pulse_remaining == 0).
+    ///   2. AND one of:
+    ///      a. We never sent a pulse yet (initial state).
+    ///      b. The plug has moved by >= movement_threshold_w since the
+    ///         pulse cycle started — battery responded.
+    ///      c. settle_timeout_s elapsed since the pulse cycle finished
+    ///         — battery didn't respond, but we can't wait forever.
+    pub fn pulse_settled(&self, movement_threshold_w: f64, settle_timeout_s: f64) -> bool {
         if self.pulse_remaining > 0 {
             return false;
+        }
+        if self.last_pulse_completed_at.is_none() {
+            return true;
         }
         let Some(plug) = self.last_plug_w else {
             return false;
         };
-        if (plug - self.commanded_w).abs() <= hit_tolerance_w {
-            return true;
-        }
-        // If saturated, the plug is parked at the observed ceiling and
-        // that's our new "settled" anchor.
-        if self.saturated {
-            if let Some(ceiling) = self.saturation_ceiling_w {
-                if (plug - ceiling).abs() <= hit_tolerance_w {
-                    return true;
-                }
+        if let Some(at_send) = self.plug_w_at_pulse_send {
+            if (plug - at_send).abs() >= movement_threshold_w {
+                return true;
             }
         }
-        // Time-based fallback: the Marstek calibration says reactions
-        // happen in ~1-2 s; after settle_timeout_s the battery has
-        // clearly stopped ramping. Allow the next dispatch tick to
-        // queue a corrective pulse rather than blocking forever.
         match self.last_pulse_completed_at {
             Some(t) => t.elapsed().as_secs_f64() >= settle_timeout_s,
             None => false,

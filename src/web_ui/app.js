@@ -94,7 +94,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
 function renderCircuitsStatus(circuits) {
   if (!circuits || circuits.length === 0) {
     els.circuitsStatusBody.innerHTML =
-      '<tr><td colspan="7" class="empty">no circuits configured</td></tr>';
+      '<tr><td colspan="6" class="empty">no circuits configured</td></tr>';
     return;
   }
   els.circuitsStatusBody.innerHTML = circuits
@@ -113,7 +113,6 @@ function renderCircuitsStatus(circuits) {
       return `<tr>
         <td><strong>${escapeHtml(c.id)}</strong></td>
         <td>${c.cap_w.toFixed(0)} W <span class="dim">(${c.fuse_amps} A × ${c.phases} ph)</span></td>
-        <td class="num">${fmtW(c.commanded_sum_w)} W</td>
         <td class="num">${fmtW(c.measured_sum_w)} W</td>
         <td class="num ${hClass}">${headroom.toFixed(0)} W</td>
         <td>${stateCell}</td>
@@ -129,6 +128,7 @@ function renderBatteriesStatus(batteries) {
       '<tr><td colspan="10" class="empty">no batteries configured</td></tr>';
     return;
   }
+  // 10 columns: Battery, Circuit, IP, Plug, Δ since send, Pulse, SoC, Plug age, Last poll, State
   els.batteriesStatusBody.innerHTML = batteries
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id))
@@ -136,32 +136,43 @@ function renderBatteriesStatus(batteries) {
       let stateCell;
       if (b.last_error)
         stateCell = `<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`;
-      else if (b.saturated)
-        stateCell = `<span class="state warn" title="capped at ${fmtW(b.saturation_ceiling_w)} W (BMS taper); slack redispatched to siblings">saturated</span>`;
       else if (b.plug_age_ms == null || b.plug_age_ms > 2000)
         stateCell = '<span class="state warn">plug stale</span>';
       else if (b.pulse_remaining > 0)
         stateCell = '<span class="state pulsing">pulsing</span>';
       else stateCell = '<span class="state ok">idle</span>';
 
+      const plug = b.plug_w == null ? 0 : b.plug_w;
       const dir =
-        b.commanded_w > 5
+        plug > 5
           ? '<span class="dir-tag dir-discharge">discharge</span>'
-          : b.commanded_w < -5
+          : plug < -5
           ? '<span class="dir-tag dir-charge">charge</span>'
           : "";
-      const queue =
+      const pulseCell =
         b.pulse_remaining > 0
-          ? `<span class="pulses" title="${escapeAttr(fmtW(b.pending_pulse_w))} W × ${b.pulse_remaining} polls">${b.pulse_remaining}×${fmtW(b.pending_pulse_w)}W</span>`
+          ? `<span class="pulses" title="${escapeAttr(fmtW(b.pending_pulse_w))} W × ${b.pulse_remaining} polls remaining">${b.pulse_remaining}×${fmtW(b.pending_pulse_w)}W</span>`
+          : b.pending_pulse_w !== 0
+          ? `<span class="dim" title="last pulse value (cycle done)">${fmtW(b.pending_pulse_w)} W</span>`
           : '<span class="dim">–</span>';
+      // Δ since send: how much the plug has moved relative to the snapshot
+      // taken when the most recent pulse cycle started. > deadband counts
+      // as "battery responded".
+      let deltaCell;
+      if (b.plug_w_at_pulse_send != null && b.plug_w != null) {
+        const moved = b.plug_w - b.plug_w_at_pulse_send;
+        deltaCell = `<span title="plug at pulse send: ${b.plug_w_at_pulse_send.toFixed(0)} W">${fmtW(moved)} W</span>`;
+      } else {
+        deltaCell = '<span class="dim">–</span>';
+      }
       const socCell = `<span title="${escapeAttr(b.soc_source || "no source yet")}">${fmtPct(b.soc_pct)}</span>`;
       return `<tr>
         <td><strong>${escapeHtml(b.id)}</strong> ${dir}</td>
         <td>${escapeHtml(b.circuit)}</td>
         <td class="dim">${escapeHtml(b.address)}</td>
-        <td class="num">${fmtW(b.commanded_w)} W</td>
         <td class="num">${fmtW(b.plug_w)} W</td>
-        <td class="num">${queue}</td>
+        <td class="num">${deltaCell}</td>
+        <td class="num">${pulseCell}</td>
         <td class="num">${socCell}</td>
         <td class="num">${fmtMs(b.plug_age_ms)}</td>
         <td class="num">${fmtMs(b.last_marstek_poll_ms_ago)}</td>

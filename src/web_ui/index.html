@@ -76,7 +76,6 @@
             <col class="col-w">
             <col class="col-w">
             <col class="col-w">
-            <col class="col-w">
             <col class="col-status">
             <col class="col-members">
           </colgroup>
@@ -84,7 +83,6 @@
             <tr>
               <th>Circuit</th>
               <th class="num">Fuse cap</th>
-              <th class="num">Commanded sum</th>
               <th class="num">Measured sum</th>
               <th class="num">Headroom</th>
               <th>State</th>
@@ -120,9 +118,9 @@
               <th>Battery</th>
               <th>Circuit</th>
               <th>IP</th>
-              <th class="num" title="What we have committed to the Marstek's internal integrator">Commanded</th>
-              <th class="num" title="Live reading from the Shelly Plug PM Gen3">Plug</th>
-              <th class="num" title="Pending CT pulse to the next Marstek polls">Pulse&nbsp;queue</th>
+              <th class="num" title="Live reading from the Shelly Plug PM Gen3 — the only ground truth">Plug</th>
+              <th class="num" title="Plug change since the most recent pulse cycle started">Δ&nbsp;since&nbsp;send</th>
+              <th class="num" title="Pending CT pulse value × remaining poll count">Pulse</th>
               <th class="num">SoC</th>
               <th class="num">Plug age</th>
               <th class="num">Last poll</th>

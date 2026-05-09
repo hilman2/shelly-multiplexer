@@ -129,13 +129,12 @@ struct BatteryInfo {
     priority_weight: f64,
     soc_full_pct: Option<f64>,
     soc_empty_pct: Option<f64>,
-    commanded_w: f64,
     plug_w: Option<f64>,
     plug_age_ms: Option<u128>,
     pulse_remaining: u32,
     pending_pulse_w: f64,
-    saturated: bool,
-    saturation_ceiling_w: Option<f64>,
+    plug_w_at_pulse_send: Option<f64>,
+    last_pulse_completed_ms_ago: Option<u128>,
     soc_pct: Option<f64>,
     soc_source: Option<String>,
     last_marstek_poll_ms_ago: Option<u128>,
@@ -152,7 +151,6 @@ struct CircuitInfo {
     silent_for_ms: Option<u128>,
     member_ids: Vec<String>,
     measured_sum_w: f64,
-    commanded_sum_w: f64,
 }
 
 async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
@@ -176,13 +174,14 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
             priority_weight: b.priority_weight,
             soc_full_pct: b.soc_full_pct,
             soc_empty_pct: b.soc_empty_pct,
-            commanded_w: b.commanded_w,
             plug_w: b.last_plug_w,
             plug_age_ms: b.last_plug_at.map(|t| now.duration_since(t).as_millis()),
             pulse_remaining: b.pulse_remaining,
             pending_pulse_w: b.pending_pulse_w,
-            saturated: b.saturated,
-            saturation_ceiling_w: b.saturation_ceiling_w,
+            plug_w_at_pulse_send: b.plug_w_at_pulse_send,
+            last_pulse_completed_ms_ago: b
+                .last_pulse_completed_at
+                .map(|t| now.duration_since(t).as_millis()),
             soc_pct: b.soc_pct,
             soc_source: b.soc_source.clone(),
             last_marstek_poll_ms_ago: b
@@ -200,11 +199,6 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
                 .iter()
                 .filter_map(|id| bats.get(id).and_then(|b| b.last_plug_w))
                 .sum();
-            let commanded_sum_w: f64 = c
-                .member_ids
-                .iter()
-                .filter_map(|id| bats.get(id).map(|b| b.commanded_w))
-                .sum();
             CircuitInfo {
                 id: c.config.id.clone(),
                 fuse_amps: c.config.fuse_amps,
@@ -220,7 +214,6 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
                 }),
                 member_ids: c.member_ids.clone(),
                 measured_sum_w,
-                commanded_sum_w,
             }
         })
         .collect();
