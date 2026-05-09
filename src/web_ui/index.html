@@ -310,6 +310,10 @@
               <input name="grid_bias_w" type="number" min="0" step="any" required>
               <small style="color:var(--fg-faint);font-size:11px">never cross 0: import side when discharging, export side when charging</small>
             </label>
+            <label>Settle timeout (s)
+              <input name="settle_timeout_s" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">if plug doesn't converge within hit_tolerance after this long, accept and move on</small>
+            </label>
           </div>
           <div class="form-actions">
             <button type="submit" class="primary">Save</button>

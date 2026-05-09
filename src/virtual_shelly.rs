@@ -143,8 +143,11 @@ async fn handle_request(
                     value = b.pending_pulse_w;
                     b.pulse_remaining -= 1;
                     if b.pulse_remaining == 0 {
-                        // Reset stored value so a stale read can't reappear.
+                        // Reset stored value so a stale read can't reappear,
+                        // and stamp the completion time so the dispatcher's
+                        // settle_timeout_s fallback works.
                         b.pending_pulse_w = 0.0;
+                        b.last_pulse_completed_at = Some(now);
                     }
                 }
             }

@@ -148,6 +148,14 @@ pub struct DispatcherConfig {
     /// Set to 0 to dispatch to exact 0.
     #[serde(default = "default_grid_bias_w")]
     pub grid_bias_w: f64,
+    /// Time-based pulse-settle fallback: even if the plug reading hasn't
+    /// converged within hit_tolerance_w, after this many seconds the
+    /// dispatcher accepts the cycle as done and is free to queue the
+    /// next corrective pulse. Marstek typically reacts in 1-2 s; 5 s is
+    /// a safe upper bound. The saturation detection separately handles
+    /// persistent large gaps via ceiling/resync.
+    #[serde(default = "default_settle_timeout_s")]
+    pub settle_timeout_s: f64,
 }
 
 impl Default for DispatcherConfig {
@@ -165,6 +173,7 @@ impl Default for DispatcherConfig {
             saturation_gap_w: default_saturation_gap_w(),
             saturation_window_s: default_saturation_window_s(),
             grid_bias_w: default_grid_bias_w(),
+            settle_timeout_s: default_settle_timeout_s(),
         }
     }
 }
@@ -204,6 +213,9 @@ fn default_saturation_window_s() -> f64 {
 }
 fn default_grid_bias_w() -> f64 {
     30.0
+}
+fn default_settle_timeout_s() -> f64 {
+    5.0
 }
 
 // ---------------------------------------------------------------------------

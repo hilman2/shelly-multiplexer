@@ -250,6 +250,18 @@ fn compute_desired(
             if clamped < lb && lb <= prev {
                 clamped = lb.min(prev);
             }
+            // Saturation ceiling: if we've observed that the battery
+            // can't deliver beyond a certain magnitude, clamp future
+            // dispatch decisions to that ceiling. This is what makes
+            // the overflow loop redispatch the unmet correction to
+            // siblings with headroom.
+            if let Some(c) = b.saturation_ceiling_w {
+                if need_more_discharge {
+                    clamped = clamped.min(c);
+                } else {
+                    clamped = clamped.max(c);
+                }
+            }
             desired.insert(b.id.clone(), clamped);
             if (clamped - proposed).abs() > 1e-3 {
                 clamped_ids.push(b.id.clone());
@@ -326,8 +338,10 @@ fn queue_pulses(
 
         resync_if_drifted(b, dcfg, now);
 
-        // Sequencing: only queue a new pulse if the previous has settled.
-        if !b.pulse_settled(dcfg.hit_tolerance_w) {
+        // Sequencing: only queue a new pulse if the previous has settled
+        // (clean landing within hit_tolerance, sitting at saturation
+        // ceiling, or settle_timeout_s elapsed).
+        if !b.pulse_settled(dcfg.hit_tolerance_w, dcfg.settle_timeout_s) {
             continue;
         }
 
@@ -360,22 +374,27 @@ fn queue_pulses(
     }
 }
 
-/// Resync our virtual integrator to the plug reading when the gap stays
-/// large for too long. This is NOT real "saturation" detection — true
-/// BMS saturation only happens at the SoC extremes (typically >98 %
-/// charging, <floor discharging) and is already handled by the SoC-aware
-/// soft bounds in compute_desired. What this function catches is
-/// communication drift: lost UDP pulses, the HACS Marstek plugin sending
-/// its own CT signal that overrides ours, or transient BMS refusals.
-/// In any of those cases the right move is to trust the plug as ground
-/// truth, set commanded := plug, and let the next dispatch tick queue
-/// a fresh corrective pulse from there.
+/// React to persistent gaps between commanded_w and the plug reading.
+/// Two distinct cases:
+///   - same_sign + magnitude shortfall: the battery moves in the
+///     commanded direction but can't hit the magnitude (BMS taper at
+///     ~100 % SoC, derating, etc.). Set saturation_ceiling_w to the
+///     observed plug value; future dispatches respect it as a clamp,
+///     and the overflow loop in compute_desired hands the unmet watts
+///     to siblings with headroom.
+///   - opposite sign or no movement: dropped pulses, HACS plugin
+///     overriding our CT, transient BMS refusal. Resync commanded := plug
+///     so the next dispatch tick computes a fresh corrective delta from
+///     reality.
 fn resync_if_drifted(b: &mut BatteryState, dcfg: &DispatcherConfig, now: Instant) {
     let Some(plug) = b.last_plug_w else {
         return;
     };
     let gap = b.commanded_w - plug;
     if gap.abs() <= dcfg.saturation_gap_w {
+        if b.saturated {
+            info!(battery = %b.id, "battery saturation cleared");
+        }
         b.saturation_since = None;
         b.saturated = false;
         b.saturation_ceiling_w = None;
@@ -384,17 +403,34 @@ fn resync_if_drifted(b: &mut BatteryState, dcfg: &DispatcherConfig, now: Instant
     match b.saturation_since {
         None => b.saturation_since = Some(now),
         Some(t) => {
-            if now.duration_since(t).as_secs_f64() >= dcfg.saturation_window_s {
+            if now.duration_since(t).as_secs_f64() < dcfg.saturation_window_s {
+                return;
+            }
+            let same_direction = (b.commanded_w >= 0.0 && plug >= 0.0)
+                || (b.commanded_w < 0.0 && plug < 0.0);
+            if same_direction {
+                if !b.saturated || b.saturation_ceiling_w.is_none() {
+                    b.saturated = true;
+                    b.saturation_ceiling_w = Some(plug);
+                    info!(
+                        battery = %b.id,
+                        ceiling_w = plug,
+                        commanded_w = b.commanded_w,
+                        "battery saturated — capping at observed ceiling, redispatching slack to siblings"
+                    );
+                }
+                b.commanded_w = plug;
+            } else {
                 info!(
                     battery = %b.id,
                     commanded_w = b.commanded_w,
                     plug_w = plug,
-                    "model/reality drift — resyncing commanded to plug"
+                    "model/reality drift (opposite sign) — resyncing commanded to plug"
                 );
                 b.commanded_w = plug;
-                b.saturation_since = None;
                 b.saturated = false;
                 b.saturation_ceiling_w = None;
+                b.saturation_since = None;
             }
         }
     }
