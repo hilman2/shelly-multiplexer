@@ -164,14 +164,16 @@ fn compute_desired(
     // unwind a previous command in the opposite direction (e.g. roll a
     // -81 W charge command back to 0 when SoC is now 1 %).
     let high_bound = |b: &BatteryState| -> f64 {
+        let empty = b.effective_soc_empty_pct(dcfg.soc_empty_pct);
         match b.soc_pct {
-            Some(soc) if soc <= dcfg.soc_empty_pct => 0.0,
+            Some(soc) if soc <= empty => 0.0,
             _ => b.max_discharge_w,
         }
     };
     let low_bound = |b: &BatteryState| -> f64 {
+        let full = b.effective_soc_full_pct(dcfg.soc_full_pct);
         match b.soc_pct {
-            Some(soc) if soc >= dcfg.soc_full_pct => 0.0,
+            Some(soc) if soc >= full => 0.0,
             _ => -b.max_charge_w,
         }
     };

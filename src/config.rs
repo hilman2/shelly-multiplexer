@@ -304,6 +304,15 @@ pub struct BatteryConfig {
     /// Optional HA entity for SoC (overrides direct Marstek read).
     #[serde(default)]
     pub soc_entity_id: Option<String>,
+    /// Per-battery override for the dispatcher-level full/empty thresholds.
+    /// If unset, the dispatcher's `soc_full_pct` / `soc_empty_pct` apply.
+    /// Useful for mixing batteries with different DoD specs or different
+    /// reserve preferences (e.g. one Marstek aggressive at 5/95, an older
+    /// LiFePO4 conservative at 15/90).
+    #[serde(default)]
+    pub soc_full_pct: Option<f64>,
+    #[serde(default)]
+    pub soc_empty_pct: Option<f64>,
 }
 
 fn default_priority_weight() -> f64 {
@@ -396,6 +405,26 @@ impl Config {
             }
             if b.priority_weight <= 0.0 {
                 anyhow::bail!("battery {}: priority_weight must be > 0", b.id);
+            }
+            if let Some(s) = b.soc_full_pct {
+                if !(0.0..=100.0).contains(&s) {
+                    anyhow::bail!("battery {}: soc_full_pct must be in [0, 100]", b.id);
+                }
+            }
+            if let Some(s) = b.soc_empty_pct {
+                if !(0.0..=100.0).contains(&s) {
+                    anyhow::bail!("battery {}: soc_empty_pct must be in [0, 100]", b.id);
+                }
+            }
+            if let (Some(f), Some(e)) = (b.soc_full_pct, b.soc_empty_pct) {
+                if e >= f {
+                    anyhow::bail!(
+                        "battery {}: soc_empty_pct ({}) must be < soc_full_pct ({})",
+                        b.id,
+                        e,
+                        f
+                    );
+                }
             }
             if b.marstek_port == 0 {
                 anyhow::bail!("battery {}: marstek_port must be > 0", b.id);

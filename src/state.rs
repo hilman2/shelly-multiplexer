@@ -44,6 +44,9 @@ pub struct BatteryState {
     pub max_discharge_w: f64,
     pub capacity_wh: f64,
     pub priority_weight: f64,
+    /// Per-battery SoC limits (None = inherit dispatcher defaults).
+    pub soc_full_pct: Option<f64>,
+    pub soc_empty_pct: Option<f64>,
 
     /// Our virtual integrator. Hardware-clamped to
     /// [-max_charge_w, +max_discharge_w].
@@ -95,6 +98,8 @@ impl BatteryState {
                 cfg.max_charge_w + cfg.max_discharge_w
             },
             priority_weight: cfg.priority_weight,
+            soc_full_pct: cfg.soc_full_pct,
+            soc_empty_pct: cfg.soc_empty_pct,
             commanded_w: 0.0,
             pending_pulse_w: 0.0,
             pulse_remaining: 0,
@@ -139,6 +144,15 @@ impl BatteryState {
             Some(t) => now.duration_since(t).as_secs_f64() <= stale_s,
             None => false,
         }
+    }
+
+    /// Effective full / empty thresholds: per-battery override, falling
+    /// back to dispatcher defaults if unset.
+    pub fn effective_soc_full_pct(&self, fallback: f64) -> f64 {
+        self.soc_full_pct.unwrap_or(fallback)
+    }
+    pub fn effective_soc_empty_pct(&self, fallback: f64) -> f64 {
+        self.soc_empty_pct.unwrap_or(fallback)
     }
 }
 

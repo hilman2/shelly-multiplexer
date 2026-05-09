@@ -402,6 +402,8 @@ function addBatteryCard(b = {}) {
       </label>
       <label>marstek_port<input data-f="marstek_port" type="number" min="1" max="65535" value="${b.marstek_port ?? 30000}"></label>
       <label>soc_interval_ms<input data-f="soc_interval_ms" type="number" min="1000" max="600000" value="${b.soc_interval_ms ?? 30000}"></label>
+      <label>soc_full_pct (override; blank = dispatcher default)<input data-f="soc_full_pct" type="number" min="0" max="100" step="any" value="${b.soc_full_pct == null ? "" : b.soc_full_pct}"></label>
+      <label>soc_empty_pct (override; blank = dispatcher default)<input data-f="soc_empty_pct" type="number" min="0" max="100" step="any" value="${b.soc_empty_pct == null ? "" : b.soc_empty_pct}"></label>
       <label>soc_entity_id (HA, optional)<input data-f="soc_entity_id" type="text" placeholder="sensor.battery_a_soc" value="${escapeAttr(b.soc_entity_id || "")}"></label>
     </div>
     <div class="bat-actions">
@@ -440,6 +442,10 @@ function readBatteries() {
     };
     const ent = get("soc_entity_id");
     if (ent) out.soc_entity_id = ent;
+    const socFull = num("soc_full_pct");
+    if (socFull != null) out.soc_full_pct = socFull;
+    const socEmpty = num("soc_empty_pct");
+    if (socEmpty != null) out.soc_empty_pct = socEmpty;
     return out;
   });
 }
