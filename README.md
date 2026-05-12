@@ -96,7 +96,7 @@ measurements, never from "what we think we asked for".
    per battery) ─▶│   • Switch.GetStatus -> last_plug_w             │
    GET /rpc      │   • stale > plug_stale_s -> mute circuit         │
                   │                                                  │
-   Browser   ───▶│   Status UI (:8080) — read-only                  │
+   Browser   ───▶│   Admin UI (:8080) — live status + full config   │
                   └──────────────────────────────────────────────────┘
 ```
 
@@ -155,7 +155,10 @@ to deploy.
    ./shelly-multiplexer --config config.toml
    ```
 
-4. Open the status UI: <http://localhost:8080>
+4. Open the admin UI: <http://localhost:8080> — live status plus full
+   live configuration (real Shelly host/port, circuits, batteries,
+   dispatcher tuning, HA SoC bridge). The TOML on disk is just the
+   bootstrap seed; everything is editable in the UI without a restart.
 
 5. In each battery, point its "Shelly Pro 3EM" target at the
    multiplexer's IP (instead of the real Shelly's IP). For Marstek
