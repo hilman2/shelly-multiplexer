@@ -6,8 +6,11 @@
 //!      both recover — Marstek watchdogs then clear their integrators.
 //!   2. **Global settle gate**: if any non-muted battery is still in a
 //!      pulse cycle (pulse_remaining > 0, OR pulse_remaining = 0 but the
-//!      plug hasn't yet moved by `hit_tolerance_w` and `settle_timeout_s`
-//!      hasn't elapsed), skip the cycle entirely. Without this gate the
+//!      plug hasn't yet moved AND stayed stable for `plug_stable_duration_s`
+//!      and `settle_timeout_s` hasn't elapsed), skip the cycle entirely.
+//!      "Stable" = no consecutive >`plug_stable_w` movement, i.e. Marstek
+//!      has FINISHED implementing the delta (not just started). Without
+//!      this gate the
 //!      dispatcher would distribute a correction across all batteries
 //!      while a previous pulse for a slow-reacting sibling is still in
 //!      flight — the slow sibling's pending Δ is not yet visible in
@@ -122,7 +125,7 @@ fn any_pulse_in_flight(state: &AppState, dcfg: &DispatcherConfig, now: Instant) 
         if muted {
             return false;
         }
-        !b.pulse_settled(dcfg.hit_tolerance_w, dcfg.settle_timeout_s)
+        !b.pulse_settled(dcfg.plug_stable_duration_s, dcfg.settle_timeout_s)
     })
 }
 
@@ -508,6 +511,7 @@ mod tests {
             last_pulse_completed_at: None,
             last_plug_w: Some(plug_w),
             last_plug_at: Some(Instant::now()),
+            last_plug_movement_at: None,
             last_marstek_poll_at: None,
             soc_pct: None,
             soc_at: None,

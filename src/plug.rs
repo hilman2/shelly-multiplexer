@@ -32,6 +32,7 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     let cfg0 = config.load_full();
     let interval_ms = cfg0.dispatcher.cycle_ms.max(100);
     let timeout_ms = cfg0.real_shelly.request_timeout_ms.clamp(200, 800);
+    let stable_w = cfg0.dispatcher.plug_stable_w;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()
@@ -46,7 +47,7 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
         let plug_url = b.plug_url.trim_end_matches('/').to_string();
         let interval = interval_ms;
         handles.push(tokio::spawn(async move {
-            poll_plug_loop(state_c, client_c, battery_id, plug_url, interval).await;
+            poll_plug_loop(state_c, client_c, battery_id, plug_url, interval, stable_w).await;
         }));
     }
 
@@ -73,6 +74,7 @@ async fn poll_plug_loop(
     battery_id: String,
     plug_url: String,
     interval_ms: u64,
+    stable_w: f64,
 ) {
     let url = format!("{plug_url}/rpc/Switch.GetStatus?id=0");
     let mut tick = time::interval(Duration::from_millis(interval_ms));
@@ -86,6 +88,18 @@ async fn poll_plug_loop(
                 let now = std::time::Instant::now();
                 let mut bats = state.batteries.write();
                 if let Some(b) = bats.get_mut(&battery_id) {
+                    // Track movement: if the new reading differs from the
+                    // previous by more than the stable threshold, the plug
+                    // is "moving" and `pulse_settled` keeps blocking until
+                    // a stable window elapses. First reading also seeds
+                    // last_plug_movement_at so the timestamp is meaningful.
+                    let moved = match b.last_plug_w {
+                        Some(prev) => (signed_w - prev).abs() > stable_w,
+                        None => true,
+                    };
+                    if moved {
+                        b.last_plug_movement_at = Some(now);
+                    }
                     b.last_plug_w = Some(signed_w);
                     b.last_plug_at = Some(now);
                     // Any previous error is now stale — the plug is reachable

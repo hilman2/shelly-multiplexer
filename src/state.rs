@@ -76,6 +76,13 @@ pub struct BatteryState {
     /// Latest plug reading (signed, our convention).
     pub last_plug_w: Option<f64>,
     pub last_plug_at: Option<Instant>,
+    /// When the plug reading last changed by more than `plug_stable_w`
+    /// from its previous value. Updated in `plug.rs` on every ingest.
+    /// Combined with `last_pulse_completed_at`, this lets `pulse_settled`
+    /// wait until the battery has finished implementing the delta — i.e.
+    /// the plug has moved AND stopped moving — instead of firing the next
+    /// pulse the moment movement begins.
+    pub last_plug_movement_at: Option<Instant>,
 
     /// Diagnostics: when this Marstek last polled the virtual Shelly.
     pub last_marstek_poll_at: Option<Instant>,
@@ -119,6 +126,7 @@ impl BatteryState {
             last_pulse_completed_at: None,
             last_plug_w: None,
             last_plug_at: None,
+            last_plug_movement_at: None,
             last_marstek_poll_at: None,
             soc_pct: None,
             soc_at: None,
@@ -133,28 +141,33 @@ impl BatteryState {
     ///   1. No pulse in flight (pulse_remaining == 0), AND
     ///   2. one of:
     ///      (a) we never sent a pulse yet (initial state),
-    ///      (b) the plug has moved by >= movement_threshold_w since the
-    ///      pulse cycle started (battery responded), or
-    ///      (c) settle_timeout_s elapsed since the pulse cycle finished
-    ///      (battery didn't respond, but we can't wait forever).
-    pub fn pulse_settled(&self, movement_threshold_w: f64, settle_timeout_s: f64) -> bool {
+    ///      (b) the plug has moved since the pulse and has now been STABLE
+    ///          (no movement above plug_stable_w) for `stable_duration_s` —
+    ///          i.e. Marstek has finished implementing the delta, or
+    ///      (c) `settle_timeout_s` elapsed since the pulse cycle finished
+    ///          (battery didn't respond, but we can't wait forever).
+    ///
+    /// The plug is "moving" while `last_plug_movement_at` keeps getting
+    /// refreshed by the plug poller in response to >stable_w deltas
+    /// between consecutive readings. Once readings settle within the
+    /// stable_w band again, `last_plug_movement_at` stops advancing and
+    /// the elapsed-time check eventually clears.
+    pub fn pulse_settled(&self, stable_duration_s: f64, settle_timeout_s: f64) -> bool {
         if self.pulse_remaining > 0 {
             return false;
         }
-        if self.last_pulse_completed_at.is_none() {
-            return true;
-        }
-        let Some(plug) = self.last_plug_w else {
-            return false;
+        let Some(pulse_done) = self.last_pulse_completed_at else {
+            return true; // initial state — never pulsed
         };
-        if let Some(at_send) = self.plug_w_at_pulse_send {
-            if (plug - at_send).abs() >= movement_threshold_w {
-                return true;
-            }
+        let since_pulse = pulse_done.elapsed().as_secs_f64();
+        if since_pulse >= settle_timeout_s {
+            return true; // escape hatch — Marstek isn't reacting
         }
-        match self.last_pulse_completed_at {
-            Some(t) => t.elapsed().as_secs_f64() >= settle_timeout_s,
-            None => false,
+        // Movement must have occurred AFTER the pulse went out (proves
+        // Marstek reacted), then stabilized for stable_duration_s.
+        match self.last_plug_movement_at {
+            Some(t) if t >= pulse_done => t.elapsed().as_secs_f64() >= stable_duration_s,
+            _ => false,
         }
     }
 
@@ -371,6 +384,7 @@ mod tests {
             last_pulse_completed_at: None,
             last_plug_w: plug_w,
             last_plug_at: plug_w.map(|_| Instant::now()),
+            last_plug_movement_at: None,
             last_marstek_poll_at: None,
             soc_pct: None,
             soc_at: None,
@@ -395,30 +409,49 @@ mod tests {
     }
 
     #[test]
-    fn pulse_settled_when_plug_moved() {
+    fn pulse_settled_when_plug_moved_then_stable() {
         let mut b = make_battery(Some(120.0));
         b.plug_w_at_pulse_send = Some(0.0);
-        b.last_pulse_completed_at = Some(Instant::now());
-        // Movement well above threshold → settled.
-        assert!(b.pulse_settled(15.0, 5.0));
+        // Pulse 4 s ago, last movement 2 s ago (i.e. plug has been stable
+        // for 2 s, longer than stable_duration_s = 1.5).
+        let now = Instant::now();
+        b.last_pulse_completed_at = Some(now - Duration::from_secs(4));
+        b.last_plug_movement_at = Some(now - Duration::from_secs(2));
+        assert!(b.pulse_settled(1.5, 5.0));
     }
 
     #[test]
-    fn pulse_settled_blocked_when_plug_didnt_move() {
+    fn pulse_settled_blocked_while_plug_still_moving() {
+        let mut b = make_battery(Some(120.0));
+        b.plug_w_at_pulse_send = Some(0.0);
+        // Pulse 1 s ago, plug moved just now → not stable yet.
+        let now = Instant::now();
+        b.last_pulse_completed_at = Some(now - Duration::from_secs(1));
+        b.last_plug_movement_at = Some(now);
+        assert!(!b.pulse_settled(1.5, 5.0));
+    }
+
+    #[test]
+    fn pulse_settled_blocked_when_marstek_didnt_react() {
+        // Marstek refused: plug never moved after the pulse, last_movement
+        // is from before the pulse went out.
         let mut b = make_battery(Some(2.0));
         b.plug_w_at_pulse_send = Some(0.0);
-        b.last_pulse_completed_at = Some(Instant::now());
-        // 2 W movement < 15 W threshold, and not enough time passed → blocked.
-        assert!(!b.pulse_settled(15.0, 5.0));
+        let now = Instant::now();
+        b.last_pulse_completed_at = Some(now - Duration::from_secs(1));
+        b.last_plug_movement_at = Some(now - Duration::from_secs(10));
+        // Pre-pulse movement doesn't count → blocked until timeout.
+        assert!(!b.pulse_settled(1.5, 5.0));
     }
 
     #[test]
     fn pulse_settled_via_timeout() {
         let mut b = make_battery(Some(2.0));
         b.plug_w_at_pulse_send = Some(0.0);
-        // Pretend the pulse completed long ago.
+        // Pretend the pulse completed long ago, plug never moved.
         b.last_pulse_completed_at = Some(Instant::now() - Duration::from_secs(10));
-        assert!(b.pulse_settled(15.0, 5.0));
+        b.last_plug_movement_at = None;
+        assert!(b.pulse_settled(1.5, 5.0));
     }
 
     #[test]

@@ -111,14 +111,25 @@ pub struct DispatcherConfig {
     /// minimum pulse magnitude the dispatcher will issue.
     #[serde(default = "default_deadband_w")]
     pub deadband_w: f64,
-    /// Plug-movement threshold that counts the previous pulse as
-    /// "landed", so the dispatcher is free to queue the next pulse.
-    /// Smaller than `deadband_w` on purpose — every pulse we issue is
-    /// at least `deadband_w` in magnitude, so any landed pulse moves
-    /// the plug by more than this. Marstek typically undershoots ~5 W
-    /// due to conversion losses; 15 W is a safe noise floor.
+    /// DEPRECATED since v0.4.4 — kept for config-file compatibility only.
+    /// The "pulse landed" criterion is now (a) any plug movement above
+    /// `plug_stable_w` proving Marstek reacted, then (b) plug stable for
+    /// `plug_stable_duration_s`. Old configs still load with this field set.
     #[serde(default = "default_hit_tolerance_w")]
     pub hit_tolerance_w: f64,
+    /// Plug-reading delta (W) below which two consecutive readings are
+    /// considered "the same" — i.e. the plug is not moving. The pulse-
+    /// settled check waits until no >stable_w deltas have arrived for
+    /// `plug_stable_duration_s` so the next pulse only fires once the
+    /// previous delta has FULLY landed (not just started landing).
+    #[serde(default = "default_plug_stable_w")]
+    pub plug_stable_w: f64,
+    /// How long the plug must stay within `plug_stable_w` (i.e. no
+    /// movement) before the dispatcher considers the previous pulse done
+    /// and queues the next one. Roughly: Marstek's typical reaction time
+    /// (~1-2 s) plus a debounce margin.
+    #[serde(default = "default_plug_stable_duration_s")]
+    pub plug_stable_duration_s: f64,
     /// Pulses sent per delta change. Marstek needs ≥2; 3 = safety margin.
     #[serde(default = "default_pulse_count")]
     pub pulse_count: u32,
@@ -166,6 +177,8 @@ impl Default for DispatcherConfig {
             cycle_ms: default_cycle_ms(),
             deadband_w: default_deadband_w(),
             hit_tolerance_w: default_hit_tolerance_w(),
+            plug_stable_w: default_plug_stable_w(),
+            plug_stable_duration_s: default_plug_stable_duration_s(),
             pulse_count: default_pulse_count(),
             soc_full_pct: default_soc_full(),
             soc_empty_pct: default_soc_empty(),
@@ -187,6 +200,12 @@ fn default_deadband_w() -> f64 {
 }
 fn default_hit_tolerance_w() -> f64 {
     15.0
+}
+fn default_plug_stable_w() -> f64 {
+    10.0
+}
+fn default_plug_stable_duration_s() -> f64 {
+    1.5
 }
 fn default_pulse_count() -> u32 {
     3
@@ -564,10 +583,12 @@ impl Config {
         if self.dispatcher.hit_tolerance_w < 0.0 {
             anyhow::bail!("dispatcher.hit_tolerance_w must not be negative");
         }
-        // Note: hit_tolerance_w > deadband_w is suboptimal (the
-        // movement-based settle path can never trigger, so settle_timeout_s
-        // takes over) but not broken. We deliberately allow it so v0.3
-        // configs with manually raised hit_tolerance_w still load.
+        if self.dispatcher.plug_stable_w < 0.0 {
+            anyhow::bail!("dispatcher.plug_stable_w must not be negative");
+        }
+        if self.dispatcher.plug_stable_duration_s < 0.0 {
+            anyhow::bail!("dispatcher.plug_stable_duration_s must not be negative");
+        }
         if self.dispatcher.plug_stale_s < 0.0 {
             anyhow::bail!("dispatcher.plug_stale_s must not be negative");
         }
