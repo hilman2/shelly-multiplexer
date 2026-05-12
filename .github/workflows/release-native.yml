@@ -1,0 +1,149 @@
+name: Release native binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Generic x86_64 Linux (server / NAS / generic distro).
+          # musl = static, runs on any glibc version.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: false
+            os: linux
+          # Raspberry Pi 3 / 4 / 5 (64-bit OS) and Pi Zero 2 W.
+          # Native arm64 runner, no QEMU.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            use_cross: false
+            os: linux
+          # Raspberry Pi 2 / 3 / 4 on 32-bit OS (ARMv7 hard-float).
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            use_cross: true
+            os: linux
+          # Raspberry Pi 1 / Pi Zero / Pi Zero W (ARMv6 hard-float).
+          - target: arm-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            use_cross: true
+            os: linux
+          # Windows 10/11 x86_64.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use_cross: false
+            os: windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools (native Linux musl builds)
+        if: matrix.os == 'linux' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -e
+          VERSION=${{ steps.ver.outputs.version }}
+          TARGET=${{ matrix.target }}
+          NAME="shelly-multiplexer-${VERSION}-${TARGET}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${TARGET}/release/shelly-multiplexer" "dist/${NAME}/"
+          cp config.example.toml "dist/${NAME}/"
+          cp packaging/shelly-multiplexer.service "dist/${NAME}/"
+          cp docs/INSTALL-LINUX.md "dist/${NAME}/README.md"
+          tar -czf "${NAME}.tar.gz" -C dist "${NAME}"
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $name = "shelly-multiplexer-$version-$target"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/$target/release/shelly-multiplexer.exe" "dist/$name/"
+          Copy-Item "config.example.toml" "dist/$name/"
+          Copy-Item "docs/INSTALL-WINDOWS.md" "dist/$name/README.md"
+          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+            *.zip
+            *.zip.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false

@@ -104,7 +104,24 @@ measurements, never from "what we think we asked for".
 > off the default 1010 (e.g. to 2020). Otherwise the multiplexer can't
 > bind 1010 and the batteries will reach the real Shelly directly.
 
-## Building
+## Installation
+
+Three supported paths:
+
+- **Home Assistant add-on** — install via the HA Add-on Store from
+  the repository URL. The supervisor pulls prebuilt OCI images per
+  architecture; see [addon/README.md](addon/README.md).
+- **Native Linux (Debian / Ubuntu / Raspberry Pi OS)** — download the
+  prebuilt static binary for your arch from
+  [Releases](https://github.com/hilman2/shelly-multiplexer/releases),
+  install as a systemd service. Full walkthrough in
+  [docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md). Targets: x86_64,
+  aarch64 (Pi 3/4/5, Pi Zero 2), armv7 (Pi 2/3 32-bit), armv6 (Pi Zero / Pi 1).
+- **Native Windows** — download the `.exe`, run interactively or as a
+  service via NSSM. Walkthrough in
+  [docs/INSTALL-WINDOWS.md](docs/INSTALL-WINDOWS.md).
+
+## Building from source
 
 Requires Rust 1.87+ (edition 2024).
 

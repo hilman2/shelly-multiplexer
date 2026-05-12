@@ -1,0 +1,38 @@
+[Unit]
+Description=Shelly Multiplexer — pulse-based Marstek dispatcher
+Documentation=https://github.com/hilman2/shelly-multiplexer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shelly-multiplexer
+Group=shelly-multiplexer
+WorkingDirectory=/var/lib/shelly-multiplexer
+ExecStart=/usr/local/bin/shelly-multiplexer --config /etc/shelly-multiplexer/config.toml
+Restart=on-failure
+RestartSec=5
+
+# The virtual Shelly binds UDP 1010 + HTTP 80 (configurable). Both are
+# below 1024 so a non-root user needs CAP_NET_BIND_SERVICE. CAP_NET_RAW
+# covers mDNS multicast on some kernels.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+# Hardening — the daemon doesn't need much.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/shelly-multiplexer
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
