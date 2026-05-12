@@ -1,4 +1,4 @@
-//! Pulse-based dispatcher (v0.3.0+ delta-only architecture).
+//! Pulse-based dispatcher (v0.4.3+ target-based architecture).
 //!
 //! Every cycle:
 //!   1. Update circuit-mute state from plug freshness AND grid freshness.
@@ -15,10 +15,14 @@
 //!      its first, producing overshoot followed by ringing back the
 //!      other way.
 //!   3. Read grid_w from the real Shelly snapshot. Apply asymmetric
-//!      grid_bias_w to compute a correction_total.
-//!   4. Distribute correction_total across batteries by available
-//!      headroom (= plug_w against SoC-aware soft bounds), with overflow
-//!      redistribution if any battery clamps.
+//!      grid_bias_w + deadband to compute grid_correction.
+//!   4. Compute desired_total = sum(plug_w over eligible) + grid_correction
+//!      and distribute it across eligible batteries weighted by
+//!        priority_weight × capacity_wh × soc_room
+//!      where soc_room is (soc_full - soc) for charging and (soc - soc_empty)
+//!      for discharging. Each target is clamped to [low_bound, high_bound]
+//!      (SoC-aware), overflow redistributed to siblings. delta_i = target_i
+//!      - plug_w_i.
 //!   5. Per-circuit cap enforcement on (plug_w + delta) sum. Scale is
 //!      always clamped to [0, 1] — we never flip the requested direction
 //!      to "fix" an over-cap state, because that would oscillate against
@@ -29,10 +33,24 @@
 //!      checked here any more — the global gate above covers it for
 //!      every active battery.)
 //!
-//! There is no virtual integrator, no "commanded" we maintain; the plug
-//! is the only ground truth. Saturation falls out for free: when a
-//! battery is at hardware/SoC limit, headroom = 0 → 0 weight → 0 share
-//! of new correction → siblings absorb the unmet residual.
+//! Why target-based (v0.4.3) instead of delta-based (≤ v0.4.2): with
+//! two batteries on one circuit at e.g. {A=-400 W, B=-2000 W} (total
+//! -2400 W charge), if a cloud cuts surplus from 2400 to 400 W,
+//! grid_w jumps to +2000. The old delta-based code split +1970 across
+//! both by headroom → A flipped to +372 (DISCHARGE) while B stayed at
+//! -802 (CHARGE), wasting conversion losses in both inverters. The
+//! target-based code distributes the TARGET (-430), giving each
+//! battery ≈ -215 W → both keep charging, just less. Always one direction.
+//!
+//! The SoC weighting (soc_room factor) is a secondary preference: it
+//! never reduces the total dispatched correction (the primary goal),
+//! only shifts WHICH battery does the work — emptier batteries get
+//! more charge, fuller batteries get more discharge → all reach the
+//! healthy band together.
+//!
+//! There is no virtual integrator. The plug is the only ground truth.
+//! Saturation falls out naturally via target clamping at [low_bound,
+//! high_bound], with overflow redistributed to siblings.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -202,20 +220,8 @@ fn low_bound(b: &BatteryState, dcfg: &DispatcherConfig) -> f64 {
     }
 }
 
-/// Headroom = how much further we can push this battery's plug_w in the
-/// requested direction, respecting hardware caps + SoC soft bounds.
-fn headroom(b: &BatteryState, dcfg: &DispatcherConfig, need_more_discharge: bool) -> f64 {
-    let plug = b.last_plug_w.unwrap_or(0.0);
-    let h = if need_more_discharge {
-        high_bound(b, dcfg) - plug
-    } else {
-        plug - low_bound(b, dcfg)
-    };
-    h.max(0.0)
-}
-
 // ---------------------------------------------------------------------------
-// Step 2/3: distribute correction across batteries
+// Step 3/4: target-based delta computation
 // ---------------------------------------------------------------------------
 
 fn compute_deltas(
@@ -227,24 +233,10 @@ fn compute_deltas(
     let bats = state.batteries.read();
     let circuits = state.circuits.read();
 
-    let raw = grid_w;
-    let correction_total = if raw > 0.0 {
-        (raw - dcfg.grid_bias_w).max(0.0)
-    } else if raw < 0.0 {
-        (raw + dcfg.grid_bias_w).min(0.0)
-    } else {
-        0.0
-    };
-
     let mut deltas: HashMap<String, f64> = HashMap::new();
     for b in bats.values() {
         deltas.insert(b.id.clone(), 0.0);
     }
-    if correction_total.abs() < dcfg.deadband_w {
-        return deltas;
-    }
-
-    let need_more_discharge = correction_total > 0.0;
 
     let muted_circuit = |cid: &str| -> bool {
         circuits
@@ -254,64 +246,127 @@ fn compute_deltas(
             .unwrap_or(false)
     };
 
-    let mut eligible: Vec<&BatteryState> = bats
+    // Eligible = not on a muted circuit AND has a usable plug reading.
+    let eligible: Vec<&BatteryState> = bats
         .values()
-        .filter(|b| {
-            if muted_circuit(&b.circuit) {
-                return false;
-            }
-            headroom(b, dcfg, need_more_discharge) > 0.0
-        })
+        .filter(|b| !muted_circuit(&b.circuit) && b.last_plug_w.is_some())
         .collect();
-
     if eligible.is_empty() {
         return deltas;
     }
 
-    // weight = priority × headroom. headroom is already > 0 by construction
-    // above, so no .max(1.0) safety dance is needed.
-    let weight_of = |b: &BatteryState| -> f64 {
-        b.priority_weight * headroom(b, dcfg, need_more_discharge)
+    // Asymmetric bias + deadband.
+    let raw = grid_w;
+    let grid_correction_raw = if raw > 0.0 {
+        (raw - dcfg.grid_bias_w).max(0.0)
+    } else if raw < 0.0 {
+        (raw + dcfg.grid_bias_w).min(0.0)
+    } else {
+        0.0
+    };
+    let grid_correction = if grid_correction_raw.abs() < dcfg.deadband_w {
+        0.0
+    } else {
+        grid_correction_raw
     };
 
-    // Distribute correction with overflow redistribution.
-    let mut remaining = correction_total;
+    // Conflict detection: any active circuit with opposing flows above
+    // deadband must be realigned even when the grid itself is balanced.
+    let has_conflict = circuits.values().any(|cs| {
+        if cs.silent_until.map(|t| t > now).unwrap_or(false) {
+            return false;
+        }
+        let plugs: Vec<f64> = cs
+            .member_ids
+            .iter()
+            .filter_map(|id| bats.get(id))
+            .filter_map(|b| b.last_plug_w)
+            .collect();
+        let any_pos = plugs.iter().any(|w| *w > dcfg.deadband_w);
+        let any_neg = plugs.iter().any(|w| *w < -dcfg.deadband_w);
+        any_pos && any_neg
+    });
+
+    if grid_correction.abs() < 1e-3 && !has_conflict {
+        return deltas;
+    }
+
+    let current_total: f64 = eligible
+        .iter()
+        .map(|b| b.last_plug_w.unwrap_or(0.0))
+        .sum();
+    let desired_total = current_total + grid_correction;
+    let charging = desired_total < 0.0;
+
+    // weight = priority × capacity × soc_room (in the relevant direction).
+    let weight_of = |b: &BatteryState| -> f64 {
+        let cap = if b.capacity_wh > 0.0 {
+            b.capacity_wh
+        } else {
+            b.max_charge_w + b.max_discharge_w
+        };
+        let soc_room = match b.soc_pct {
+            Some(soc) => {
+                if charging {
+                    (b.effective_soc_full_pct(dcfg.soc_full_pct) - soc).max(0.0)
+                } else {
+                    (soc - b.effective_soc_empty_pct(dcfg.soc_empty_pct)).max(0.0)
+                }
+            }
+            // Unknown SoC: neutral 50 %-point room so the battery still
+            // participates rather than stalling the dispatcher.
+            None => 50.0,
+        };
+        b.priority_weight * cap * soc_room
+    };
+
+    let mut targets: HashMap<String, f64> = HashMap::new();
+    for b in &eligible {
+        targets.insert(b.id.clone(), 0.0);
+    }
+    let mut active: Vec<&BatteryState> = eligible.iter().copied().collect();
+    let mut remaining = desired_total;
+
     for _ in 0..6 {
-        if remaining.abs() < 1e-3 || eligible.is_empty() {
+        if active.is_empty() || remaining.abs() < 1e-3 {
             break;
         }
-        let total_w: f64 = eligible.iter().map(|b| weight_of(b)).sum();
-        if total_w <= 0.0 {
+        let total_weight: f64 = active.iter().map(|b| weight_of(b)).sum();
+        if total_weight <= 0.0 {
+            // No battery has SoC room in the desired direction; what's
+            // already in targets stays, the rest of desired_total is
+            // physically unreachable this cycle.
             break;
         }
         let mut clamped_ids: Vec<String> = Vec::new();
-        for b in &eligible {
-            let share = remaining * weight_of(b) / total_w;
-            let prev = *deltas.get(&b.id).unwrap();
+        for b in &active {
+            let prev = targets.get(&b.id).copied().unwrap_or(0.0);
+            let share = remaining * weight_of(b) / total_weight;
             let proposed = prev + share;
-            // Clamp to remaining headroom (live).
-            let h = headroom(b, dcfg, need_more_discharge);
-            let clamped = if need_more_discharge {
-                proposed.min(h).max(0.0)
-            } else {
-                proposed.max(-h).min(0.0)
-            };
-            deltas.insert(b.id.clone(), clamped);
+            let lo = low_bound(b, dcfg);
+            let hi = high_bound(b, dcfg);
+            let clamped = proposed.clamp(lo, hi);
+            targets.insert(b.id.clone(), clamped);
             if (clamped - proposed).abs() > 1e-3 {
                 clamped_ids.push(b.id.clone());
             }
         }
-        let applied: f64 = bats
-            .values()
-            .map(|b| deltas.get(&b.id).copied().unwrap_or(0.0))
-            .sum();
-        remaining = correction_total - applied;
-        eligible.retain(|b| !clamped_ids.contains(&b.id));
+        let assigned: f64 = targets.values().sum();
+        remaining = desired_total - assigned;
+        if clamped_ids.is_empty() {
+            break;
+        }
+        active.retain(|b| !clamped_ids.contains(&b.id));
     }
 
-    // Per-circuit cap on (plug_w + delta) sum. Plug-measured |sum| of all
-    // batteries on a circuit, plus any new delta we'd add, must stay
-    // below cap × headroom.
+    // targets → deltas
+    for b in &eligible {
+        let plug = b.last_plug_w.unwrap_or(0.0);
+        let target = targets.get(&b.id).copied().unwrap_or(plug);
+        deltas.insert(b.id.clone(), target - plug);
+    }
+
+    // Per-circuit cap on (plug_w + delta) sum.
     //
     // Scale is clamped to [0, 1]:
     //   - 1.0 → no scaling, deltas pass through.
@@ -320,15 +375,13 @@ fn compute_deltas(
     //
     // We deliberately do NOT flip signs to "fix" an already-over-cap
     // measured_sum: that would emit reverse-direction pulses against the
-    // grid-balance intent and oscillate. Cap protection is one-way — it
-    // only prevents making things worse. If a circuit is genuinely
-    // over-cap, the operator must downsize loads; the dispatcher will
-    // refuse to push further but won't fight the user's setpoint.
+    // grid-balance intent and oscillate.
     for cs in circuits.values() {
         let members: Vec<&BatteryState> = cs
             .member_ids
             .iter()
             .filter_map(|id| bats.get(id))
+            .filter(|b| b.last_plug_w.is_some())
             .collect();
         if members.is_empty() {
             continue;
@@ -464,50 +517,26 @@ mod tests {
     }
 
     #[test]
-    fn headroom_discharge_uses_distance_to_max_discharge() {
-        let cfg = dcfg();
-        // Currently discharging at 200 W, max 800 W → 600 W of headroom up.
-        let b = make_battery("a", 200.0, 2500.0, 800.0);
-        assert!((headroom(&b, &cfg, true) - 600.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn headroom_charge_uses_distance_to_max_charge() {
-        let cfg = dcfg();
-        // Currently charging at -1000 W, max charge 2500 W → 1500 W headroom down.
-        let b = make_battery("a", -1000.0, 2500.0, 800.0);
-        assert!((headroom(&b, &cfg, false) - 1500.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn headroom_clamped_to_zero_when_at_or_past_bound() {
-        let cfg = dcfg();
-        let b = make_battery("a", 800.0, 2500.0, 800.0); // at max discharge
-        assert_eq!(headroom(&b, &cfg, true), 0.0);
-        let b = make_battery("a", 1000.0, 2500.0, 800.0); // somehow over (plug noise)
-        assert_eq!(headroom(&b, &cfg, true), 0.0);
-    }
-
-    #[test]
-    fn headroom_zero_at_full_soc_when_charging() {
+    fn low_bound_zero_at_full_soc() {
         let mut cfg = dcfg();
         cfg.soc_full_pct = 95.0;
         let mut b = make_battery("a", -500.0, 2500.0, 800.0);
         b.soc_pct = Some(96.0);
-        // Charging would push SoC higher, but battery is already "full".
-        assert_eq!(headroom(&b, &cfg, false), 0.0);
-        // Discharge headroom is unaffected by full SoC.
-        assert!(headroom(&b, &cfg, true) > 0.0);
+        // SoC at/above full: can't charge any more.
+        assert_eq!(low_bound(&b, &cfg), 0.0);
+        // Discharge bound is unaffected by full SoC.
+        assert!(high_bound(&b, &cfg) > 0.0);
     }
 
     #[test]
-    fn headroom_zero_at_empty_soc_when_discharging() {
+    fn high_bound_zero_at_empty_soc() {
         let mut cfg = dcfg();
         cfg.soc_empty_pct = 5.0;
         let mut b = make_battery("a", 200.0, 2500.0, 800.0);
         b.soc_pct = Some(4.0);
-        assert_eq!(headroom(&b, &cfg, true), 0.0);
-        assert!(headroom(&b, &cfg, false) > 0.0);
+        // SoC at/below empty: can't discharge any more.
+        assert_eq!(high_bound(&b, &cfg), 0.0);
+        assert!(low_bound(&b, &cfg) < 0.0);
     }
 
     #[test]
@@ -591,18 +620,16 @@ mod tests {
     }
 
     #[test]
-    fn taper_reduces_headroom_so_dispatcher_redistributes() {
+    fn taper_tightens_low_bound() {
         // Battery at 92 % SoC, nominal max_charge 2500 W, taper kicks at
-        // 90 % to 1000 W. Currently charging at -200 W. Headroom for
-        // "more charge" should reflect the taper, not the hardware cap.
+        // 90 % down to 1000 W. low_bound should reflect the taper so
+        // target clamping limits the dispatched share.
         let cfg = dcfg();
         let mut b = make_battery("a", -200.0, 2500.0, 800.0);
         b.charge_taper_soc_pct = Some(90.0);
         b.charge_taper_w = Some(1000.0);
         b.soc_pct = Some(92.0);
-        // headroom(charge direction) = plug - low_bound = -200 - (-1000) = 800.
-        // Without taper it would be -200 - (-2500) = 2300.
-        assert_eq!(headroom(&b, &cfg, false), 800.0);
+        assert_eq!(low_bound(&b, &cfg), -1000.0);
     }
 
     #[test]
