@@ -4,6 +4,37 @@ This guide installs Shelly Multiplexer as a systemd service from the
 prebuilt static binaries published on each GitHub Release. No Docker,
 no Rust toolchain on the target machine required.
 
+## Quick install (interactive script)
+
+The fastest path: a single command that detects your architecture,
+downloads the latest release, verifies its SHA-256, asks for the basics
+(real Shelly IP, ports, admin-UI port), writes a bootstrap config and
+starts the service.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hilman2/shelly-multiplexer/main/scripts/install.sh | sudo bash
+```
+
+Prefer reading the script first? Recommended:
+
+```bash
+wget https://raw.githubusercontent.com/hilman2/shelly-multiplexer/main/scripts/install.sh
+less install.sh                 # have a look
+sudo bash install.sh
+```
+
+Re-running the script upgrades the binary in place and keeps your
+config. To remove everything, use the matching uninstaller:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hilman2/shelly-multiplexer/main/scripts/uninstall.sh | sudo bash
+```
+
+The rest of this document is the manual walkthrough, useful when the
+script doesn't fit your setup or you want to know what it does.
+
+---
+
 ## 1. Choose the right archive
 
 | Hardware | Target tarball |

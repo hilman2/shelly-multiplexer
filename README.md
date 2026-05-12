@@ -102,12 +102,15 @@ Three supported paths:
 - **Home Assistant add-on** — install via the HA Add-on Store from
   the repository URL. The supervisor pulls prebuilt OCI images per
   architecture; see [addon/README.md](addon/README.md).
-- **Native Linux (Debian / Ubuntu / Raspberry Pi OS)** — download the
-  prebuilt static binary for your arch from
-  [Releases](https://github.com/hilman2/shelly-multiplexer/releases)
-  and install as a systemd service. Walkthrough:
-  [docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md). Targets: x86_64,
-  aarch64 (Pi 3/4/5, Pi Zero 2), armv7 (Pi 2/3 32-bit), armv6 (Pi Zero / Pi 1).
+- **Native Linux (Debian / Ubuntu / Raspberry Pi OS)** — one-line
+  interactive installer:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/hilman2/shelly-multiplexer/main/scripts/install.sh | sudo bash
+  ```
+  Detects your architecture (x86_64, aarch64, armv7, armv6), pulls the
+  latest release, asks for the basics, writes a bootstrap config and
+  starts the systemd service. Full walkthrough (and manual steps):
+  [docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md).
 - **Native Windows** — download the `.exe`, run interactively or as a
   service via NSSM. Walkthrough:
   [docs/INSTALL-WINDOWS.md](docs/INSTALL-WINDOWS.md).
