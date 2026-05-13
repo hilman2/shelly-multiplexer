@@ -444,7 +444,7 @@ function addBatteryCard(b = {}) {
           <option value="venus_e_v12"${b.marstek_model === "venus_e_v12" ? " selected" : ""}>Venus E v1.2 — reg 32104</option>
         </select>
       </label>
-      <label class="soc-modbus">modbus_host — required. IP of the RS485-to-LAN bridge (Waveshare / EW11 / DR134 / M5Stack). On Venus E V3 with Ethernet cable, set this to the same value as `address`<input data-f="modbus_host" type="text" placeholder="e.g. 192.168.1.91" value="${escapeAttr(b.modbus_host || "")}"></label>
+      <label class="soc-modbus">modbus_host — IP of the RS485-to-LAN bridge (Waveshare / EW11 / DR134 / M5Stack). On Venus E V3 with Ethernet cable, use the same value as "address". Leave blank to keep the battery inactive.<input data-f="modbus_host" type="text" placeholder="e.g. 192.168.1.91" value="${escapeAttr(b.modbus_host || "")}"></label>
       <label class="soc-modbus">modbus_port<input data-f="modbus_port" type="number" min="1" max="65535" value="${b.modbus_port ?? 502}"></label>
       <label class="soc-modbus">modbus_unit_id<input data-f="modbus_unit_id" type="number" min="1" max="255" value="${b.modbus_unit_id ?? 1}"></label>
       <label>soc_interval_ms<input data-f="soc_interval_ms" type="number" min="1000" max="600000" value="${b.soc_interval_ms ?? 30000}"></label>
