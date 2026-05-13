@@ -264,27 +264,50 @@ Per-battery overrides are also available (see `[[batteries]]`).
 | `group_silent_after_stale_s` | 60.0 | After recovery, drop UDP responses for this long so every Marstek's watchdog clears its integrator. Must be ≥ Marstek watchdog timeout (~60 s). |
 | `circuit_headroom` | 0.95 | Use only this fraction of the calculated fuse cap (jitter buffer). |
 
+#### Empirical full/empty detection (no-SoC mode)
+
+For installs without a SoC source (no Modbus bridge, no HA sensor) the
+dispatcher infers "full" / "empty" from refused pulses: if a
+significant directional pulse goes out and the plug doesn't move
+within `settle_timeout_s`, that direction is locked for the lockout
+duration. The opposite direction stays free — a battery that won't
+take more charge (full) is still used for discharge, and vice versa.
+After the lockout expires the direction is retried; a successful
+pulse anywhere clears the matching lockout early.
+
+This acts as a backstop even when SoC IS available: if the SoC reading
+is wrong or stale, the empirical layer still catches refusals.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `soc_unknown_lockout_s` | 600 | How long a direction is locked after a refusal (seconds). |
+
 ### `[home_assistant]` — SoC source switch
 
 The dispatcher reads battery SoC from exactly one source. This block is
 the global switch:
 
 - `enabled = false` (default) — SoC is polled via Modbus TCP. Each
-  battery needs a `modbus_host` (plus `marstek_model`, `modbus_port`,
-  `modbus_unit_id`). Batteries without `modbus_host` stay inactive.
-- `enabled = true` — SoC is polled from HA. Each battery needs a
-  `soc_entity_id`. Batteries without one stay inactive.
+  battery typically needs a `modbus_host` (plus `marstek_model`,
+  `modbus_port`, `modbus_unit_id`).
+- `enabled = true` — SoC is polled from HA. Each battery typically
+  needs a `soc_entity_id`.
 
 The two modes are mutually exclusive; the previous "Local API" path
-(direct UDP JSON-RPC on port 30000) was removed in v0.5.0 because it
-was slow and conflicted with other clients on the inverter's UDP port.
+(direct UDP JSON-RPC on port 30000) was removed in v0.5.0.
+
+**No SoC source? Still works.** Since v0.6, a battery without ANY
+SoC source still participates. The dispatcher derives "full" /
+"empty" empirically by watching whether each Marstek honours its
+directional pulses — see [Empirical full/empty detection](#empirical-fullempty-detection-no-soc-mode)
+under `[dispatcher]`. The admin UI flags such batteries with a "no
+SoC" pill so you can tell at a glance which ones run in
+empirical-only mode.
 
 **Upgrade behaviour from v0.4.x:** old configs that still carry the
 retired `vendor` and `marstek_port` fields load unchanged — Serde
-ignores the unknown fields. Affected batteries simply show up as
-"inactive" in the admin UI until the user fills in `modbus_host` (or
-flips on HA mode and sets `soc_entity_id`). The dispatcher leaves
-inactive batteries alone — no pulses, no SoC polls.
+ignores the unknown fields. Affected batteries participate in
+dispatch via empirical detection until you wire up a SoC source.
 
 | Field | Default | Purpose |
 |---|---|---|

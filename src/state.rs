@@ -105,6 +105,22 @@ pub struct BatteryState {
     /// it is.
     pub soc_source: Option<String>,
 
+    /// Delta value (W) of the most recently QUEUED pulse cycle. Set by
+    /// `queue_pulses` when a non-zero pulse goes out, consumed once by
+    /// `detect_pulse_outcomes` to decide whether the Marstek accepted
+    /// or refused the request. None outside a settled-detection window.
+    pub last_pulse_delta_w: Option<f64>,
+
+    /// Direction lockouts for empirical full/empty detection. While
+    /// `charge_locked_until` is in the future, the dispatcher treats
+    /// the battery as if `is_soc_full_gated` were true (charge bound
+    /// pinned to 0). Same for `discharge_locked_until` and the empty
+    /// gate. Set when a battery refuses a directional pulse (likely
+    /// "full" / "empty"), cleared by expiry OR by the next successful
+    /// pulse in that direction. Opposite direction stays unaffected.
+    pub charge_locked_until: Option<Instant>,
+    pub discharge_locked_until: Option<Instant>,
+
     /// Last error from any subsystem, surfaced in the UI.
     pub last_error: Option<String>,
 }
@@ -141,6 +157,9 @@ impl BatteryState {
             soc_pct: None,
             soc_at: None,
             soc_source: None,
+            last_pulse_delta_w: None,
+            charge_locked_until: None,
+            discharge_locked_until: None,
             last_error: None,
         }
     }
@@ -249,6 +268,18 @@ impl BatteryState {
             Some(soc) => soc <= self.effective_soc_empty_pct(fallback_empty_pct),
             None => false,
         }
+    }
+
+    /// Charge direction is locked (empirical "full" detection), and the
+    /// lockout window has not yet expired. While true, low_bound is
+    /// pinned to 0 — exactly like the hard SoC-full gate.
+    pub fn is_charge_locked(&self, now: Instant) -> bool {
+        self.charge_locked_until.map(|t| t > now).unwrap_or(false)
+    }
+
+    /// Discharge direction is locked (empirical "empty" detection).
+    pub fn is_discharge_locked(&self, now: Instant) -> bool {
+        self.discharge_locked_until.map(|t| t > now).unwrap_or(false)
     }
 
     /// True iff the plug is currently at ≥ 95 % of the effective max
@@ -440,6 +471,9 @@ mod tests {
             soc_pct: None,
             soc_at: None,
             soc_source: None,
+            last_pulse_delta_w: None,
+            charge_locked_until: None,
+            discharge_locked_until: None,
             last_error: None,
         }
     }

@@ -169,6 +169,22 @@ pub struct DispatcherConfig {
     /// a safe upper bound that prevents lockups when a Marstek refuses.
     #[serde(default = "default_settle_timeout_s")]
     pub settle_timeout_s: f64,
+    /// Empirical full/empty detection lockout duration. When a battery
+    /// refuses a directional pulse — significant delta queued, full
+    /// `settle_timeout_s` elapsed, plug never moved — the dispatcher
+    /// locks that DIRECTION for this many seconds and redistributes the
+    /// load to the other batteries. After the lockout expires the
+    /// direction is retried; a successful pulse clears the lockout
+    /// early. The OPPOSITE direction is never affected: a battery that
+    /// refuses charge (= full) keeps participating in discharge, and
+    /// vice versa.
+    ///
+    /// Primarily useful for installations without a SoC source (no
+    /// Modbus bridge, no HA sensor) — derived "full"/"empty" replaces
+    /// the SoC gate. With SoC available it acts as a backstop in case
+    /// the SoC reading is wrong or stale.
+    #[serde(default = "default_soc_unknown_lockout_s")]
+    pub soc_unknown_lockout_s: f64,
 }
 
 impl Default for DispatcherConfig {
@@ -188,6 +204,7 @@ impl Default for DispatcherConfig {
             circuit_headroom: default_circuit_headroom(),
             grid_bias_w: default_grid_bias_w(),
             settle_timeout_s: default_settle_timeout_s(),
+            soc_unknown_lockout_s: default_soc_unknown_lockout_s(),
         }
     }
 }
@@ -233,6 +250,9 @@ fn default_grid_bias_w() -> f64 {
 }
 fn default_settle_timeout_s() -> f64 {
     5.0
+}
+fn default_soc_unknown_lockout_s() -> f64 {
+    600.0
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +712,9 @@ impl Config {
         }
         if self.dispatcher.settle_timeout_s < 0.0 {
             anyhow::bail!("dispatcher.settle_timeout_s must not be negative");
+        }
+        if self.dispatcher.soc_unknown_lockout_s < 0.0 {
+            anyhow::bail!("dispatcher.soc_unknown_lockout_s must not be negative");
         }
         if !(0.0..=100.0).contains(&self.dispatcher.soc_full_pct) {
             anyhow::bail!("dispatcher.soc_full_pct must be in [0, 100]");
