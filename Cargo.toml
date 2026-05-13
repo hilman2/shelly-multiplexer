@@ -1,6 +1,6 @@
 [package]
 name = "shelly-multiplexer"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Pulse-based dispatcher emulating a Shelly Pro 3EM that steers multiple Marstek Venus E batteries with per-battery Shelly Plug PM Gen3 feedback"

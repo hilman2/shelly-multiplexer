@@ -136,6 +136,8 @@ main {
 .state.taper { background: rgba(74, 158, 255, 0.18); color: var(--accent); }
 /* At limit = plug at ≥ 95 % of effective cap; battery is doing all it can */
 .state.limit { background: rgba(255, 154, 74, 0.18); color: var(--accent-warm); }
+/* Neutral info pill (e.g. "no SoC source — using empirical detection"). */
+.state.info { background: rgba(148, 163, 184, 0.18); color: var(--fg-faint); }
 /* Pills wrap onto multiple lines if several flags are active. */
 td .state + .state { margin-left: 4px; }
 

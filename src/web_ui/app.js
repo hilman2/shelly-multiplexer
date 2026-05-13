@@ -137,9 +137,7 @@ function renderBatteriesStatus(batteries) {
       // first pill is the dominant one (error / silent / stale beat
       // taper / limit annotations).
       const pills = [];
-      if (b.active === false) {
-        pills.push('<span class="state warn" title="no SoC source configured — set modbus_host (or soc_entity_id in HA mode) to activate. Dispatcher skips inactive batteries entirely.">inactive</span>');
-      } else if (b.last_error) {
+      if (b.last_error) {
         pills.push(`<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`);
       } else if (b.circuit_silent) {
         pills.push('<span class="state silent" title="circuit muted (stale plug or grid)">silent</span>');
@@ -151,6 +149,15 @@ function renderBatteriesStatus(batteries) {
         pills.push('<span class="state ok">idle</span>');
       }
       // Annotation pills — additive, can stack with the dominant pill.
+      if (b.active === false) {
+        pills.push('<span class="state info" title="no SoC source configured. The dispatcher uses empirical full/empty detection: a refused directional pulse locks that direction for soc_unknown_lockout_s. Configure modbus_host (or soc_entity_id in HA mode) for direct SoC gating.">no SoC</span>');
+      }
+      if (b.charge_locked_for_ms != null) {
+        pills.push(`<span class="state warn" title="charge direction locked for ${fmtMs(b.charge_locked_for_ms)} — empirical refusal detection thinks the battery is full. Discharge stays available.">charge locked (full?)</span>`);
+      }
+      if (b.discharge_locked_for_ms != null) {
+        pills.push(`<span class="state warn" title="discharge direction locked for ${fmtMs(b.discharge_locked_for_ms)} — empirical refusal detection thinks the battery is empty. Charging stays available.">discharge locked (empty?)</span>`);
+      }
       if (b.soc_full_gated) {
         pills.push('<span class="state warn" title="SoC ≥ soc_full_pct: charging is fully gated to 0 W">SoC full</span>');
       }

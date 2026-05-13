@@ -68,6 +68,12 @@ grid_bias_w = 30
 # Time-based pulse-settle fallback: if the plug hasn't moved by
 # hit_tolerance_w within this many seconds, accept and move on.
 settle_timeout_s = 5.0
+# Empirical full/empty detection. When a battery refuses a directional
+# pulse (significant request, no plug movement before settle_timeout_s
+# elapses), that DIRECTION is locked for this many seconds. The other
+# direction stays free — a "full" battery still discharges, an "empty"
+# one still charges. Primarily useful for installs without a SoC source.
+soc_unknown_lockout_s = 600
 
 [home_assistant]
 # SoC source switch (global).

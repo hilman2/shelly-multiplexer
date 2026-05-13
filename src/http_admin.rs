@@ -162,6 +162,12 @@ struct BatteryInfo {
     at_discharge_limit: bool,
     soc_full_gated: bool,
     soc_empty_gated: bool,
+    /// Empirical direction lockouts (set by `detect_pulse_outcomes`
+    /// when the battery refuses a directional pulse). Remaining
+    /// lockout time in ms, None if not locked. Lets the UI distinguish
+    /// "locked (likely full / empty)" from the SoC-based gates.
+    charge_locked_for_ms: Option<u128>,
+    discharge_locked_for_ms: Option<u128>,
     /// Circuit-level mute (plug or grid stale) — surfaced here too
     /// so the per-battery row can show "silent" without the user
     /// having to cross-reference the circuit table.
@@ -236,6 +242,14 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
                 at_discharge_limit: b.is_at_discharge_limit(),
                 soc_full_gated: b.is_soc_full_gated(dcfg.soc_full_pct),
                 soc_empty_gated: b.is_soc_empty_gated(dcfg.soc_empty_pct),
+                charge_locked_for_ms: b
+                    .charge_locked_until
+                    .and_then(|t| t.checked_duration_since(now))
+                    .map(|d| d.as_millis()),
+                discharge_locked_for_ms: b
+                    .discharge_locked_until
+                    .and_then(|t| t.checked_duration_since(now))
+                    .map(|d| d.as_millis()),
                 circuit_silent,
             }
         })
