@@ -328,11 +328,13 @@
         <form id="form-home_assistant" class="cfg-form" data-section="home_assistant">
           <h3>Home Assistant integration</h3>
           <p class="hint">
-            Optional: read battery SoC from HA entities instead of
-            polling the inverter directly. Useful when an HA integration
-            already owns the inverter's UDP port. Token can be left blank
-            inside the add-on — it's then taken from
-            <code>$SUPERVISOR_TOKEN</code>.
+            SoC source switch. When <strong>enabled</strong>, every
+            battery's SoC is read from the configured HA entity
+            (per-battery <code>soc_entity_id</code>) and the Modbus
+            poller stays idle. When <strong>disabled</strong>, SoC is
+            read via Modbus TCP from each Marstek directly — no HA
+            required. Token can be left blank inside the add-on — it's
+            then taken from <code>$SUPERVISOR_TOKEN</code>.
             <span class="restart-tag">restart required</span>
           </p>
           <div class="form-grid">

@@ -137,7 +137,9 @@ function renderBatteriesStatus(batteries) {
       // first pill is the dominant one (error / silent / stale beat
       // taper / limit annotations).
       const pills = [];
-      if (b.last_error) {
+      if (b.active === false) {
+        pills.push('<span class="state warn" title="no SoC source configured — set modbus_host (or soc_entity_id in HA mode) to activate. Dispatcher skips inactive batteries entirely.">inactive</span>');
+      } else if (b.last_error) {
         pills.push(`<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`);
       } else if (b.circuit_silent) {
         pills.push('<span class="state silent" title="circuit muted (stale plug or grid)">silent</span>');
@@ -436,14 +438,15 @@ function addBatteryCard(b = {}) {
       <label>max_discharge_w<input data-f="max_discharge_w" type="number" min="0" step="any" value="${b.max_discharge_w ?? 800}" required></label>
       <label>capacity_wh<input data-f="capacity_wh" type="number" min="0" step="any" value="${b.capacity_wh ?? 2500}"></label>
       <label>priority_weight<input data-f="priority_weight" type="number" min="0.01" step="any" value="${b.priority_weight ?? 1.0}" required></label>
-      <label>vendor
-        <select data-f="vendor">
-          <option value="marstek"${(b.vendor || "marstek") === "marstek" ? " selected" : ""}>marstek</option>
-          <option value="hoymiles"${b.vendor === "hoymiles" ? " selected" : ""}>hoymiles</option>
-          <option value="generic"${b.vendor === "generic" ? " selected" : ""}>generic</option>
+      <label class="soc-modbus">marstek_model
+        <select data-f="marstek_model">
+          <option value="venus_e"${(b.marstek_model || "venus_e") === "venus_e" ? " selected" : ""}>Venus E (v1 / v2 / v3) — reg 34002</option>
+          <option value="venus_e_v12"${b.marstek_model === "venus_e_v12" ? " selected" : ""}>Venus E v1.2 — reg 32104</option>
         </select>
       </label>
-      <label>marstek_port<input data-f="marstek_port" type="number" min="1" max="65535" value="${b.marstek_port ?? 30000}"></label>
+      <label class="soc-modbus">modbus_host — required. IP of the RS485-to-LAN bridge (Waveshare / EW11 / DR134 / M5Stack). On Venus E V3 with Ethernet cable, set this to the same value as `address`<input data-f="modbus_host" type="text" placeholder="e.g. 192.168.1.91" value="${escapeAttr(b.modbus_host || "")}"></label>
+      <label class="soc-modbus">modbus_port<input data-f="modbus_port" type="number" min="1" max="65535" value="${b.modbus_port ?? 502}"></label>
+      <label class="soc-modbus">modbus_unit_id<input data-f="modbus_unit_id" type="number" min="1" max="255" value="${b.modbus_unit_id ?? 1}"></label>
       <label>soc_interval_ms<input data-f="soc_interval_ms" type="number" min="1000" max="600000" value="${b.soc_interval_ms ?? 30000}"></label>
       <label>soc_full_pct (override; blank = dispatcher default)<input data-f="soc_full_pct" type="number" min="0" max="100" step="any" value="${b.soc_full_pct == null ? "" : b.soc_full_pct}"></label>
       <label>soc_empty_pct (override; blank = dispatcher default)<input data-f="soc_empty_pct" type="number" min="0" max="100" step="any" value="${b.soc_empty_pct == null ? "" : b.soc_empty_pct}"></label>
@@ -451,7 +454,7 @@ function addBatteryCard(b = {}) {
       <label>charge_taper_w (cap to this many W)<input data-f="charge_taper_w" type="number" min="0" step="any" value="${b.charge_taper_w == null ? "" : b.charge_taper_w}"></label>
       <label>discharge_taper_soc_pct (cap discharge below this SoC)<input data-f="discharge_taper_soc_pct" type="number" min="0" max="100" step="any" value="${b.discharge_taper_soc_pct == null ? "" : b.discharge_taper_soc_pct}"></label>
       <label>discharge_taper_w (cap to this many W)<input data-f="discharge_taper_w" type="number" min="0" step="any" value="${b.discharge_taper_w == null ? "" : b.discharge_taper_w}"></label>
-      <label>soc_entity_id (HA, optional)<input data-f="soc_entity_id" type="text" placeholder="sensor.battery_a_soc" value="${escapeAttr(b.soc_entity_id || "")}"></label>
+      <label class="soc-ha">soc_entity_id (HA — required when HA mode is on)<input data-f="soc_entity_id" type="text" placeholder="sensor.battery_a_soc" value="${escapeAttr(b.soc_entity_id || "")}"></label>
     </div>
     <div class="bat-actions">
       <button type="button" class="ghost" data-act="remove">remove battery</button>
@@ -464,6 +467,23 @@ function addBatteryCard(b = {}) {
 function renderBatteriesEditor(batteries) {
   els.batteriesList.innerHTML = "";
   for (const b of batteries) addBatteryCard(b);
+  applyHaModeToBatteryEditor();
+}
+
+// Toggle visibility of Modbus-only / HA-only fields per the current
+// home_assistant.enabled flag. In HA mode the soc_entity_id input is the
+// only valid SoC source; in Modbus mode the inverse — entity_id is
+// ignored, Modbus port / unit / model drive the poll. Keeping the
+// inactive fields out of the editor avoids users juggling settings that
+// have no effect.
+function applyHaModeToBatteryEditor() {
+  const haEnabled = !!(cachedConfig && cachedConfig.home_assistant && cachedConfig.home_assistant.enabled);
+  els.batteriesList.querySelectorAll(".soc-modbus").forEach((el) => {
+    el.style.display = haEnabled ? "none" : "";
+  });
+  els.batteriesList.querySelectorAll(".soc-ha").forEach((el) => {
+    el.style.display = haEnabled ? "" : "none";
+  });
 }
 
 function readBatteries() {
@@ -483,10 +503,13 @@ function readBatteries() {
       max_discharge_w: num("max_discharge_w"),
       capacity_wh: num("capacity_wh") ?? 0,
       priority_weight: num("priority_weight") ?? 1.0,
-      vendor: get("vendor") || "marstek",
-      marstek_port: num("marstek_port") ?? 30000,
+      marstek_model: get("marstek_model") || "venus_e",
+      modbus_port: num("modbus_port") ?? 502,
+      modbus_unit_id: num("modbus_unit_id") ?? 1,
       soc_interval_ms: num("soc_interval_ms") ?? 30000,
     };
+    const mbHost = get("modbus_host");
+    if (mbHost) out.modbus_host = mbHost;
     const ent = get("soc_entity_id");
     if (ent) out.soc_entity_id = ent;
     const socFull = num("soc_full_pct");
@@ -505,7 +528,10 @@ function readBatteries() {
   });
 }
 
-els.btnAddBattery.addEventListener("click", () => addBatteryCard({}));
+els.btnAddBattery.addEventListener("click", () => {
+  addBatteryCard({});
+  applyHaModeToBatteryEditor();
+});
 
 els.btnSaveBatteries.addEventListener("click", async () => {
   const status = els.statusBatteries;

@@ -1,6 +1,6 @@
 ---
 name: Shelly Multiplexer
-version: "0.4.5"
+version: "0.5.0"
 slug: shelly_multiplexer
 description: >-
   Pulse-based dispatcher: emulates a Shelly Pro 3EM and steers multiple

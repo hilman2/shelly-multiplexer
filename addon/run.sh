@@ -63,11 +63,16 @@ grid_bias_w = 30
 settle_timeout_s = 5.0
 
 [home_assistant]
-# Optional. If enabled, batteries with a soc_entity_id read SoC from HA
-# instead of polling the inverter directly. Token is auto-injected from
-# \$SUPERVISOR_TOKEN so leave it blank here. With host_network: true the
-# "supervisor" alias does NOT resolve - we hit HA Core directly. Replace
-# homeassistant.local with the host's IP if your network has no mDNS.
+# SoC source switch.
+#   enabled = false → every Marstek battery's SoC is read via Modbus TCP
+#                     directly from the inverter (default port 502).
+#                     soc_entity_id values are ignored.
+#   enabled = true  → SoC is read from HA entities (per-battery
+#                     soc_entity_id REQUIRED) and Modbus is not used.
+# Token is auto-injected from \$SUPERVISOR_TOKEN so leave it blank here.
+# With host_network: true the "supervisor" alias does NOT resolve - we
+# hit HA Core directly. Replace homeassistant.local with the host's IP
+# if your network has no mDNS.
 enabled = false
 url = "http://homeassistant.local:8123/api"
 token = ""
@@ -94,6 +99,20 @@ timeout_ms = 3000
 # max_discharge_w = 800
 # capacity_wh = 2500
 # priority_weight = 1.0
+# # Modbus SoC (used when [home_assistant].enabled = false).
+# # marstek_model selects the SoC register: "venus_e" (reg 34002 — v1/v2/v3)
+# # or "venus_e_v12" (reg 32104).
+# marstek_model = "venus_e"
+# # modbus_host: IP of the RS485-to-LAN bridge wired to the battery's
+# # RS485 port. Nearly every Marstek (A / D / E v1 / v2 / v1.2 / E 2.0)
+# # needs one — only Venus E V3 with Ethernet speaks Modbus TCP natively
+# # (set it to the same IP as \`address\` in that case). Without this the
+# # battery stays INACTIVE — dispatcher skips it.
+# modbus_host = "192.168.1.91"
+# modbus_port = 502
+# modbus_unit_id = 1
+# # When [home_assistant].enabled = true use this instead:
+# # soc_entity_id = "sensor.marstek_a_soc"
 EOF
 else
     bashio::log.info "Using existing /config/config.toml (real_shelly host/port from HA options)."

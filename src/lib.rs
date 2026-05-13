@@ -3,7 +3,7 @@ pub mod dispatcher;
 pub mod ha;
 pub mod http_admin;
 pub mod http_shelly;
-pub mod marstek;
+pub mod modbus;
 pub mod mdns;
 pub mod plug;
 pub mod real_shelly;

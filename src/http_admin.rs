@@ -123,6 +123,11 @@ struct BatteryInfo {
     id: String,
     circuit: String,
     address: String,
+    /// `false` when no SoC source is configured for the active mode —
+    /// dispatcher skips this battery entirely. Frontend renders an
+    /// "inactive" pill so the user knows to fill in `modbus_host` (or
+    /// `soc_entity_id` in HA mode).
+    active: bool,
     max_charge_w: f64,
     max_discharge_w: f64,
     /// SoC-aware effective caps. Equal to the hardware caps unless a
@@ -198,6 +203,7 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
                 id: b.id.clone(),
                 circuit: b.circuit.clone(),
                 address: b.address.to_string(),
+                active: b.active,
                 max_charge_w: b.max_charge_w,
                 max_discharge_w: b.max_discharge_w,
                 effective_max_charge_w: b.effective_max_charge_w(),
@@ -417,6 +423,10 @@ async fn apply_new_config(ctx: &AdminCtx, mut new_cfg: Config) -> Response {
     // immediately. AppState topology (batteries / circuits maps) was
     // built at startup and is NOT rebuilt — adding a battery, removing
     // one, or changing its IP / circuit / plug_url requires a restart.
+    // Per-battery activation IS refreshed though, so flipping
+    // `home_assistant.enabled` or adding a `modbus_host` / `soc_entity_id`
+    // takes effect on the next dispatcher cycle.
+    ctx.state.refresh_activity(&new_cfg);
     ctx.config.store(Arc::new(new_cfg));
     info!("config updated via admin UI");
 

@@ -70,9 +70,12 @@ grid_bias_w = 30
 settle_timeout_s = 5.0
 
 [home_assistant]
-# Optional: read battery SoC from an HA entity instead of polling the
-# inverter directly. Useful when an HA integration owns the inverter's
-# UDP port. Token can be left blank inside the add-on (sourced from
+# SoC source switch (global).
+#   enabled = false → SoC is read via Modbus TCP directly from each
+#                     Marstek battery (default port 502). HA is not used.
+#   enabled = true  → SoC is read from HA entities. Every battery MUST
+#                     have a soc_entity_id; Modbus is not used.
+# Token can be left blank inside the add-on (sourced from
 # $SUPERVISOR_TOKEN automatically).
 enabled = false
 url = "http://homeassistant.local:8123/api"
@@ -103,8 +106,28 @@ max_charge_w = 2500
 max_discharge_w = 800
 capacity_wh = 2500
 priority_weight = 1.0
-vendor = "marstek"
-marstek_port = 30000               # Marstek Open API UDP port
+# Modbus SoC source (used when [home_assistant].enabled = false).
+# marstek_model picks the register map per the ViperRNMC integration:
+#   "venus_e"     → SoC holding register 34002 (v1 / v2 / v3)
+#   "venus_e_v12" → SoC holding register 32104 (Venus E v1.2)
+marstek_model = "venus_e"
+# modbus_host: IP of the RS485-to-LAN bridge connected to the
+# battery's RS485 port — most Marstek variants (A / D / E v1 / v2 /
+# v1.2 / E 2.0) do NOT expose Modbus on their own WiFi interface.
+# Common bridges:
+#   - Waveshare RS485-to-RJ45 Ethernet Converter
+#   - Elfin EW11 (WiFi)
+#   - PUSR DR134
+#   - M5Stack Atom S3 Lite + RS485 base
+# For Venus E V3 with an Ethernet cable (recent firmware), set this to
+# the same IP as `address` — the battery speaks Modbus TCP natively.
+# If you leave this OUT, the battery loads as INACTIVE: the dispatcher
+# skips it entirely (no pulses, no SoC poll) until you configure a
+# source. Old v0.4.x configs with `vendor` / `marstek_port` continue to
+# load — those fields are now ignored.
+modbus_host = "192.168.1.91"
+modbus_port = 502
+modbus_unit_id = 1
 soc_interval_ms = 30000
 # SoC-based power tapering (optional). Real batteries can't accept
 # full max_charge_w near 100 % SoC nor sustain full max_discharge_w
@@ -119,7 +142,7 @@ discharge_taper_w = 400            # …to this many watts
 # Optional per-battery SoC override (defaults to dispatcher.soc_full_pct/empty)
 # soc_full_pct = 95
 # soc_empty_pct = 5
-# Optional HA SoC source (overrides direct Marstek poll)
+# Required when [home_assistant].enabled = true (otherwise ignored).
 # soc_entity_id = "sensor.marstek_a_soc"
 
 [[batteries]]
@@ -131,8 +154,10 @@ max_charge_w = 2500
 max_discharge_w = 800
 capacity_wh = 2500
 priority_weight = 1.0
-vendor = "marstek"
-marstek_port = 30000
+marstek_model = "venus_e"
+modbus_host = "192.168.1.92"   # IP of this battery's RS485-to-LAN bridge
+modbus_port = 502
+modbus_unit_id = 1
 soc_interval_ms = 30000
 charge_taper_soc_pct = 90
 charge_taper_w = 1000

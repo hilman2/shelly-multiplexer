@@ -45,6 +45,15 @@ pub struct BatteryState {
     pub circuit: String,
     pub address: IpAddr,
 
+    /// Has a configured SoC source for the currently active mode
+    /// (Modbus: `modbus_host` set; HA: `soc_entity_id` set). Inactive
+    /// batteries are excluded from dispatch — no pulses are queued for
+    /// them and the modbus poller skips them. Refreshed on config
+    /// hot-swap so flipping a battery from inactive to active in the
+    /// admin UI takes effect on the next dispatcher cycle without
+    /// requiring an add-on restart.
+    pub active: bool,
+
     pub max_charge_w: f64,
     pub max_discharge_w: f64,
     pub capacity_wh: f64,
@@ -91,7 +100,7 @@ pub struct BatteryState {
     pub soc_pct: Option<f64>,
     pub soc_at: Option<Instant>,
     /// Where the current SoC value came from (e.g. "ha:sensor.marstek_soc"
-    /// or "marstek-direct"). Surfaced in /api/status so the user can see
+    /// or "modbus:34002"). Surfaced in /api/status so the user can see
     /// at a glance whether the dispatcher is reading the value they think
     /// it is.
     pub soc_source: Option<String>,
@@ -101,11 +110,12 @@ pub struct BatteryState {
 }
 
 impl BatteryState {
-    pub fn from_config(cfg: &BatteryConfig) -> Self {
+    pub fn from_config(cfg: &BatteryConfig, ha_enabled: bool) -> Self {
         Self {
             id: cfg.id.clone(),
             circuit: cfg.circuit.clone(),
             address: cfg.address,
+            active: cfg.has_soc_source(ha_enabled),
             max_charge_w: cfg.max_charge_w,
             max_discharge_w: cfg.max_discharge_w,
             capacity_wh: if cfg.capacity_wh > 0.0 {
@@ -306,8 +316,9 @@ impl AppState {
     pub fn from_config(cfg: &Config) -> Arc<Self> {
         let mut batteries = HashMap::new();
         let mut by_addr = HashMap::new();
+        let ha_enabled = cfg.home_assistant.enabled;
         for b in &cfg.batteries {
-            let st = BatteryState::from_config(b);
+            let st = BatteryState::from_config(b, ha_enabled);
             by_addr.insert(st.address, st.id.clone());
             batteries.insert(st.id.clone(), st);
         }
@@ -337,6 +348,45 @@ impl AppState {
             started_at: Instant::now(),
             last_grid_stale_warn: Mutex::new(None),
         })
+    }
+
+    /// Refresh per-battery `active` flags from a (possibly updated) config.
+    /// Called on admin-UI hot-swap so toggling `home_assistant.enabled` or
+    /// filling in `modbus_host` / `soc_entity_id` takes effect without
+    /// requiring an add-on restart. Topology (which batteries exist) is
+    /// still fixed at startup — only the activation state moves.
+    pub fn refresh_activity(&self, cfg: &Config) {
+        let ha_enabled = cfg.home_assistant.enabled;
+        let mut bats = self.batteries.write();
+        for bcfg in &cfg.batteries {
+            if let Some(b) = bats.get_mut(&bcfg.id) {
+                let was_active = b.active;
+                b.active = bcfg.has_soc_source(ha_enabled);
+                if !b.active {
+                    // Clearing a stale SoC reading prevents the dispatcher
+                    // from using a value that's no longer authoritative
+                    // (e.g. user just switched from Modbus to HA without
+                    // configuring an entity yet).
+                    b.soc_pct = None;
+                    b.soc_at = None;
+                    b.soc_source = None;
+                }
+                if was_active && !b.active {
+                    b.last_error = Some(
+                        "inactive: SoC source removed (set modbus_host or soc_entity_id to re-enable)"
+                            .into(),
+                    );
+                } else if !was_active && b.active {
+                    // Old "inactive" error message was the sole reason for
+                    // last_error; clear it so the UI doesn't show stale text.
+                    if let Some(e) = &b.last_error {
+                        if e.starts_with("inactive:") {
+                            b.last_error = None;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -368,6 +418,7 @@ mod tests {
             id: "test".into(),
             circuit: "c1".into(),
             address: "127.0.0.1".parse().unwrap(),
+            active: true,
             max_charge_w: 2500.0,
             max_discharge_w: 800.0,
             capacity_wh: 2500.0,

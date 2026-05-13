@@ -81,17 +81,23 @@ refuses to react.
 - **SoC-aware power tapering** — optional per-battery taper knobs
   reduce the effective charge / discharge cap near the SoC edges, so
   the dispatcher doesn't try to push more than the BMS will accept.
-- **Marstek SoC poller** — used for the `soc_full_pct` / `soc_empty_pct`
-  eligibility gate. Power telemetry comes from the plug, not the
-  battery itself.
-- **Home Assistant SoC bridge** — optional per-battery SoC source via
-  the HA Core REST API (a long-lived token plus the entity ID).
+- **Marstek SoC via Modbus TCP** — the multiplexer reads SoC from the
+  Modbus register matched by `marstek_model`. Only **Venus E V3 with
+  Ethernet** speaks Modbus TCP natively; every other Marstek variant
+  (Venus A, D, E V1, V2, V1.2, E 2.0) needs an external RS485-to-LAN
+  bridge (Waveshare RS485-to-RJ45, Elfin EW11, PUSR DR134, M5Stack
+  Atom S3 + RS485, …) wired to the battery's RS485 port. `modbus_host`
+  on each battery points at that bridge. Power telemetry still comes
+  from the plug, not the battery itself.
+- **Home Assistant SoC mode** — alternative SoC source. When
+  `[home_assistant].enabled = true`, every battery's SoC is read from
+  its `soc_entity_id` via the HA Core REST API and the Modbus poller
+  stays idle. HA mode and Modbus mode are mutually exclusive.
 - **Admin UI on `:8080`** — live status (per-battery plug power, SoC,
   pulse queue, taper / at-limit / silent state) **and** full live
   configuration (real Shelly host / port, circuits, batteries,
-  dispatcher tuning, HA bridge). The TOML on disk is just the bootstrap
+  dispatcher tuning, HA mode). The TOML on disk is just the bootstrap
   seed; every setting can be edited at runtime without a restart.
-- **Standalone calibration tool** — see [Calibration tool](#calibration-tool).
 - **Cross-platform** — Linux (x86_64, aarch64, armv7, armv6), Windows
   (x86_64), macOS (build from source).
 
@@ -142,8 +148,16 @@ cp config.example.toml config.toml
 ```
 
 In each battery's app, point its "Shelly Pro 3EM" target at the
-multiplexer's IP (instead of the real Shelly's IP). For Marstek
-devices, also enable the Open API.
+multiplexer's IP (instead of the real Shelly's IP). For SoC reads you
+need either:
+
+- **HA mode** — set `[home_assistant].enabled = true` and a
+  `soc_entity_id` per battery; the multiplexer reads SoC from HA.
+- **Modbus mode** — point `modbus_host` at the Modbus TCP endpoint of
+  each battery. For Venus E V3 with Ethernet that's the battery's own
+  IP; for every other variant it's the IP of an external RS485-to-LAN
+  bridge (Waveshare / Elfin EW11 / PUSR DR134 / M5Stack Atom S3 +
+  RS485) wired to the battery's RS485 port.
 
 ### Privileged ports
 
@@ -250,20 +264,34 @@ Per-battery overrides are also available (see `[[batteries]]`).
 | `group_silent_after_stale_s` | 60.0 | After recovery, drop UDP responses for this long so every Marstek's watchdog clears its integrator. Must be ≥ Marstek watchdog timeout (~60 s). |
 | `circuit_headroom` | 0.95 | Use only this fraction of the calculated fuse cap (jitter buffer). |
 
-### `[home_assistant]` — optional SoC bridge
+### `[home_assistant]` — SoC source switch
 
-Lets you read each battery's SoC from a Home Assistant entity instead
-of (or in addition to) polling the Marstek directly.
+The dispatcher reads battery SoC from exactly one source. This block is
+the global switch:
+
+- `enabled = false` (default) — SoC is polled via Modbus TCP. Each
+  battery needs a `modbus_host` (plus `marstek_model`, `modbus_port`,
+  `modbus_unit_id`). Batteries without `modbus_host` stay inactive.
+- `enabled = true` — SoC is polled from HA. Each battery needs a
+  `soc_entity_id`. Batteries without one stay inactive.
+
+The two modes are mutually exclusive; the previous "Local API" path
+(direct UDP JSON-RPC on port 30000) was removed in v0.5.0 because it
+was slow and conflicted with other clients on the inverter's UDP port.
+
+**Upgrade behaviour from v0.4.x:** old configs that still carry the
+retired `vendor` and `marstek_port` fields load unchanged — Serde
+ignores the unknown fields. Affected batteries simply show up as
+"inactive" in the admin UI until the user fills in `modbus_host` (or
+flips on HA mode and sets `soc_entity_id`). The dispatcher leaves
+inactive batteries alone — no pulses, no SoC polls.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Master switch. |
+| `enabled` | `false` | SoC mode switch (see above). |
 | `url` | `http://homeassistant.local:8123/api` | HA Core REST base. |
 | `token` | — | Long-lived access token. Required when `enabled = true`. |
 | `timeout_ms` | 3000 | Per-request timeout. |
-
-Per-battery `soc_entity_id` (see below) selects which HA entity feeds
-that battery's SoC.
 
 ### `[[circuits]]` — shared fuses
 
@@ -292,10 +320,12 @@ voltage = 230` → 3680 W cap, or 3496 W with the default 0.95 headroom.
 | `max_discharge_w` | — | Hardware discharge cap. Required. |
 | `capacity_wh` | (auto) | Usable capacity, used as a distribution weight. Defaults to `max_charge_w + max_discharge_w` if unset. |
 | `priority_weight` | 1.0 | Manual multiplier on top of capacity (bigger = more share of work). |
-| `vendor` | `marstek` | `marstek` / `hoymiles` / `generic`. Controls only the SoC polling method; the pulse path is identical. |
-| `marstek_port` | 30000 | UDP port of the Marstek Open API (SoC read). |
+| `marstek_model` | `venus_e` | Picks the Modbus SoC register: `venus_e` (reg 34002, fits Venus E v1/v2/v3) or `venus_e_v12` (reg 32104, Venus E v1.2). Register map sourced from the [ViperRNMC marstek_venus_modbus](https://github.com/ViperRNMC/marstek_venus_modbus) project. |
+| `modbus_host` | — | Modbus TCP host. Needed in Modbus mode (`[home_assistant].enabled = false`); ignored in HA mode. Usually the IP of an RS485-to-LAN bridge — only Venus E V3 with Ethernet speaks Modbus TCP natively, in which case set this to the same value as `address`. Every other variant (Venus A, D, E V1, V2, V1.2, E 2.0) needs an external bridge such as Waveshare RS485-to-RJ45, Elfin EW11, PUSR DR134 or M5Stack Atom S3 + RS485. **Until this is set, the battery stays inactive** — the dispatcher skips it entirely. Not auto-derived from `address` on purpose: silently polling the wrong IP for SoC is a worse failure mode than asking for an explicit setting. |
+| `modbus_port` | 502 | Modbus TCP port (most bridges default to 502; some use 8899 or 4196 — check the bridge's web UI). |
+| `modbus_unit_id` | 1 | Modbus unit / slave ID. |
 | `soc_interval_ms` | 30000 | How often we poll the battery's SoC. |
-| `soc_entity_id` | — | If set + `[home_assistant].enabled`, read SoC from this HA entity instead of the Marstek. |
+| `soc_entity_id` | — | HA entity ID. **Required** when `[home_assistant].enabled = true`; ignored otherwise. |
 | `soc_full_pct` | (inherit) | Per-battery override of `[dispatcher].soc_full_pct`. |
 | `soc_empty_pct` | (inherit) | Per-battery override of `[dispatcher].soc_empty_pct`. |
 | `charge_taper_soc_pct` | — | Above this SoC, cap effective charge at `charge_taper_w`. Models BMS charge tapering near full. |
@@ -338,23 +368,6 @@ This means: (a) the primary goal — meeting the grid setpoint — is
 always pursued within physical limits, (b) batteries on the same
 circuit can never end up in opposite directions, and (c) SoCs
 naturally converge over time.
-
-## Calibration tool
-
-`marstek_calibrate` (under `src/bin/marstek_calibrate.rs`) is a
-standalone binary for empirically characterising a Marstek's pulse
-response. Build with:
-
-```bash
-cargo build --release --bin marstek_calibrate
-```
-
-Run it on a PC on the same LAN as the Marstek; it announces itself as
-a Shelly Pro 3EM via mDNS so the Marstek auto-discovers it. Send
-manual pulses (e.g. `set -100 3`) and observe the resulting power
-change in the Marstek app. The empirically measured numbers backing
-the production defaults are documented in
-`memory/marstek_empirical.md`.
 
 ## License
 
