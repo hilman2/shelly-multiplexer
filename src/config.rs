@@ -321,16 +321,45 @@ pub struct BatteryConfig {
     /// Manual weight multiplier on top of capacity (default 1.0).
     #[serde(default = "default_priority_weight")]
     pub priority_weight: f64,
-    /// Marstek vendor (drives SoC poll method only — pulses are universal).
-    #[serde(default = "default_vendor")]
-    pub vendor: BatteryVendor,
-    /// Marstek Open API UDP port for SoC reads (default 30000).
-    #[serde(default = "default_marstek_port")]
-    pub marstek_port: u16,
+    /// Marstek model — drives Modbus register-map selection. The Venus E
+    /// variants differ in their SoC register address; see
+    /// https://github.com/ViperRNMC/marstek_venus_modbus for the full map.
+    #[serde(default = "default_marstek_model")]
+    pub marstek_model: MarstekModel,
+    /// Modbus TCP host. Needed in Modbus mode
+    /// (`home_assistant.enabled = false`); ignored in HA mode.
+    ///
+    /// For nearly every Marstek variant (A / D / E V1 / V2 / V1.2 /
+    /// E 2.0) this is the LAN IP of an external RS485-to-LAN bridge
+    /// (Waveshare, Elfin EW11, PUSR DR134, M5Stack Atom S3 + RS485,
+    /// …) wired to the battery's RS485 port — they do NOT expose
+    /// Modbus on their own WiFi. Only Venus E V3 with an Ethernet
+    /// cable and recent firmware speaks Modbus TCP natively; in that
+    /// case set `modbus_host` to the same value as `address`.
+    ///
+    /// Not auto-derived from `address` on purpose: typing the IP twice
+    /// for V3 setups is cheap insurance against the much-more-common
+    /// failure where someone forgets to configure the bridge.
+    ///
+    /// Until this is set, the battery is INACTIVE — the dispatcher
+    /// skips it and the modbus poller doesn't try to read its SoC.
+    /// Old v0.4.x configs (with `vendor` / `marstek_port` from the
+    /// retired Local API path) load unchanged; their batteries just
+    /// stay idle until the user wires up `modbus_host` here.
+    #[serde(default)]
+    pub modbus_host: Option<IpAddr>,
+    /// Modbus TCP port (default 502). Some RS485-to-LAN bridges expose
+    /// Modbus on a non-standard port.
+    #[serde(default = "default_modbus_port")]
+    pub modbus_port: u16,
+    /// Modbus unit / slave ID (default 1).
+    #[serde(default = "default_modbus_unit_id")]
+    pub modbus_unit_id: u8,
     /// SoC poll interval.
     #[serde(default = "default_soc_interval_ms")]
     pub soc_interval_ms: u64,
-    /// Optional HA entity for SoC (overrides direct Marstek read).
+    /// Optional HA entity for SoC. Required when `home_assistant.enabled`
+    /// is true — Modbus is not used in HA mode.
     #[serde(default)]
     pub soc_entity_id: Option<String>,
     /// Per-battery override for the dispatcher-level full/empty thresholds.
@@ -373,22 +402,73 @@ pub struct BatteryConfig {
 fn default_priority_weight() -> f64 {
     1.0
 }
-fn default_vendor() -> BatteryVendor {
-    BatteryVendor::Marstek
+fn default_marstek_model() -> MarstekModel {
+    MarstekModel::VenusE
 }
-fn default_marstek_port() -> u16 {
-    30000
+fn default_modbus_port() -> u16 {
+    502
+}
+fn default_modbus_unit_id() -> u8 {
+    1
 }
 fn default_soc_interval_ms() -> u64 {
     30000
 }
 
+/// Marstek hardware variants distinguished by their Modbus register map.
+/// Mapping per the ViperRNMC marstek_venus_modbus integration:
+///   - Venus E v1 / v2 / E v3  → SoC at holding register 34002
+///   - Venus E v1.2            → SoC at holding register 32104
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BatteryVendor {
-    Marstek,
-    Hoymiles,
-    Generic,
+#[serde(rename_all = "snake_case")]
+pub enum MarstekModel {
+    /// Venus E (v1, v2, v3) — SoC register 34002.
+    VenusE,
+    /// Venus E v1.2 — SoC register 32104.
+    VenusEV12,
+}
+
+impl MarstekModel {
+    /// Holding-register address that holds battery SoC (uint16, percent).
+    pub fn soc_register(self) -> u16 {
+        match self {
+            MarstekModel::VenusE => 34002,
+            MarstekModel::VenusEV12 => 32104,
+        }
+    }
+}
+
+impl BatteryConfig {
+    /// Effective Modbus endpoint. `modbus_host` is checked by callers via
+    /// `has_soc_source()` before any poll fires, so the `address`
+    /// fallback here is just a safety net — it never reaches the wire
+    /// in practice because batteries without a configured SoC source
+    /// are skipped entirely.
+    pub fn modbus_target(&self) -> std::net::SocketAddr {
+        let host = self.modbus_host.unwrap_or(self.address);
+        std::net::SocketAddr::new(host, self.modbus_port)
+    }
+
+    /// Does this battery have a SoC source configured for the current
+    /// dispatcher mode? Batteries that return `false` here are INACTIVE:
+    /// the dispatcher excludes them from distribution, the modbus poller
+    /// skips them, and the UI flags them as "no SoC source".
+    ///
+    /// This is the soft-migration path for configs that predate v0.5.0
+    /// (where SoC came from the now-removed Local API): the file still
+    /// loads, but until the user adds `soc_entity_id` or `modbus_host`
+    /// the affected battery just sits idle.
+    pub fn has_soc_source(&self, ha_enabled: bool) -> bool {
+        if ha_enabled {
+            self.soc_entity_id
+                .as_deref()
+                .map(str::trim)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        } else {
+            self.modbus_host.is_some()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -551,12 +631,24 @@ impl Config {
                     }
                 }
             }
-            if b.marstek_port == 0 {
-                anyhow::bail!("battery {}: marstek_port must be > 0", b.id);
+            if b.modbus_port == 0 {
+                anyhow::bail!("battery {}: modbus_port must be > 0", b.id);
+            }
+            if b.modbus_unit_id == 0 {
+                anyhow::bail!("battery {}: modbus_unit_id must be > 0", b.id);
             }
             if b.soc_interval_ms == 0 {
                 anyhow::bail!("battery {}: soc_interval_ms must be > 0", b.id);
             }
+            // SoC source is a single global toggle (HA enabled → HA, else
+            // Modbus). Missing the relevant field for the active mode is
+            // NOT a hard error — older v0.4.x configs (with `vendor` /
+            // `marstek_port` from the removed Local API path) must keep
+            // loading on upgrade. Instead we treat such batteries as
+            // INACTIVE: the dispatcher skips them entirely until the user
+            // wires up either an `soc_entity_id` (HA mode) or a
+            // `modbus_host` (Modbus mode). See `BatteryConfig::has_soc_source`
+            // and the dispatcher's eligibility filter.
         }
 
         if self.dispatcher.cycle_ms == 0 {
@@ -665,6 +757,7 @@ circuit = "c1"
 plug_url = "http://192.168.1.71"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.91"
 "#,
         );
         assert!(cfg.is_ok(), "expected valid config; got {:?}", cfg.err());
@@ -708,6 +801,7 @@ circuit = "c1"
 plug_url = "http://192.168.1.71"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.91"
 "#,
         );
         assert!(cfg.is_ok(), "expected valid config; got {:?}", cfg.err());
@@ -740,6 +834,7 @@ circuit = "c1"
 plug_url = "http://192.168.1.71"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.91"
 "#;
         assert!(load_str(bad).is_err());
     }
@@ -772,7 +867,258 @@ circuit = "c1"
 plug_url = "http://192.168.1.71"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.91"
 "#;
         assert!(load_str(bad).is_err());
+    }
+
+    /// In HA mode, a battery without `soc_entity_id` LOADS but is
+    /// marked inactive (`has_soc_source = false`). The dispatcher then
+    /// skips it until the user fills the entity ID in. Soft migration:
+    /// old configs without an entity ID don't fail the add-on on
+    /// upgrade.
+    #[test]
+    fn ha_mode_without_entity_id_loads_as_inactive() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[home_assistant]
+enabled = true
+token = "x"
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.batteries[0].has_soc_source(true));
+    }
+
+    #[test]
+    fn ha_mode_accepts_battery_with_entity_id() {
+        let ok = r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[home_assistant]
+enabled = true
+token = "x"
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+soc_entity_id = "sensor.battery_a"
+"#;
+        assert!(load_str(ok).is_ok());
+    }
+
+    /// MarstekModel enum is wired up to the SoC register map per the
+    /// ViperRNMC integration. Regression test for the v0.5.0 Modbus rewrite.
+    #[test]
+    fn marstek_model_register_map() {
+        assert_eq!(MarstekModel::VenusE.soc_register(), 34002);
+        assert_eq!(MarstekModel::VenusEV12.soc_register(), 32104);
+    }
+
+    /// In Modbus mode a battery WITHOUT modbus_host loads but is marked
+    /// inactive. This is the v0.5.0 soft-migration path: old configs
+    /// that still have the retired `vendor` / `marstek_port` Local-API
+    /// fields keep loading; their batteries just sit idle until the
+    /// user wires up `modbus_host`.
+    #[test]
+    fn modbus_mode_without_modbus_host_loads_as_inactive() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.batteries[0].has_soc_source(false));
+    }
+
+    /// Regression test for the v0.5.0 soft-migration: an old config that
+    /// still carries the retired Local-API fields (`vendor`, `marstek_port`)
+    /// MUST keep loading. Serde ignores unknown fields, and the battery
+    /// becomes inactive (no modbus_host) until the user adds one via UI.
+    #[test]
+    fn loads_v04_config_with_retired_local_api_fields() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+vendor = "marstek"
+marstek_port = 30000
+soc_interval_ms = 30000
+"#,
+        )
+        .unwrap();
+        // Loaded successfully despite the unknown fields. The battery is
+        // INACTIVE because no SoC source is configured for v0.5.0.
+        assert_eq!(cfg.batteries.len(), 1);
+        assert!(!cfg.batteries[0].has_soc_source(false));
+    }
+
+    /// HA-mode configs don't need modbus_host — the modbus poller is
+    /// idle there, so the field is irrelevant.
+    #[test]
+    fn ha_mode_does_not_require_modbus_host() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[home_assistant]
+enabled = true
+token = "x"
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+soc_entity_id = "sensor.battery_a"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.batteries[0].modbus_host, None);
+    }
+
+    #[test]
+    fn modbus_host_overrides_address() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+modbus_host = "192.168.1.91"
+modbus_port = 5020
+"#,
+        )
+        .unwrap();
+        let b = &cfg.batteries[0];
+        assert_eq!(b.modbus_target().ip().to_string(), "192.168.1.91");
+        assert_eq!(b.modbus_target().port(), 5020);
+    }
+
+    #[test]
+    fn marstek_model_deserializes_snake_case() {
+        let cfg = load_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+marstek_model = "venus_e_v12"
+modbus_host = "192.168.1.91"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.batteries[0].marstek_model, MarstekModel::VenusEV12);
     }
 }

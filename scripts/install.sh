@@ -322,7 +322,9 @@ Next steps:
   1. Open the admin UI and add your circuits + batteries (each battery
      needs a dedicated Shelly Plug PM Gen3 reachable on plug_url).
   2. In each battery's app, point its "Shelly Pro 3EM" target at this
-     host's IP. For Marstek devices, also enable the Open API.
+     host's IP. For Marstek devices, also enable the Modbus TCP server
+     (port 502) so the multiplexer can read SoC — or use HA mode by
+     enabling [home_assistant] in config.toml.
 
 To re-run this installer later (upgrades the binary, keeps your config):
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | sudo bash

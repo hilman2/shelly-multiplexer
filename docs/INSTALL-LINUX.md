@@ -132,9 +132,13 @@ upgrades; only the binary in `/usr/local/bin/` is overwritten.
   works without root. If you set `[virtual_shelly] http_port` above
   1023, you can drop the capability from the unit.
 - **Firewall** — open UDP 1010 (Marstek → multiplexer), TCP 80
-  (Marstek HTTP probes), TCP 8080 (admin UI), UDP 5353 (mDNS).
-- **Home Assistant SoC** — set `[home_assistant] enabled = true` and
-  paste a long-lived token; per-battery `soc_entity_id` reads from HA.
+  (Marstek HTTP probes), TCP 8080 (admin UI), UDP 5353 (mDNS). The
+  multiplexer reaches OUT to each Marstek on TCP 502 (Modbus) by
+  default — no inbound firewall change needed for that direction.
+- **SoC source** — by default SoC is read via Modbus TCP (port 502)
+  from each Marstek. To switch to HA mode, set
+  `[home_assistant] enabled = true`, paste a long-lived token, and set
+  a `soc_entity_id` on every battery. Modes are mutually exclusive.
 - **Logs** — `journalctl -u shelly-multiplexer`. Raise verbosity with
   `Environment=RUST_LOG=shelly_multiplexer=debug` in a drop-in
   (`sudo systemctl edit shelly-multiplexer`).

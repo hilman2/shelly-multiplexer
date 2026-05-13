@@ -249,10 +249,14 @@ fn compute_deltas(
             .unwrap_or(false)
     };
 
-    // Eligible = not on a muted circuit AND has a usable plug reading.
+    // Eligible = active AND not on a muted circuit AND has a usable
+    // plug reading. Inactive batteries (no configured SoC source) are
+    // skipped entirely — no pulses queued, no slice of the desired_total,
+    // their plug reading isn't even folded into current_total because
+    // their target is "do nothing".
     let eligible: Vec<&BatteryState> = bats
         .values()
-        .filter(|b| !muted_circuit(&b.circuit) && b.last_plug_w.is_some())
+        .filter(|b| b.active && !muted_circuit(&b.circuit) && b.last_plug_w.is_some())
         .collect();
     if eligible.is_empty() {
         return deltas;
@@ -495,6 +499,7 @@ mod tests {
             address: format!("127.0.0.{}", id.bytes().last().unwrap_or(1))
                 .parse()
                 .unwrap(),
+            active: true,
             max_charge_w: max_charge,
             max_discharge_w: max_discharge,
             capacity_wh: max_charge + max_discharge,
@@ -677,6 +682,7 @@ circuit = "c1"
 plug_url = "http://x"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.91"
 
 [[batteries]]
 id = "b"
@@ -685,6 +691,7 @@ circuit = "c1"
 plug_url = "http://y"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.92"
 
 [[batteries]]
 id = "c"
@@ -693,6 +700,7 @@ circuit = "c1"
 plug_url = "http://z"
 max_charge_w = 2500
 max_discharge_w = 800
+modbus_host = "192.168.1.93"
 "#,
         )
         .unwrap();
