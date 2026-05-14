@@ -349,6 +349,18 @@
               <input name="grid_smoothing_s" type="number" min="0" step="any">
               <small style="color:var(--fg-faint);font-size:11px">EMA time constant on grid_w. Filters out sub-second PV inverter PWM ripple. 0 = no smoothing</small>
             </label>
+            <label>Modbus connect timeout (ms)
+              <input name="modbus_connect_timeout_ms" type="number" min="500" max="60000" step="100">
+              <small style="color:var(--fg-faint);font-size:11px">V3 talks directly to the Marstek Modbus server (slower than Elfin/Waveshare bridges). 10000 is V3-safe.</small>
+            </label>
+            <label>Modbus request timeout (ms)
+              <input name="modbus_request_timeout_ms" type="number" min="500" max="60000" step="100">
+              <small style="color:var(--fg-faint);font-size:11px">Per-register read / write timeout</small>
+            </label>
+            <label>Modbus write retries
+              <input name="modbus_write_retries" type="number" min="0" max="10" step="1">
+              <small style="color:var(--fg-faint);font-size:11px">retry the full write sequence on transient failures (200ms × attempt backoff). 0 disables</small>
+            </label>
             <label>Emergency cutoff margin (W)
               <input name="emergency_cutoff_margin_w" type="number" min="0" step="any">
               <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap × headroom + this. 0 = disabled</small>

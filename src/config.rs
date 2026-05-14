@@ -304,6 +304,29 @@ pub struct DispatcherConfig {
     #[serde(default = "default_modbus_min_write_interval_s")]
     pub modbus_min_write_interval_s: f64,
 
+    /// Modbus TCP connect timeout (ms). Venus E V3 (direct-Ethernet
+    /// Modbus, no bridge) is noticeably slower to accept connections
+    /// than Venus E v1/v2 behind an Elfin/Waveshare bridge — the
+    /// bridge has its own TCP stack and ack's instantly, while V3
+    /// goes straight to the inverter's own Modbus server. Default
+    /// 10000 ms is safe for both.
+    #[serde(default = "default_modbus_connect_timeout_ms")]
+    pub modbus_connect_timeout_ms: u64,
+
+    /// Modbus TCP request (read / write) timeout (ms). Same reasoning
+    /// as the connect timeout — V3 batteries can take noticeably
+    /// longer to respond. Default 5000 ms.
+    #[serde(default = "default_modbus_request_timeout_ms")]
+    pub modbus_request_timeout_ms: u64,
+
+    /// Per-write retry budget. If the full setpoint sequence fails
+    /// partway through (connect timeout, exception code, etc.), the
+    /// writer task closes the connection, sleeps briefly, then
+    /// retries up to this many times. Set to 0 to disable retries.
+    /// Default 2.
+    #[serde(default = "default_modbus_write_retries")]
+    pub modbus_write_retries: u32,
+
     // ----- Night cutoff (efficiency) -----
 
     /// Disconnect a battery's plug between sunset and sunrise if its
@@ -353,6 +376,9 @@ impl Default for DispatcherConfig {
             night_cutoff_soc_margin_pct: default_night_cutoff_soc_margin_pct(),
             grid_smoothing_s: default_grid_smoothing_s(),
             modbus_min_write_interval_s: default_modbus_min_write_interval_s(),
+            modbus_connect_timeout_ms: default_modbus_connect_timeout_ms(),
+            modbus_request_timeout_ms: default_modbus_request_timeout_ms(),
+            modbus_write_retries: default_modbus_write_retries(),
         }
     }
 }
@@ -448,6 +474,15 @@ fn default_grid_smoothing_s() -> f64 {
 }
 fn default_modbus_min_write_interval_s() -> f64 {
     10.0
+}
+fn default_modbus_connect_timeout_ms() -> u64 {
+    10_000
+}
+fn default_modbus_request_timeout_ms() -> u64 {
+    5_000
+}
+fn default_modbus_write_retries() -> u32 {
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1039,12 @@ impl Config {
         }
         if self.dispatcher.modbus_min_write_interval_s < 0.0 {
             anyhow::bail!("dispatcher.modbus_min_write_interval_s must not be negative");
+        }
+        if self.dispatcher.modbus_connect_timeout_ms == 0 {
+            anyhow::bail!("dispatcher.modbus_connect_timeout_ms must be > 0");
+        }
+        if self.dispatcher.modbus_request_timeout_ms == 0 {
+            anyhow::bail!("dispatcher.modbus_request_timeout_ms must be > 0");
         }
         if self.dispatcher.night_cutoff_soc_margin_pct < 0.0 {
             anyhow::bail!("dispatcher.night_cutoff_soc_margin_pct must not be negative");

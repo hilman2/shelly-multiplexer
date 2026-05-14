@@ -102,6 +102,16 @@ modbus_watchdog_grace_s = 30
 # ±2 kW at 4 Hz; without smoothing we'd chase that noise. 5 s gives
 # a sensible tracking response without lagging real load changes.
 grid_smoothing_s = 5
+# Modbus connect + request timeouts. Venus E V3 (native Ethernet
+# Modbus) is noticeably slower to respond than v1/v2 behind an Elfin
+# or Waveshare bridge — the bridge has its own TCP stack and acks
+# instantly, V3 goes straight to the inverter's own Modbus server.
+# 10s / 5s are V3-safe and don't hurt v1/v2.
+modbus_connect_timeout_ms = 10000
+modbus_request_timeout_ms = 5000
+# Per-write retry budget on transient failures (connect timeout,
+# Modbus exception, etc.). Exponential 200ms × attempt backoff.
+modbus_write_retries = 2
 
 # ---- Emergency plug cutoff (safety) ----
 # Hard-disconnect a battery via its Shelly Plug PM Gen3 relay when the

@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -58,9 +59,35 @@ const REG_FORCE_MODE: u16 = 42010;
 const REG_CHARGE_POWER_SETPOINT: u16 = 42020;
 const REG_DISCHARGE_POWER_SETPOINT: u16 = 42021;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+// Modbus timings are set once at process startup via `init_timings`
+// (called from `pub async fn run`). Stored as atomics because every
+// modbus helper reads them on every call, and tokio tasks across
+// many threads need to see the latest value — this is simpler than
+// threading a config struct through every read / write helper, and
+// the values don't change after startup anyway.
+static CONNECT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
+static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5_000);
+static WRITE_RETRIES: AtomicU32 = AtomicU32::new(2);
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
+fn connect_timeout() -> Duration {
+    Duration::from_millis(CONNECT_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+fn request_timeout() -> Duration {
+    Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+fn write_retries() -> u32 {
+    WRITE_RETRIES.load(Ordering::Relaxed)
+}
+
+/// Apply dispatcher.modbus_* timeout / retry knobs to the module-
+/// level atomics. Called once at startup; safe to call again on
+/// config hot-swap (the atomics are read on every modbus operation).
+pub fn init_timings(cfg: &Config) {
+    CONNECT_TIMEOUT_MS.store(cfg.dispatcher.modbus_connect_timeout_ms, Ordering::Relaxed);
+    REQUEST_TIMEOUT_MS.store(cfg.dispatcher.modbus_request_timeout_ms, Ordering::Relaxed);
+    WRITE_RETRIES.store(cfg.dispatcher.modbus_write_retries, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // SoC polling task — same as v0.6 but also stashes battery_power readings
@@ -240,11 +267,11 @@ async fn read_holding(
     register: u16,
     count: u16,
 ) -> Result<Vec<u16>> {
-    let mut ctx = time::timeout(CONNECT_TIMEOUT, tcp::connect_slave(target, unit))
+    let mut ctx = time::timeout(connect_timeout(), tcp::connect_slave(target, unit))
         .await
         .map_err(|_| anyhow!("modbus connect timeout to {target}"))?
         .with_context(|| format!("modbus connect to {target}"))?;
-    let result = time::timeout(REQUEST_TIMEOUT, ctx.read_holding_registers(register, count))
+    let result = time::timeout(request_timeout(), ctx.read_holding_registers(register, count))
         .await
         .map_err(|_| anyhow!("modbus read timeout (reg {register})"))?;
     let _ = ctx.disconnect().await;
@@ -303,7 +330,42 @@ impl Setpoint {
     }
 }
 
-/// Push a single setpoint to a battery. Opens a fresh Modbus connection,
+/// Push a single setpoint to a battery, retrying up to
+/// `dispatcher.modbus_write_retries` times on transient failures.
+/// Each attempt opens a fresh TCP connection — connect timeouts and
+/// half-open sockets from a previous failed attempt don't leak into
+/// the retry.
+pub async fn write_setpoint(battery: &BatteryConfig, sp: Setpoint) -> Result<()> {
+    let max_attempts = write_retries().saturating_add(1);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=max_attempts {
+        match write_setpoint_once(battery, sp).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < max_attempts {
+                    debug!(
+                        battery = %battery.id,
+                        attempt,
+                        max_attempts,
+                        error = %e,
+                        "modbus write attempt failed — retrying after backoff"
+                    );
+                    // Short exponential-ish backoff. The Marstek's own
+                    // ramp window is in the 1-3 s range so we don't
+                    // need to wait much.
+                    time::sleep(Duration::from_millis(
+                        200u64.saturating_mul(attempt as u64),
+                    ))
+                    .await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("write_setpoint exhausted retries")))
+}
+
+/// One attempt at the write sequence — opens a fresh Modbus connection,
 /// runs the proven write sequence from hilman2/MarstekVenus (Python
 /// implementation that's been tested on real hardware), closes.
 ///
@@ -328,9 +390,9 @@ impl Setpoint {
 ///      clean slate.
 ///
 /// Total write time per setpoint cycle is ~0.8-1 s. That's fine
-/// because the dispatcher's settle_timeout_s is 5 s and the writer
+/// because the dispatcher's settle_timeout_s is 10 s and the writer
 /// task de-dups intermediate setpoints via its watch channel.
-pub async fn write_setpoint(battery: &BatteryConfig, sp: Setpoint) -> Result<()> {
+async fn write_setpoint_once(battery: &BatteryConfig, sp: Setpoint) -> Result<()> {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
@@ -448,7 +510,7 @@ async fn read_bms_cutoffs(ctx: &mut tokio_modbus::client::Context) -> Result<Bms
 }
 
 async fn read_single(ctx: &mut tokio_modbus::client::Context, reg: u16) -> Result<u16> {
-    let result = time::timeout(REQUEST_TIMEOUT, ctx.read_holding_registers(reg, 1))
+    let result = time::timeout(request_timeout(), ctx.read_holding_registers(reg, 1))
         .await
         .map_err(|_| anyhow!("modbus read timeout (reg {reg})"))?;
     let regs = result
@@ -479,7 +541,7 @@ async fn open(
     target: std::net::SocketAddr,
     unit: Slave,
 ) -> Result<tokio_modbus::client::Context> {
-    time::timeout(CONNECT_TIMEOUT, tcp::connect_slave(target, unit))
+    time::timeout(connect_timeout(), tcp::connect_slave(target, unit))
         .await
         .map_err(|_| anyhow!("modbus connect timeout to {target}"))?
         .with_context(|| format!("modbus connect to {target}"))
@@ -490,7 +552,7 @@ async fn write_reg(
     register: u16,
     value: u16,
 ) -> Result<()> {
-    let result = time::timeout(REQUEST_TIMEOUT, ctx.write_single_register(register, value))
+    let result = time::timeout(request_timeout(), ctx.write_single_register(register, value))
         .await
         .map_err(|_| anyhow!("modbus write timeout (reg {register})"))?;
     result
