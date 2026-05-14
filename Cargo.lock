@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "shelly-multiplexer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1595,6 +1595,7 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
+ "sunrise",
  "thiserror",
  "tokio",
  "tokio-modbus",
@@ -1680,6 +1681,15 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sunrise"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15eecb5ec59a060dd9fe8f88c48b701abecd6be9d9c28d55081b80bdda73981c"
+dependencies = [
+ "chrono",
+]
 
 [[package]]
 name = "syn"

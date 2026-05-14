@@ -13,6 +13,7 @@ const REFRESH_MS = 1000;
 const els = {
   connState: document.getElementById("conn-state"),
   lastSeen: document.getElementById("last-seen"),
+  modePill: document.getElementById("mode-pill"),
   gridW: document.getElementById("grid-w"),
   gridDirection: document.getElementById("grid-direction"),
   gridAge: document.getElementById("grid-age"),
@@ -137,6 +138,32 @@ function renderBatteriesStatus(batteries) {
       // first pill is the dominant one (error / silent / stale beat
       // taper / limit annotations).
       const pills = [];
+      if (b.plug_cut_for_ms != null) {
+        const reason = b.plug_cut_reason || "cutoff active";
+        const remaining = fmtMs(b.plug_cut_for_ms);
+        // Night cutoff is an EFFICIENCY feature, not an emergency.
+        // Render it with a softer label so the user doesn't panic.
+        const isNight = reason.startsWith("night cutoff:");
+        const label = isNight ? "NIGHT SAVING" : "PLUG OFF";
+        const cls = isNight ? "state nightcut" : "state cutoff";
+        pills.push(
+          `<span class="${cls}" title="${escapeAttr(reason)} — auto-recovery in ${remaining}">${label}</span>` +
+          ` <button class="ghost reset-cutoff" type="button" data-bid="${escapeAttr(b.id)}" title="manual reset: re-enable the plug now">reset</button>`
+        );
+      }
+      if (b.last_modbus_write_error) {
+        pills.push(`<span class="state err" title="${escapeAttr(b.last_modbus_write_error)}">modbus error</span>`);
+      } else if (b.last_modbus_setpoint_w != null) {
+        const sp = b.last_modbus_setpoint_w;
+        const label =
+          sp === 0
+            ? "standby"
+            : sp < 0
+            ? `charge ${Math.round(-sp)} W`
+            : `discharge ${Math.round(sp)} W`;
+        const age = b.last_modbus_write_ago_ms == null ? "?" : fmtMs(b.last_modbus_write_ago_ms);
+        pills.push(`<span class="state info" title="last Modbus setpoint, written ${age} ago">${label}</span>`);
+      }
       if (b.last_error) {
         pills.push(`<span class="state err" title="${escapeAttr(b.last_error)}">error</span>`);
       } else if (b.circuit_silent) {
@@ -222,6 +249,32 @@ function renderBatteriesStatus(batteries) {
     .join("");
 }
 
+// Delegate click handler for the per-battery cutoff-reset buttons. We
+// can't bind in renderBatteriesStatus because the table is re-rendered
+// every second; a single delegated handler on the table body survives.
+document.addEventListener("click", async (ev) => {
+  const target = ev.target;
+  if (!(target instanceof HTMLElement)) return;
+  if (!target.classList.contains("reset-cutoff")) return;
+  const bid = target.getAttribute("data-bid");
+  if (!bid) return;
+  target.disabled = true;
+  try {
+    const res = await fetch(api(`/api/cutoff/${encodeURIComponent(bid)}/reset`), {
+      method: "POST",
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    showToast(`cutoff reset for ${bid}`);
+  } catch (e) {
+    showToast(`cutoff reset failed: ${e.message}`, "err");
+  } finally {
+    target.disabled = false;
+  }
+});
+
 async function fetchStatus() {
   try {
     const res = await fetch(api("/api/status"), { cache: "no-store" });
@@ -231,6 +284,11 @@ async function fetchStatus() {
     els.gridDirection.textContent = directionLabel(data.grid_w);
     els.gridAge.textContent = fmtMs(data.grid_age_ms);
     if (els.cfgPath) els.cfgPath.textContent = data.config_path || "–";
+    if (els.modePill && data.dispatch_mode) {
+      els.modePill.textContent = `${data.dispatch_mode} mode`;
+      els.modePill.classList.toggle("mode-pill-modbus", data.dispatch_mode === "modbus");
+      els.modePill.classList.toggle("mode-pill-pulse", data.dispatch_mode === "pulse");
+    }
     renderCircuitsStatus(data.circuits);
     renderBatteriesStatus(data.batteries);
     setConnOk(true);

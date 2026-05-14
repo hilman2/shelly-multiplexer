@@ -20,9 +20,21 @@ pub struct Config {
     #[serde(default)]
     pub home_assistant: HomeAssistantConfig,
     #[serde(default)]
+    pub location: LocationConfig,
+    #[serde(default)]
     pub circuits: Vec<CircuitConfig>,
     #[serde(default)]
     pub batteries: Vec<BatteryConfig>,
+}
+
+/// Geographic location — only used by the night-cutoff feature (see
+/// `DispatcherConfig::night_cutoff_enabled`). Both fields must be set
+/// for sunrise / sunset computation; either Some(unset) disables the
+/// feature with a startup warning.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LocationConfig {
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +114,42 @@ fn default_management_bind() -> String {
 // Dispatcher (pulse-based)
 // ---------------------------------------------------------------------------
 
+/// How the dispatcher commands the batteries.
+///
+/// - `Modbus` (v0.7+ default): writes absolute power setpoints directly
+///   via Modbus TCP (register 42010 for force mode + 42020/42021 for the
+///   wattage). Eliminates the entire pulse/delta machinery — every
+///   battery is told EXACTLY what to do, every cycle. Requires
+///   `modbus_host` on each battery.
+/// - `Pulse` (legacy): emulates a Shelly Pro 3EM and steers each
+///   Marstek via per-poll CT deltas. Kept for installs without
+///   per-battery Modbus access (no RS485 bridge), and for non-Marstek
+///   inverters that integrate via the Shelly 3EM protocol.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchMode {
+    Modbus,
+    Pulse,
+}
+
+impl Default for DispatchMode {
+    fn default() -> Self {
+        DispatchMode::Modbus
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DispatcherConfig {
-    /// Recompute interval for desired_w + pulse generation.
+    /// Which dispatch backend to use. Default `modbus` since v0.7 — the
+    /// pulse path is kept for legacy installs without Modbus access.
+    #[serde(default)]
+    pub mode: DispatchMode,
+    /// Recompute interval for desired_w + (pulse generation OR modbus
+    /// setpoint write). In modbus mode we re-evaluate every cycle but
+    /// only WRITE when the setpoint changes by more than
+    /// `setpoint_deadband_w` OR `modbus_heartbeat_s` has elapsed since
+    /// the last write — keeps Modbus traffic low while still serving
+    /// as an "I'm still alive" heartbeat for crash detection.
     #[serde(default = "default_cycle_ms")]
     pub cycle_ms: u64,
     /// Δ below this is ignored — Marstek-quantisation noise. Also the
@@ -185,11 +230,85 @@ pub struct DispatcherConfig {
     /// the SoC reading is wrong or stale.
     #[serde(default = "default_soc_unknown_lockout_s")]
     pub soc_unknown_lockout_s: f64,
+
+    // ----- Modbus-dispatch specific tuning (mode = "modbus" only) -----
+
+    /// Don't write a new setpoint to Modbus unless the desired value
+    /// has shifted by at least this many watts from the last
+    /// successfully written value. Below the deadband we skip the
+    /// write (saves Modbus traffic over flaky RS485-to-LAN bridges).
+    /// Default 20 W matches typical Marstek quantisation noise.
+    #[serde(default = "default_setpoint_deadband_w")]
+    pub setpoint_deadband_w: f64,
+
+    /// Re-write the current setpoint to Modbus at least this often,
+    /// even if it hasn't changed. Two purposes: (a) recover from any
+    /// bridge that dropped a write, (b) serve as an "I'm still alive"
+    /// heartbeat — if our process dies, the Marstek doesn't auto-
+    /// revert (no firmware watchdog) and would otherwise stay on the
+    /// last setpoint forever. See also `modbus_watchdog_grace_s`.
+    #[serde(default = "default_modbus_heartbeat_s")]
+    pub modbus_heartbeat_s: f64,
+
+    /// Safety watchdog inside this process: if the main dispatcher
+    /// loop hasn't ticked for this many seconds, a background task
+    /// force-writes `force_mode = 0` to every battery and exits the
+    /// process. Catches hangs that the SIGTERM handler can't see
+    /// (e.g. tokio runtime deadlock). 0.0 disables the watchdog.
+    #[serde(default = "default_modbus_watchdog_grace_s")]
+    pub modbus_watchdog_grace_s: f64,
+
+    // ----- Emergency plug cutoff (hard safety relay) -----
+
+    /// When the SIGNED plug-power sum on a circuit exceeds the
+    /// effective cap (= fuse_amps × voltage × phases × circuit_headroom)
+    /// by MORE than this many watts, the dispatcher considers the
+    /// circuit to be in physical danger. The condition has to persist
+    /// for `emergency_cutoff_grace_s` seconds before the worst
+    /// offending plug is cut. 0 W disables the entire feature.
+    /// Default 200 W — accounts for measurement jitter while still
+    /// catching real overloads quickly.
+    #[serde(default = "default_emergency_cutoff_margin_w")]
+    pub emergency_cutoff_margin_w: f64,
+
+    /// Sustained-overload time (in seconds) before the emergency
+    /// cutoff fires. Default 5 s: long enough that brief startup
+    /// transients (large appliances kicking in) don't trip the relay,
+    /// short enough that genuine cable / fuse stress is bounded.
+    #[serde(default = "default_emergency_cutoff_grace_s")]
+    pub emergency_cutoff_grace_s: f64,
+
+    /// How long the plug stays off after an emergency cutoff before
+    /// the dispatcher attempts to re-enable it. Default 600 s.
+    /// Re-enable is automatic after the recovery window; a manual
+    /// reset via the admin API is also available.
+    #[serde(default = "default_emergency_cutoff_recovery_s")]
+    pub emergency_cutoff_recovery_s: f64,
+
+    // ----- Night cutoff (efficiency) -----
+
+    /// Disconnect a battery's plug between sunset and sunrise if its
+    /// SoC is at the empty cutoff. The Marstek's inverter standby
+    /// loss (~5-15 W per unit) over a winter night is non-trivial.
+    /// Requires `[location].latitude` and `longitude` to be set —
+    /// without them the feature stays inactive with a startup warning.
+    /// Default `false` (opt-in).
+    #[serde(default)]
+    pub night_cutoff_enabled: bool,
+
+    /// SoC margin above `effective_soc_empty_pct` at which a battery
+    /// still counts as "empty" for night-cutoff purposes. Acts as
+    /// hysteresis: a battery has to hover within this margin of empty
+    /// before the cutoff fires, and rise more than this margin above
+    /// empty before recovery re-enables the plug. Default 2 %.
+    #[serde(default = "default_night_cutoff_soc_margin_pct")]
+    pub night_cutoff_soc_margin_pct: f64,
 }
 
 impl Default for DispatcherConfig {
     fn default() -> Self {
         Self {
+            mode: DispatchMode::default(),
             cycle_ms: default_cycle_ms(),
             deadband_w: default_deadband_w(),
             hit_tolerance_w: default_hit_tolerance_w(),
@@ -205,6 +324,14 @@ impl Default for DispatcherConfig {
             grid_bias_w: default_grid_bias_w(),
             settle_timeout_s: default_settle_timeout_s(),
             soc_unknown_lockout_s: default_soc_unknown_lockout_s(),
+            setpoint_deadband_w: default_setpoint_deadband_w(),
+            modbus_heartbeat_s: default_modbus_heartbeat_s(),
+            modbus_watchdog_grace_s: default_modbus_watchdog_grace_s(),
+            emergency_cutoff_margin_w: default_emergency_cutoff_margin_w(),
+            emergency_cutoff_grace_s: default_emergency_cutoff_grace_s(),
+            emergency_cutoff_recovery_s: default_emergency_cutoff_recovery_s(),
+            night_cutoff_enabled: false,
+            night_cutoff_soc_margin_pct: default_night_cutoff_soc_margin_pct(),
         }
     }
 }
@@ -253,6 +380,27 @@ fn default_settle_timeout_s() -> f64 {
 }
 fn default_soc_unknown_lockout_s() -> f64 {
     600.0
+}
+fn default_setpoint_deadband_w() -> f64 {
+    20.0
+}
+fn default_modbus_heartbeat_s() -> f64 {
+    5.0
+}
+fn default_modbus_watchdog_grace_s() -> f64 {
+    30.0
+}
+fn default_emergency_cutoff_margin_w() -> f64 {
+    200.0
+}
+fn default_emergency_cutoff_grace_s() -> f64 {
+    5.0
+}
+fn default_emergency_cutoff_recovery_s() -> f64 {
+    600.0
+}
+fn default_night_cutoff_soc_margin_pct() -> f64 {
+    2.0
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +602,18 @@ impl MarstekModel {
         match self {
             MarstekModel::VenusE => 34002,
             MarstekModel::VenusEV12 => 32104,
+        }
+    }
+
+    /// Holding-register address that reports current battery output power
+    /// (int16, watts; sign indicates direction). Cross-referenced against
+    /// the plug PM Gen3 in modbus dispatch mode for closed-loop refinement.
+    pub fn battery_power_register(self) -> u16 {
+        match self {
+            // v3 (and the A/D ETH variants) report battery_power at 30001.
+            // v1.2 sits at 32102.
+            MarstekModel::VenusE => 30001,
+            MarstekModel::VenusEV12 => 32102,
         }
     }
 }
@@ -715,6 +875,42 @@ impl Config {
         }
         if self.dispatcher.soc_unknown_lockout_s < 0.0 {
             anyhow::bail!("dispatcher.soc_unknown_lockout_s must not be negative");
+        }
+        if self.dispatcher.setpoint_deadband_w < 0.0 {
+            anyhow::bail!("dispatcher.setpoint_deadband_w must not be negative");
+        }
+        if self.dispatcher.modbus_heartbeat_s < 0.0 {
+            anyhow::bail!("dispatcher.modbus_heartbeat_s must not be negative");
+        }
+        if self.dispatcher.modbus_watchdog_grace_s < 0.0 {
+            anyhow::bail!("dispatcher.modbus_watchdog_grace_s must not be negative");
+        }
+        if self.dispatcher.emergency_cutoff_margin_w < 0.0 {
+            anyhow::bail!("dispatcher.emergency_cutoff_margin_w must not be negative");
+        }
+        if self.dispatcher.emergency_cutoff_grace_s < 0.0 {
+            anyhow::bail!("dispatcher.emergency_cutoff_grace_s must not be negative");
+        }
+        if self.dispatcher.emergency_cutoff_recovery_s < 0.0 {
+            anyhow::bail!("dispatcher.emergency_cutoff_recovery_s must not be negative");
+        }
+        if self.dispatcher.night_cutoff_soc_margin_pct < 0.0 {
+            anyhow::bail!("dispatcher.night_cutoff_soc_margin_pct must not be negative");
+        }
+        if self.dispatcher.night_cutoff_enabled {
+            match (self.location.latitude, self.location.longitude) {
+                (Some(lat), Some(lon)) => {
+                    if !(-90.0..=90.0).contains(&lat) {
+                        anyhow::bail!("location.latitude must be in [-90, 90]");
+                    }
+                    if !(-180.0..=180.0).contains(&lon) {
+                        anyhow::bail!("location.longitude must be in [-180, 180]");
+                    }
+                }
+                _ => anyhow::bail!(
+                    "dispatcher.night_cutoff_enabled = true requires [location] latitude AND longitude"
+                ),
+            }
         }
         if !(0.0..=100.0).contains(&self.dispatcher.soc_full_pct) {
             anyhow::bail!("dispatcher.soc_full_pct must be in [0, 100]");

@@ -40,7 +40,11 @@ enable_mdns = true
 bind_address = "0.0.0.0:8080"
 
 [dispatcher]
-# Recompute interval for desired_w + pulse generation
+# Dispatch backend. "modbus" (v0.7+ default) writes power setpoints
+# directly to each Marstek (registers 42010/42020/42021). "pulse"
+# keeps the legacy Shelly-3EM-emulation path for non-Modbus setups.
+mode = "modbus"
+# Recompute interval for desired_w + pulse / setpoint generation
 cycle_ms = 200
 # Δ below this is ignored (Marstek-quantisation noise) AND is the minimum
 # pulse magnitude we'll issue.
@@ -68,12 +72,45 @@ grid_bias_w = 30
 # Time-based pulse-settle fallback: if the plug hasn't moved by
 # hit_tolerance_w within this many seconds, accept and move on.
 settle_timeout_s = 5.0
-# Empirical full/empty detection. When a battery refuses a directional
-# pulse (significant request, no plug movement before settle_timeout_s
-# elapses), that DIRECTION is locked for this many seconds. The other
-# direction stays free — a "full" battery still discharges, an "empty"
-# one still charges. Primarily useful for installs without a SoC source.
+# Empirical full/empty detection (PULSE MODE ONLY). When a battery
+# refuses a directional pulse (significant request, no plug movement
+# before settle_timeout_s elapses), that DIRECTION is locked for this
+# many seconds. Modbus mode doesn't need it — direct telemetry (SoC,
+# force_mode, battery_power) tells us the truth.
 soc_unknown_lockout_s = 600
+
+# ---- Modbus-dispatch tuning (mode = "modbus") ----
+# Skip the Modbus write when the new setpoint is within this many W
+# of the last successful write. Reduces traffic on slow RS485 bridges.
+setpoint_deadband_w = 20
+# Re-write the current setpoint at least this often (heartbeat — also
+# our process-liveness signal, Marstek firmware has no watchdog).
+modbus_heartbeat_s = 5
+# Internal watchdog: if the dispatcher loop hangs for this long, a
+# background task force-writes force_mode=0 and exits. 0 disables.
+modbus_watchdog_grace_s = 30
+
+# ---- Emergency plug cutoff (safety) ----
+# Hard-disconnect a battery via its Shelly Plug PM Gen3 relay when the
+# circuit's measured plug sum exceeds cap × headroom + margin for the
+# grace window. Last line of defence — soft control should keep us
+# under cap normally. 0 disables.
+emergency_cutoff_margin_w = 200
+emergency_cutoff_grace_s = 5
+emergency_cutoff_recovery_s = 600
+
+# ---- Night cutoff (efficiency) ----
+# Cut empty batteries between sunset and sunrise to skip the Marstek's
+# ~5-15 W inverter standby loss. Requires [location] below to be set.
+night_cutoff_enabled = false
+night_cutoff_soc_margin_pct = 2
+
+[location]
+# Required when [dispatcher].night_cutoff_enabled = true. Decimal
+# degrees, WGS-84. Used to compute local sunrise / sunset.
+# Example: München.
+# latitude = 48.137
+# longitude = 11.575
 
 [home_assistant]
 # SoC source switch (global).
