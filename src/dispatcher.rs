@@ -717,7 +717,16 @@ fn any_pulse_in_flight(state: &AppState, dcfg: &DispatcherConfig, now: Instant) 
 fn update_circuit_mute(state: &AppState, dcfg: &DispatcherConfig, now: Instant) -> bool {
     let plug_stale_s = dcfg.plug_stale_s;
     let grid_stale_s = dcfg.grid_stale_s;
-    let silence = Duration::from_secs_f64(dcfg.group_silent_after_stale_s);
+    // The post-stale cooldown is a pulse-mode quirk: in pulse mode the
+    // Marstek's internal CT integrator needs ~60 s without input to
+    // clear, otherwise the first post-recovery pulse stacks on top of
+    // whatever the integrator had accumulated. In modbus mode we're in
+    // force_mode (not following CT at all), so there's no integrator
+    // to clear — recovery is immediate, no cooldown needed.
+    let silence = match dcfg.mode {
+        DispatchMode::Pulse => Duration::from_secs_f64(dcfg.group_silent_after_stale_s),
+        DispatchMode::Modbus => Duration::ZERO,
+    };
 
     let grid_fresh = match state.snapshot.load_full().age {
         Some(t) => now.duration_since(t).as_secs_f64() <= grid_stale_s,
@@ -737,6 +746,10 @@ fn update_circuit_mute(state: &AppState, dcfg: &DispatcherConfig, now: Instant) 
         });
         let needs_silence = any_plug_stale || !grid_fresh;
         if needs_silence {
+            // Stale path: in pulse mode set the long cooldown so the
+            // Marstek integrators clear; in modbus mode just mute the
+            // current cycle (silence = 0 → silent_until = now means
+            // "muted now, but the next fresh cycle resumes immediately").
             let target = now + silence;
             cs.silent_until = match cs.silent_until {
                 Some(prev) if prev > target => Some(prev),
