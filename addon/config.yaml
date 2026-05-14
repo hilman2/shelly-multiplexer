@@ -1,13 +1,13 @@
 ---
 name: Shelly Multiplexer
-version: "0.7.3"
+version: "0.8.0"
 slug: shelly_multiplexer
 description: >-
-  Pulse-based dispatcher: emulates a Shelly Pro 3EM and steers multiple
-  battery storages (Marstek Venus E) via per-poll delta pulses. Each
-  battery REQUIRES a Shelly Plug PM Gen3 for safety-critical cap
-  enforcement. Status UI shows live plug power, pulse queue and per-
-  battery operational state (taper, at-limit, SoC-gated, silent).
+  Modbus-TCP dispatcher: writes absolute power setpoints to multiple
+  Marstek Venus batteries every cycle (sequential per circuit, rate-
+  limited to smooth ramps). Each battery REQUIRES a Shelly Plug PM
+  Gen3 for safety-critical cap enforcement. Pulse-mode Shelly-Pro-3EM
+  CT emulation kept as a legacy path for installs without RS485.
 arch:
   - amd64
   - aarch64

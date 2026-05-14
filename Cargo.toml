@@ -1,9 +1,9 @@
 [package]
 name = "shelly-multiplexer"
-version = "0.7.3"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.87"
-description = "Pulse-based dispatcher emulating a Shelly Pro 3EM that steers multiple Marstek Venus E batteries with per-battery Shelly Plug PM Gen3 feedback"
+description = "Modbus-TCP dispatcher steering multiple Marstek Venus batteries with per-battery Shelly Plug PM Gen3 feedback (pulse-mode CT emulation kept as legacy path)"
 license = "Apache-2.0"
 
 [dependencies]

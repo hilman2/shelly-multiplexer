@@ -177,7 +177,7 @@ function renderBatteriesStatus(batteries) {
       }
       // Annotation pills — additive, can stack with the dominant pill.
       if (b.active === false) {
-        pills.push('<span class="state info" title="no SoC source configured. The dispatcher uses empirical full/empty detection: a refused directional pulse locks that direction for soc_unknown_lockout_s. Configure modbus_host (or soc_entity_id in HA mode) for direct SoC gating.">no SoC</span>');
+        pills.push('<span class="state info" title="no SoC source configured. In pulse mode the dispatcher falls back to empirical full/empty detection. Configure modbus_host (or soc_entity_id in HA mode) for direct SoC gating.">no SoC</span>');
       }
       if (b.charge_locked_for_ms != null) {
         pills.push(`<span class="state warn" title="charge direction locked for ${fmtMs(b.charge_locked_for_ms)} — empirical refusal detection thinks the battery is full. Discharge stays available.">charge locked (full?)</span>`);

@@ -37,7 +37,7 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     let cfg0 = config.load_full();
     let interval_ms = cfg0.dispatcher.cycle_ms.max(100);
     let timeout_ms = cfg0.real_shelly.request_timeout_ms.clamp(200, 800);
-    let stable_w = cfg0.dispatcher.plug_stable_w;
+    let stable_w = crate::config::PLUG_STABLE_W;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()

@@ -28,12 +28,6 @@ use crate::rpc::EmStatusIncoming;
 pub struct EmSnapshot {
     pub status: EmStatusIncoming,
     pub age: Option<Instant>,
-    /// EMA-smoothed total grid power (W). Updated by `real_shelly` on
-    /// every successful poll using `dispatcher.grid_smoothing_s` as the
-    /// time constant. The dispatcher reads THIS field rather than the
-    /// raw `status.total_act_power` so sub-second PV-inverter PWM
-    /// ripple doesn't trigger setpoint changes.
-    pub smoothed_grid_w: Option<f64>,
 }
 
 /// Sign convention everywhere in this app:
@@ -135,11 +129,11 @@ pub struct BatteryState {
     /// Most recently COMMANDED setpoint via Modbus (signed: + = discharge,
     /// − = charge, 0 = standby). None until the first successful write.
     /// Compared against the desired setpoint to decide whether the next
-    /// cycle should send a new write (skip if Δ < `setpoint_deadband_w`).
+    /// cycle should send a new write (skip if Δ < `dispatcher.deadband_w`).
     pub last_modbus_setpoint_w: Option<f64>,
-    /// Wall-clock of the last successful Modbus write. Used by the
-    /// heartbeat: if `modbus_heartbeat_s` elapsed since this, we re-write
-    /// the setpoint even when unchanged.
+    /// Wall-clock of the last successful Modbus write. Used by
+    /// `modbus_settled` to decide whether the plug has had time to
+    /// respond before the next write goes out.
     pub last_modbus_write_at: Option<Instant>,
     /// Last Modbus write error message (per-battery). Cleared by the
     /// next successful write. Surfaced in /api/status so the user can

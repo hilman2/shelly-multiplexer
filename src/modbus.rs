@@ -27,7 +27,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -59,34 +58,16 @@ const REG_FORCE_MODE: u16 = 42010;
 const REG_CHARGE_POWER_SETPOINT: u16 = 42020;
 const REG_DISCHARGE_POWER_SETPOINT: u16 = 42021;
 
-// Modbus timings are set once at process startup via `init_timings`
-// (called from `pub async fn run`). Stored as atomics because every
-// modbus helper reads them on every call, and tokio tasks across
-// many threads need to see the latest value — this is simpler than
-// threading a config struct through every read / write helper, and
-// the values don't change after startup anyway.
-static CONNECT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
-static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5_000);
-static WRITE_RETRIES: AtomicU32 = AtomicU32::new(2);
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 fn connect_timeout() -> Duration {
-    Duration::from_millis(CONNECT_TIMEOUT_MS.load(Ordering::Relaxed))
+    Duration::from_millis(crate::config::MODBUS_CONNECT_TIMEOUT_MS)
 }
 fn request_timeout() -> Duration {
-    Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::Relaxed))
+    Duration::from_millis(crate::config::MODBUS_REQUEST_TIMEOUT_MS)
 }
 fn write_retries() -> u32 {
-    WRITE_RETRIES.load(Ordering::Relaxed)
-}
-
-/// Apply dispatcher.modbus_* timeout / retry knobs to the module-
-/// level atomics. Called once at startup; safe to call again on
-/// config hot-swap (the atomics are read on every modbus operation).
-pub fn init_timings(cfg: &Config) {
-    CONNECT_TIMEOUT_MS.store(cfg.dispatcher.modbus_connect_timeout_ms, Ordering::Relaxed);
-    REQUEST_TIMEOUT_MS.store(cfg.dispatcher.modbus_request_timeout_ms, Ordering::Relaxed);
-    WRITE_RETRIES.store(cfg.dispatcher.modbus_write_retries, Ordering::Relaxed);
+    crate::config::MODBUS_WRITE_RETRIES
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +350,7 @@ impl Setpoint {
 }
 
 /// Push a single setpoint to a battery, retrying up to
-/// `dispatcher.modbus_write_retries` times on transient failures.
+/// `MODBUS_WRITE_RETRIES` times on transient failures.
 /// Each attempt opens a fresh TCP connection — connect timeouts and
 /// half-open sockets from a previous failed attempt don't leak into
 /// the retry.
@@ -623,19 +604,19 @@ async fn write_reg(
 // Per-battery writer task — owns the Modbus write side for one battery.
 // ---------------------------------------------------------------------------
 //
-// The dispatcher tick runs every cycle_ms (default 200 ms) but each
+// The dispatcher tick runs every `cycle_ms` (default 2 s) but each
 // Modbus write costs an RTT through the RS485-to-LAN bridge (~50-200 ms),
 // so the writes can't share the dispatcher's loop. Solution: one
 // `BatteryWriter` task per battery, fed by a `watch` channel from the
 // dispatcher. The writer:
 //
 //   - receives the latest desired Setpoint on every change,
-//   - skips writes inside `setpoint_deadband_w`,
-//   - re-writes the current setpoint every `modbus_heartbeat_s` even
-//     when unchanged (recovers from any dropped writes + keeps the
-//     "I'm still alive" signal flowing — Marstek has no firmware
-//     watchdog so heartbeats are our only out-of-band liveness
-//     indicator),
+//   - skips writes inside `dispatcher.deadband_w`,
+//   - piggybacks SoC reads onto the same persistent connection on a
+//     `soc_interval_ms` cadence (the only periodic action — there is
+//     no heartbeat: the dispatcher itself re-issues setpoints on every
+//     cycle when the rate-limit pulls the target toward the new
+//     plug-measured power),
 //   - on receiving a `Shutdown` command, attempts a failsafe write
 //     (force_mode = 0, RS485 control off) and exits.
 
@@ -661,11 +642,7 @@ impl ModbusDispatch {
     /// Returns the handle the dispatcher uses to push setpoints.
     pub fn spawn(state: Arc<AppState>, cfg: &Config) -> Self {
         let mut batteries = HashMap::new();
-        let heartbeat = Duration::from_secs_f64(cfg.dispatcher.modbus_heartbeat_s.max(1.0));
-        let min_write_interval = Duration::from_secs_f64(
-            cfg.dispatcher.modbus_min_write_interval_s.max(0.0),
-        );
-        let deadband_w = cfg.dispatcher.setpoint_deadband_w;
+        let deadband_w = cfg.dispatcher.deadband_w;
         for b in &cfg.batteries {
             if b.modbus_host.is_none() {
                 warn!(
@@ -681,8 +658,6 @@ impl ModbusDispatch {
                 rx: sp_rx,
                 shutdown: shutdown_rx,
                 state: state.clone(),
-                heartbeat,
-                min_write_interval,
                 deadband_w,
                 last_written: None,
                 last_write_at: None,
@@ -786,20 +761,13 @@ struct BatteryWriter {
     rx: watch::Receiver<Setpoint>,
     shutdown: mpsc::Receiver<()>,
     state: Arc<AppState>,
-    heartbeat: Duration,
-    /// Hard minimum interval between successive Modbus writes for this
-    /// battery. Even if `should_write` says yes, we wait at least this
-    /// long after the previous successful write. Lets the Marstek
-    /// actually ramp toward the new setpoint before we change it again.
-    min_write_interval: Duration,
     deadband_w: f64,
     last_written: Option<Setpoint>,
     last_write_at: Option<Instant>,
     /// Upper bound on how often we re-read SoC (and battery_power).
-    /// Piggybacked onto whatever connection we open anyway for setpoint
-    /// writes or heartbeats — no separate TCP socket. If `Some` and
-    /// `last_soc_read_at` is older than this, we tack a SoC read onto
-    /// the next operation.
+    /// Piggybacked onto the persistent connection we already use for
+    /// setpoint writes — no separate TCP socket. A standalone timer in
+    /// `run()` fires when no write happened in this window.
     soc_interval: Duration,
     last_soc_read_at: Option<Instant>,
 }
@@ -853,10 +821,13 @@ impl BatteryWriter {
         }
 
         loop {
-            let next_heartbeat = self
-                .last_write_at
-                .map(|t| (t + self.heartbeat).saturating_duration_since(Instant::now()))
-                .unwrap_or(self.heartbeat);
+            // Sleep until the next SoC read is due. Reset to soc_interval
+            // when we haven't read yet so the first SoC-only path fires
+            // soon after init even with no setpoint changes.
+            let soc_due_in = self
+                .last_soc_read_at
+                .map(|t| (t + self.soc_interval).saturating_duration_since(Instant::now()))
+                .unwrap_or(self.soc_interval);
             tokio::select! {
                 biased;
                 _ = self.shutdown.recv() => {
@@ -875,21 +846,20 @@ impl BatteryWriter {
                 changed = self.rx.changed() => {
                     if changed.is_err() { return; }
                     let desired = *self.rx.borrow();
-                    if self.should_write(desired) && self.throttle_ok() {
+                    if self.should_write(desired) {
                         let _ = self.do_write(&mut ctx, desired).await;
                     } else if self.soc_poll_due() {
-                        // Even when no write is needed, take the
-                        // opportunity to refresh SoC on the open
-                        // connection.
+                        // No write needed, but it's time to refresh SoC
+                        // on the open connection.
                         let _ = self.poll_soc_only(&mut ctx).await;
                     }
                 }
-                _ = time::sleep(next_heartbeat) => {
-                    let desired = *self.rx.borrow();
-                    // Heartbeat: re-issue the current setpoint AND
-                    // piggyback a SoC read if due (both happen on the
-                    // same persistent connection).
-                    let _ = self.do_write(&mut ctx, desired).await;
+                _ = time::sleep(soc_due_in) => {
+                    // No setpoint changes in the SoC window — refresh
+                    // SoC + battery_power so the dispatcher keeps a
+                    // current view of the battery without us having to
+                    // open a separate TCP socket.
+                    let _ = self.poll_soc_only(&mut ctx).await;
                 }
             }
         }
@@ -922,15 +892,6 @@ impl BatteryWriter {
         }
         let diff = (desired.to_signed_watts() - last.to_signed_watts()).abs();
         diff >= self.deadband_w
-    }
-
-    /// Throttle gate: refuse a write that arrives sooner than
-    /// `min_write_interval` after the previous one.
-    fn throttle_ok(&self) -> bool {
-        match self.last_write_at {
-            Some(t) => t.elapsed() >= self.min_write_interval,
-            None => true,
-        }
     }
 
     /// True iff it's time to refresh SoC. Drives the piggyback decision

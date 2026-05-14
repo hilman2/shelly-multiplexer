@@ -138,214 +138,106 @@ impl Default for DispatchMode {
     }
 }
 
+/// Dispatcher tuning — kept deliberately small (12 essentials). The
+/// rest of what used to be exposed is now hardcoded with sensible
+/// defaults; see `MODBUS_*`, `EMERGENCY_*`, `NIGHT_*` and the pulse-mode
+/// constants in `dispatcher.rs`. Stripping the surface area follows
+/// the principle of the upstream Python reference impl that worked
+/// well with ~4 control knobs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DispatcherConfig {
-    /// Which dispatch backend to use. Default `modbus` since v0.7 — the
-    /// pulse path is kept for legacy installs without Modbus access.
+    /// `modbus` (default): direct power setpoints. `pulse` (legacy):
+    /// Shelly-Pro-3EM CT emulation, for installs without per-battery
+    /// Modbus reach.
     #[serde(default)]
     pub mode: DispatchMode,
-    /// Recompute interval for desired_w + (pulse generation OR modbus
-    /// setpoint write). In modbus mode we re-evaluate every cycle but
-    /// only WRITE when the setpoint changes by more than
-    /// `setpoint_deadband_w` OR `modbus_heartbeat_s` has elapsed since
-    /// the last write — keeps Modbus traffic low while still serving
-    /// as an "I'm still alive" heartbeat for crash detection.
+
+    /// Tick rate (ms) — how often the dispatcher recomputes targets.
+    /// Marstek inverters take 1-3 s to ramp toward a setpoint, so
+    /// going much faster than 1 Hz just queues commands the inverter
+    /// can't act on. Default 2 s.
     #[serde(default = "default_cycle_ms")]
     pub cycle_ms: u64,
-    /// Δ below this is ignored — Marstek-quantisation noise. Also the
-    /// minimum pulse magnitude the dispatcher will issue.
+
+    /// Grid-imbalance noise floor (W). Imbalances smaller than this
+    /// are ignored — Marstek quantisation + plug measurement noise.
+    /// Default 50 W.
     #[serde(default = "default_deadband_w")]
     pub deadband_w: f64,
-    /// DEPRECATED since v0.4.4 — kept for config-file compatibility only.
-    /// The "pulse landed" criterion is now (a) any plug movement above
-    /// `plug_stable_w` proving Marstek reacted, then (b) plug stable for
-    /// `plug_stable_duration_s`. Old configs still load with this field set.
-    #[serde(default = "default_hit_tolerance_w")]
-    pub hit_tolerance_w: f64,
-    /// Plug-reading delta (W) below which two consecutive readings are
-    /// considered "the same" — i.e. the plug is not moving. The pulse-
-    /// settled check waits until no >stable_w deltas have arrived for
-    /// `plug_stable_duration_s` so the next pulse only fires once the
-    /// previous delta has FULLY landed (not just started landing).
-    #[serde(default = "default_plug_stable_w")]
-    pub plug_stable_w: f64,
-    /// How long the plug must stay within `plug_stable_w` (i.e. no
-    /// movement) before the dispatcher considers the previous pulse done
-    /// and queues the next one. Roughly: Marstek's typical reaction time
-    /// (~1-2 s) plus a debounce margin.
-    #[serde(default = "default_plug_stable_duration_s")]
-    pub plug_stable_duration_s: f64,
-    /// Pulses sent per delta change. Marstek needs ≥2; 3 = safety margin.
-    #[serde(default = "default_pulse_count")]
-    pub pulse_count: u32,
-    /// SoC at/above which charging is skipped for the battery.
-    #[serde(default = "default_soc_full")]
-    pub soc_full_pct: f64,
-    /// SoC at/below which discharging is skipped for the battery.
-    #[serde(default = "default_soc_empty")]
-    pub soc_empty_pct: f64,
-    /// Plug silent for this long → group goes safe.
-    #[serde(default = "default_plug_stale_s")]
-    pub plug_stale_s: f64,
-    /// Real-Shelly snapshot silent for this long → ALL circuits muted
-    /// (we can't trust grid_w any more). Symmetric to plug_stale_s for
-    /// the upstream measurement.
-    #[serde(default = "default_grid_stale_s")]
-    pub grid_stale_s: f64,
-    /// After a stale plug recovers, mute the group's CT signal for this
-    /// long (Marstek watchdog clears integrator) before resuming.
-    #[serde(default = "default_group_silent_s")]
-    pub group_silent_after_stale_s: f64,
-    /// Use only this fraction of the circuit cap (95 %) — jitter buffer.
-    #[serde(default = "default_circuit_headroom")]
-    pub circuit_headroom: f64,
-    /// Asymmetric grid target bias. The dispatcher never tries to bring
-    /// grid_w to 0 — it leaves a margin of `grid_bias_w` on the import
-    /// side when discharging (so an unmodelled load doesn't push us into
-    /// export) and on the export side when charging (so we don't
-    /// accidentally pay for a few watts of grid import while charging).
-    /// Set to 0 to dispatch to exact 0.
+
+    /// Asymmetric "never cross zero" margin (W). The dispatcher always
+    /// aims for grid_w = ±bias depending on direction — never zero.
+    /// Charging: leaves this much grid EXPORT unaddressed (never pulls
+    /// import). Discharging: leaves this much grid IMPORT unaddressed
+    /// (never pushes into export). 100 W is comfortable against
+    /// inverter ramp lag and noisy load profiles.
     #[serde(default = "default_grid_bias_w")]
     pub grid_bias_w: f64,
-    /// Time-based pulse-settle fallback: even if the plug reading hasn't
-    /// moved by `hit_tolerance_w` yet, after this many seconds the
-    /// dispatcher accepts the cycle as done and is free to queue the
-    /// next corrective pulse. Marstek typically reacts in 1-2 s; 5 s is
-    /// a safe upper bound that prevents lockups when a Marstek refuses.
+
+    /// Max change of a battery's setpoint per dispatcher cycle (W).
+    /// Smooths big steps into a ramp — going from 0 W to 2 kW takes
+    /// (2000 / rate_limit) cycles. Replaces the EMA grid smoother
+    /// + per-write throttle + heartbeat we used to expose: one knob,
+    /// applied at the algorithm level. Inspired by the Python ref
+    /// impl's "max 750 W/cycle" rate limit.
+    #[serde(default = "default_rate_limit_w")]
+    pub rate_limit_w_per_cycle: f64,
+
+    /// SoC at/above which charging is gated to 0 W. BMS-reported
+    /// cutoff (Modbus reg 44000) takes precedence when available.
+    #[serde(default = "default_soc_full")]
+    pub soc_full_pct: f64,
+
+    /// SoC at/below which discharging is gated to 0 W. BMS cutoff
+    /// (reg 44001) takes precedence.
+    #[serde(default = "default_soc_empty")]
+    pub soc_empty_pct: f64,
+
+    /// Fraction of the fuse cap that the dispatcher will actually
+    /// use. 0.95 = 5 % jitter buffer.
+    #[serde(default = "default_circuit_headroom")]
+    pub circuit_headroom: f64,
+
+    /// Plug silent this long → mute its circuit.
+    #[serde(default = "default_plug_stale_s")]
+    pub plug_stale_s: f64,
+
+    /// Real Shelly silent this long → mute every circuit.
+    #[serde(default = "default_grid_stale_s")]
+    pub grid_stale_s: f64,
+
+    /// Settle escape hatch (s): after a battery write, accept the
+    /// cycle as done after this long even without observable plug
+    /// movement. Bounds the wait if a Marstek refuses to react.
     #[serde(default = "default_settle_timeout_s")]
     pub settle_timeout_s: f64,
-    /// Empirical full/empty detection lockout duration. When a battery
-    /// refuses a directional pulse — significant delta queued, full
-    /// `settle_timeout_s` elapsed, plug never moved — the dispatcher
-    /// locks that DIRECTION for this many seconds and redistributes the
-    /// load to the other batteries. After the lockout expires the
-    /// direction is retried; a successful pulse clears the lockout
-    /// early. The OPPOSITE direction is never affected: a battery that
-    /// refuses charge (= full) keeps participating in discharge, and
-    /// vice versa.
-    ///
-    /// Primarily useful for installations without a SoC source (no
-    /// Modbus bridge, no HA sensor) — derived "full"/"empty" replaces
-    /// the SoC gate. With SoC available it acts as a backstop in case
-    /// the SoC reading is wrong or stale.
-    #[serde(default = "default_soc_unknown_lockout_s")]
-    pub soc_unknown_lockout_s: f64,
 
-    // ----- Modbus-dispatch specific tuning (mode = "modbus" only) -----
-
-    /// Don't write a new setpoint to Modbus unless the desired value
-    /// has shifted by at least this many watts from the last
-    /// successfully written value. Below the deadband we skip the
-    /// write (saves Modbus traffic over flaky RS485-to-LAN bridges).
-    /// Default 20 W matches typical Marstek quantisation noise.
-    #[serde(default = "default_setpoint_deadband_w")]
-    pub setpoint_deadband_w: f64,
-
-    /// Re-write the current setpoint to Modbus at least this often,
-    /// even if it hasn't changed. Two purposes: (a) recover from any
-    /// bridge that dropped a write, (b) serve as an "I'm still alive"
-    /// heartbeat — if our process dies, the Marstek doesn't auto-
-    /// revert (no firmware watchdog) and would otherwise stay on the
-    /// last setpoint forever. See also `modbus_watchdog_grace_s`.
-    #[serde(default = "default_modbus_heartbeat_s")]
-    pub modbus_heartbeat_s: f64,
-
-    /// Safety watchdog inside this process: if the main dispatcher
-    /// loop hasn't ticked for this many seconds, a background task
-    /// force-writes `force_mode = 0` to every battery and exits the
-    /// process. Catches hangs that the SIGTERM handler can't see
-    /// (e.g. tokio runtime deadlock). 0.0 disables the watchdog.
-    #[serde(default = "default_modbus_watchdog_grace_s")]
-    pub modbus_watchdog_grace_s: f64,
-
-    // ----- Emergency plug cutoff (hard safety relay) -----
-
-    /// When the SIGNED plug-power sum on a circuit exceeds the
-    /// effective cap (= fuse_amps × voltage × phases × circuit_headroom)
-    /// by MORE than this many watts, the dispatcher considers the
-    /// circuit to be in physical danger. The condition has to persist
-    /// for `emergency_cutoff_grace_s` seconds before the worst
-    /// offending plug is cut. 0 W disables the entire feature.
-    /// Default 200 W — accounts for measurement jitter while still
-    /// catching real overloads quickly.
+    /// Hardware safety: when the SIGNED plug-power sum on a circuit
+    /// exceeds `cap × headroom + this`, the dispatcher physically
+    /// opens the worst offender's Shelly Plug PM Gen3 relay. 0
+    /// disables. Grace + recovery are hardcoded at 5 s / 600 s.
     #[serde(default = "default_emergency_cutoff_margin_w")]
     pub emergency_cutoff_margin_w: f64,
 
-    /// Sustained-overload time (in seconds) before the emergency
-    /// cutoff fires. Default 5 s: long enough that brief startup
-    /// transients (large appliances kicking in) don't trip the relay,
-    /// short enough that genuine cable / fuse stress is bounded.
-    #[serde(default = "default_emergency_cutoff_grace_s")]
-    pub emergency_cutoff_grace_s: f64,
-
-    /// How long the plug stays off after an emergency cutoff before
-    /// the dispatcher attempts to re-enable it. Default 600 s.
-    /// Re-enable is automatic after the recovery window; a manual
-    /// reset via the admin API is also available.
-    #[serde(default = "default_emergency_cutoff_recovery_s")]
-    pub emergency_cutoff_recovery_s: f64,
-
-    // ----- Smoothing & pacing -----
-
-    /// Exponential-moving-average time constant (seconds) applied to the
-    /// raw grid_w reading before the dispatcher uses it. Filters out
-    /// sub-second PV-inverter PWM ripple (often ±2 kW @ 4 Hz) so the
-    /// dispatcher tracks meaningful load changes rather than noise.
-    /// Default 5.0 s. Set to 0 to disable smoothing.
-    #[serde(default = "default_grid_smoothing_s")]
-    pub grid_smoothing_s: f64,
-
-    /// Per-battery minimum interval (seconds) between consecutive Modbus
-    /// setpoint writes. Hard throttle on top of `setpoint_deadband_w` —
-    /// even if the dispatcher thinks the setpoint changed enough to
-    /// warrant a write, the writer task will refuse to fire faster than
-    /// this. Gives each Marstek time to actually ramp toward the new
-    /// setpoint before we change it again. Default 10 s.
-    #[serde(default = "default_modbus_min_write_interval_s")]
-    pub modbus_min_write_interval_s: f64,
-
-    /// Modbus TCP connect timeout (ms). Venus E V3 (direct-Ethernet
-    /// Modbus, no bridge) is noticeably slower to accept connections
-    /// than Venus E v1/v2 behind an Elfin/Waveshare bridge — the
-    /// bridge has its own TCP stack and ack's instantly, while V3
-    /// goes straight to the inverter's own Modbus server. Default
-    /// 10000 ms is safe for both.
-    #[serde(default = "default_modbus_connect_timeout_ms")]
-    pub modbus_connect_timeout_ms: u64,
-
-    /// Modbus TCP request (read / write) timeout (ms). Same reasoning
-    /// as the connect timeout — V3 batteries can take noticeably
-    /// longer to respond. Default 5000 ms.
-    #[serde(default = "default_modbus_request_timeout_ms")]
-    pub modbus_request_timeout_ms: u64,
-
-    /// Per-write retry budget. If the full setpoint sequence fails
-    /// partway through (connect timeout, exception code, etc.), the
-    /// writer task closes the connection, sleeps briefly, then
-    /// retries up to this many times. Set to 0 to disable retries.
-    /// Default 2.
-    #[serde(default = "default_modbus_write_retries")]
-    pub modbus_write_retries: u32,
-
-    // ----- Night cutoff (efficiency) -----
-
-    /// Disconnect a battery's plug between sunset and sunrise if its
-    /// SoC is at the empty cutoff. The Marstek's inverter standby
-    /// loss (~5-15 W per unit) over a winter night is non-trivial.
-    /// Requires `[location].latitude` and `longitude` to be set —
-    /// without them the feature stays inactive with a startup warning.
-    /// Default `false` (opt-in).
+    /// Optional efficiency feature: between sunset and sunrise,
+    /// disconnect empty batteries to skip the Marstek inverter's
+    /// ~5-15 W standby loss. Requires `[location]` lat/lon.
     #[serde(default)]
     pub night_cutoff_enabled: bool,
-
-    /// SoC margin above `effective_soc_empty_pct` at which a battery
-    /// still counts as "empty" for night-cutoff purposes. Acts as
-    /// hysteresis: a battery has to hover within this margin of empty
-    /// before the cutoff fires, and rise more than this margin above
-    /// empty before recovery re-enables the plug. Default 2 %.
-    #[serde(default = "default_night_cutoff_soc_margin_pct")]
-    pub night_cutoff_soc_margin_pct: f64,
 }
+
+// -------- removed knobs (still ignored on TOML load via serde default) --
+// hit_tolerance_w, plug_stable_w, plug_stable_duration_s, pulse_count,
+// group_silent_after_stale_s, soc_unknown_lockout_s, setpoint_deadband_w,
+// modbus_heartbeat_s, modbus_watchdog_grace_s, modbus_connect_timeout_ms,
+// modbus_request_timeout_ms, modbus_write_retries, grid_smoothing_s,
+// modbus_min_write_interval_s, emergency_cutoff_grace_s,
+// emergency_cutoff_recovery_s, night_cutoff_soc_margin_pct
+//
+// These are now compile-time constants. See `dispatcher.rs` and
+// `modbus.rs` for the values. v0.8 simplification — was 25+ knobs
+// in v0.7, now 13.
+
 
 impl Default for DispatcherConfig {
     fn default() -> Self {
@@ -353,64 +245,34 @@ impl Default for DispatcherConfig {
             mode: DispatchMode::default(),
             cycle_ms: default_cycle_ms(),
             deadband_w: default_deadband_w(),
-            hit_tolerance_w: default_hit_tolerance_w(),
-            plug_stable_w: default_plug_stable_w(),
-            plug_stable_duration_s: default_plug_stable_duration_s(),
-            pulse_count: default_pulse_count(),
+            grid_bias_w: default_grid_bias_w(),
+            rate_limit_w_per_cycle: default_rate_limit_w(),
             soc_full_pct: default_soc_full(),
             soc_empty_pct: default_soc_empty(),
+            circuit_headroom: default_circuit_headroom(),
             plug_stale_s: default_plug_stale_s(),
             grid_stale_s: default_grid_stale_s(),
-            group_silent_after_stale_s: default_group_silent_s(),
-            circuit_headroom: default_circuit_headroom(),
-            grid_bias_w: default_grid_bias_w(),
             settle_timeout_s: default_settle_timeout_s(),
-            soc_unknown_lockout_s: default_soc_unknown_lockout_s(),
-            setpoint_deadband_w: default_setpoint_deadband_w(),
-            modbus_heartbeat_s: default_modbus_heartbeat_s(),
-            modbus_watchdog_grace_s: default_modbus_watchdog_grace_s(),
             emergency_cutoff_margin_w: default_emergency_cutoff_margin_w(),
-            emergency_cutoff_grace_s: default_emergency_cutoff_grace_s(),
-            emergency_cutoff_recovery_s: default_emergency_cutoff_recovery_s(),
             night_cutoff_enabled: false,
-            night_cutoff_soc_margin_pct: default_night_cutoff_soc_margin_pct(),
-            grid_smoothing_s: default_grid_smoothing_s(),
-            modbus_min_write_interval_s: default_modbus_min_write_interval_s(),
-            modbus_connect_timeout_ms: default_modbus_connect_timeout_ms(),
-            modbus_request_timeout_ms: default_modbus_request_timeout_ms(),
-            modbus_write_retries: default_modbus_write_retries(),
         }
     }
 }
 
 fn default_cycle_ms() -> u64 {
-    // 500 ms. Fast enough to track real grid swings on noisy load
-    // profiles (heater PWM, induction cooktops, cloud-driven PV), slow
-    // enough that we don't queue commands the Marstek can't act on
-    // (it takes 1-3 s to ramp). The modbus_min_write_interval throttle
-    // and setpoint deadband still keep the actual write rate bounded.
-    500
+    2000
 }
 fn default_deadband_w() -> f64 {
-    // 50 W. Below this we treat the grid as "balanced enough". Larger
-    // than v0.7.0 (30 W) because raw grid_w noise often clears 30 W
-    // even on a quiet grid.
     50.0
 }
-fn default_hit_tolerance_w() -> f64 {
-    15.0
+fn default_grid_bias_w() -> f64 {
+    100.0
 }
-fn default_plug_stable_w() -> f64 {
-    10.0
-}
-fn default_plug_stable_duration_s() -> f64 {
-    // 3 s. Marstek inverters can take ~2 s to ramp from one setpoint
-    // to the next; we want the plug to be visibly steady before we
-    // conclude the previous command has landed.
-    3.0
-}
-fn default_pulse_count() -> u32 {
-    3
+fn default_rate_limit_w() -> f64 {
+    // 500 W per cycle. With cycle_ms = 2 s, that's 250 W/s ramp —
+    // going 0 → 2.5 kW takes 5 cycles (10 s). Smooth + matches the
+    // upstream Python ref impl's "max 750 W/cycle" approach.
+    500.0
 }
 fn default_soc_full() -> f64 {
     95.0
@@ -418,77 +280,58 @@ fn default_soc_full() -> f64 {
 fn default_soc_empty() -> f64 {
     5.0
 }
+fn default_circuit_headroom() -> f64 {
+    0.95
+}
 fn default_plug_stale_s() -> f64 {
-    2.0
+    5.0
 }
 fn default_grid_stale_s() -> f64 {
     5.0
 }
-fn default_group_silent_s() -> f64 {
-    60.0
-}
-fn default_circuit_headroom() -> f64 {
-    0.95
-}
-fn default_grid_bias_w() -> f64 {
-    30.0
-}
 fn default_settle_timeout_s() -> f64 {
-    // 10 s. Marstek ramp time + a safety margin. Lower values lead to
-    // the dispatcher giving up before the inverter has actually
-    // committed to the new setpoint.
     10.0
-}
-fn default_soc_unknown_lockout_s() -> f64 {
-    600.0
-}
-fn default_setpoint_deadband_w() -> f64 {
-    // 100 W. Anything smaller is below Marstek quantisation + plug
-    // measurement noise. Writing for sub-100 W deltas just generates
-    // churn on the bus without changing real-world behaviour.
-    100.0
-}
-fn default_modbus_heartbeat_s() -> f64 {
-    // 30 s. We re-arm RS485 control mode (42000=21930) on every
-    // setpoint write anyway, so the heartbeat just covers "dropped
-    // last write" recovery + acts as our process-liveness signal.
-    // 30 s is fast enough that a dead controller would be detected
-    // well before any real damage.
-    30.0
-}
-fn default_modbus_watchdog_grace_s() -> f64 {
-    30.0
 }
 fn default_emergency_cutoff_margin_w() -> f64 {
     200.0
 }
-fn default_emergency_cutoff_grace_s() -> f64 {
-    5.0
-}
-fn default_emergency_cutoff_recovery_s() -> f64 {
-    600.0
-}
-fn default_night_cutoff_soc_margin_pct() -> f64 {
-    2.0
-}
-fn default_grid_smoothing_s() -> f64 {
-    5.0
-}
-fn default_modbus_min_write_interval_s() -> f64 {
-    // 5 s. Bound on max write rate per battery. Pairs with the
-    // setpoint deadband to keep the bus uncongested without
-    // sacrificing responsiveness to real load changes.
-    5.0
-}
-fn default_modbus_connect_timeout_ms() -> u64 {
-    10_000
-}
-fn default_modbus_request_timeout_ms() -> u64 {
-    5_000
-}
-fn default_modbus_write_retries() -> u32 {
-    2
-}
+
+// ---------------------------------------------------------------------------
+// Hardcoded constants that used to be config knobs (v0.7 had ~25, v0.8 → 13).
+// Exposed as `pub const` so dispatcher / modbus / writers can reference them
+// without each module copy-pasting the value.
+// ---------------------------------------------------------------------------
+
+/// Identical CT samples per delta in pulse mode. Marstek commits after
+/// 2 polls; 3 is a safety margin.
+pub const PULSE_COUNT: u32 = 3;
+/// Plug-movement threshold for "is the plug stable?" (pulse mode).
+pub const PLUG_STABLE_W: f64 = 10.0;
+/// Plug must be within `PLUG_STABLE_W` for this long before pulse-settled.
+pub const PLUG_STABLE_DURATION_S: f64 = 3.0;
+/// Post-stale circuit silence in pulse mode (lets the Marstek CT
+/// integrator clear). Modbus mode uses 0 (force_mode bypasses CT).
+pub const GROUP_SILENT_AFTER_STALE_S: f64 = 60.0;
+/// Pulse-mode empirical refusal lockout duration.
+pub const SOC_UNKNOWN_LOCKOUT_S: f64 = 600.0;
+
+/// Modbus connect TCP timeout (ms). V3 talks directly to the inverter
+/// and is noticeably slower than v1/v2 behind an Elfin/Waveshare bridge.
+pub const MODBUS_CONNECT_TIMEOUT_MS: u64 = 10_000;
+/// Per-register Modbus request timeout (ms).
+pub const MODBUS_REQUEST_TIMEOUT_MS: u64 = 5_000;
+/// Per-write retry budget on transient Modbus failures (200 ms × attempt).
+pub const MODBUS_WRITE_RETRIES: u32 = 2;
+
+/// Sustained-overload grace before the emergency plug relay opens.
+pub const EMERGENCY_CUTOFF_GRACE_S: f64 = 5.0;
+/// Auto-recovery window after an emergency cutoff. Manual reset is
+/// always available via the admin API.
+pub const EMERGENCY_CUTOFF_RECOVERY_S: f64 = 600.0;
+
+/// Hysteresis above effective empty SoC for the night cutoff to fire
+/// (and below + margin to recover).
+pub const NIGHT_CUTOFF_SOC_MARGIN_PCT: f64 = 2.0;
 
 // ---------------------------------------------------------------------------
 // Optional Home Assistant SoC source (no plug equivalent for SoC yet)
@@ -991,29 +834,14 @@ impl Config {
         if self.dispatcher.deadband_w < 0.0 {
             anyhow::bail!("dispatcher.deadband_w must not be negative");
         }
-        if self.dispatcher.pulse_count < 2 {
-            anyhow::bail!(
-                "dispatcher.pulse_count must be ≥ 2 (Marstek requires at least 2 polls to commit)"
-            );
-        }
         if !(0.0..=1.0).contains(&self.dispatcher.circuit_headroom) {
             anyhow::bail!("dispatcher.circuit_headroom must be in [0, 1]");
         }
         if self.dispatcher.grid_bias_w < 0.0 {
             anyhow::bail!("dispatcher.grid_bias_w must not be negative");
         }
-        // Validation philosophy: only reject configurations that are
-        // mathematically meaningless (negative durations, ranges with
-        // empty interiors). "Suboptimal but functional" is left alone —
-        // existing user configs from older versions must keep loading.
-        if self.dispatcher.hit_tolerance_w < 0.0 {
-            anyhow::bail!("dispatcher.hit_tolerance_w must not be negative");
-        }
-        if self.dispatcher.plug_stable_w < 0.0 {
-            anyhow::bail!("dispatcher.plug_stable_w must not be negative");
-        }
-        if self.dispatcher.plug_stable_duration_s < 0.0 {
-            anyhow::bail!("dispatcher.plug_stable_duration_s must not be negative");
+        if self.dispatcher.rate_limit_w_per_cycle <= 0.0 {
+            anyhow::bail!("dispatcher.rate_limit_w_per_cycle must be > 0");
         }
         if self.dispatcher.plug_stale_s < 0.0 {
             anyhow::bail!("dispatcher.plug_stale_s must not be negative");
@@ -1021,47 +849,11 @@ impl Config {
         if self.dispatcher.grid_stale_s < 0.0 {
             anyhow::bail!("dispatcher.grid_stale_s must not be negative");
         }
-        if self.dispatcher.group_silent_after_stale_s < 0.0 {
-            anyhow::bail!("dispatcher.group_silent_after_stale_s must not be negative");
-        }
         if self.dispatcher.settle_timeout_s < 0.0 {
             anyhow::bail!("dispatcher.settle_timeout_s must not be negative");
         }
-        if self.dispatcher.soc_unknown_lockout_s < 0.0 {
-            anyhow::bail!("dispatcher.soc_unknown_lockout_s must not be negative");
-        }
-        if self.dispatcher.setpoint_deadband_w < 0.0 {
-            anyhow::bail!("dispatcher.setpoint_deadband_w must not be negative");
-        }
-        if self.dispatcher.modbus_heartbeat_s < 0.0 {
-            anyhow::bail!("dispatcher.modbus_heartbeat_s must not be negative");
-        }
-        if self.dispatcher.modbus_watchdog_grace_s < 0.0 {
-            anyhow::bail!("dispatcher.modbus_watchdog_grace_s must not be negative");
-        }
         if self.dispatcher.emergency_cutoff_margin_w < 0.0 {
             anyhow::bail!("dispatcher.emergency_cutoff_margin_w must not be negative");
-        }
-        if self.dispatcher.emergency_cutoff_grace_s < 0.0 {
-            anyhow::bail!("dispatcher.emergency_cutoff_grace_s must not be negative");
-        }
-        if self.dispatcher.emergency_cutoff_recovery_s < 0.0 {
-            anyhow::bail!("dispatcher.emergency_cutoff_recovery_s must not be negative");
-        }
-        if self.dispatcher.grid_smoothing_s < 0.0 {
-            anyhow::bail!("dispatcher.grid_smoothing_s must not be negative");
-        }
-        if self.dispatcher.modbus_min_write_interval_s < 0.0 {
-            anyhow::bail!("dispatcher.modbus_min_write_interval_s must not be negative");
-        }
-        if self.dispatcher.modbus_connect_timeout_ms == 0 {
-            anyhow::bail!("dispatcher.modbus_connect_timeout_ms must be > 0");
-        }
-        if self.dispatcher.modbus_request_timeout_ms == 0 {
-            anyhow::bail!("dispatcher.modbus_request_timeout_ms must be > 0");
-        }
-        if self.dispatcher.night_cutoff_soc_margin_pct < 0.0 {
-            anyhow::bail!("dispatcher.night_cutoff_soc_margin_pct must not be negative");
         }
         if self.dispatcher.night_cutoff_enabled {
             match (self.location.latitude, self.location.longitude) {
