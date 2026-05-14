@@ -1205,6 +1205,85 @@ fn compute_targets(
         active.retain(|b| !clamped_ids.contains(&b.id));
     }
 
+    // Per-circuit MIN_W consolidation. Splitting a small circuit total
+    // (say 80 W across two batteries → 40 W each) makes every share
+    // fall under the Marstek firmware floor, so each `Setpoint::from_
+    // signed_watts` collapses to Standby and nothing happens. This
+    // pass detects the case and concentrates the entire circuit target
+    // onto ONE battery (the one with the highest dispatch-direction
+    // weight) so the command actually fires.
+    //
+    // Triggered only when:
+    //   * |Σ targets on circuit| ≥ MARSTEK_MIN_W  (meaningful command),
+    //   * every individual target on the circuit has |t| < MARSTEK_MIN_W
+    //     (i.e. nobody would dispatch on their own).
+    //
+    // The chosen battery's target is clamped to its [low_bound,
+    // high_bound] so the consolidation can't violate SoC gates or
+    // hardware caps. If clamping leaves residual the dispatcher will
+    // pick it up next cycle on a sibling.
+    for cs in circuits.values() {
+        let member_ids = &cs.member_ids;
+        let target_sum: f64 = member_ids
+            .iter()
+            .filter_map(|id| targets.get(id).copied())
+            .sum();
+        if target_sum.abs() < crate::modbus::MARSTEK_MIN_W {
+            continue;
+        }
+        let any_dispatches = member_ids
+            .iter()
+            .filter_map(|id| targets.get(id).copied())
+            .any(|t| t.abs() >= crate::modbus::MARSTEK_MIN_W);
+        if any_dispatches {
+            continue;
+        }
+        // All individual targets are sub-MIN_W. Concentrate.
+        let dir = target_sum.signum();
+        let primary = member_ids
+            .iter()
+            .filter_map(|id| bats.get(id))
+            .filter(|b| b.last_plug_w.is_some())
+            .filter(|b| {
+                // Only consider batteries with headroom in the active
+                // direction — a charge-locked battery can't absorb a
+                // negative target.
+                if dir < 0.0 {
+                    low_bound(b, dcfg, now) < 0.0
+                } else {
+                    high_bound(b, dcfg, now) > 0.0
+                }
+            })
+            .max_by(|a, b| {
+                // Prefer the battery with the largest absolute existing
+                // target in the active direction (= most "wanting" to
+                // dispatch already); fall back to priority weight.
+                let av = targets.get(&a.id).copied().unwrap_or(0.0).abs();
+                let bv = targets.get(&b.id).copied().unwrap_or(0.0).abs();
+                av.partial_cmp(&bv)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.priority_weight.partial_cmp(&b.priority_weight).unwrap_or(std::cmp::Ordering::Equal))
+            });
+        if let Some(p) = primary {
+            let lo = low_bound(p, dcfg, now);
+            let hi = high_bound(p, dcfg, now);
+            let concentrated = target_sum.clamp(lo, hi);
+            for id in member_ids {
+                if *id == p.id {
+                    targets.insert(id.clone(), concentrated);
+                } else {
+                    targets.insert(id.clone(), 0.0);
+                }
+            }
+            debug!(
+                circuit = %cs.config.id,
+                primary = %p.id,
+                concentrated_w = concentrated,
+                "MIN_W consolidation engaged"
+            );
+        }
+    }
+
     // Per-battery rate limit: clamp each target's distance from the
     // CURRENT plug-measured power to ±rate_limit_w_per_cycle. Smooths
     // big swings into ramps — going 0 W → 2.5 kW takes
@@ -1406,6 +1485,78 @@ mod tests {
         // raw = -90 + 100 = 10. |10| < deadband 50 → 0.
         let corr = compute_grid_correction(-90.0, -1000.0, &cfg);
         assert_eq!(corr, 0.0);
+    }
+
+    /// Regression test for the v0.8.1 "persistent low-watt import while
+    /// both batteries STANDBY" bug. With 2 batteries at plug≈0 and a
+    /// grid import of +182 W (bias=100 → correction +82, target/battery
+    /// = +41), the naïve equal split puts every battery's setpoint
+    /// below MARSTEK_MIN_W = 50 → `Setpoint::from_signed_watts` rounds
+    /// each to Standby and nothing fires. The consolidation pass must
+    /// detect this and assign the entire ~82 W to ONE battery.
+    #[test]
+    fn compute_targets_consolidates_sub_min_w_split_onto_one_battery() {
+        let state = three_battery_state();
+        // Two-battery scenario: idle plugs, grid importing 180 W.
+        // (three_battery_state has 3 batteries, but the math is the
+        // same — split across 3 would be 27 W each, still sub-MIN_W.)
+        fresh_grid_snapshot(&state, 180.0);
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(0.0);
+                b.last_plug_at = Some(now);
+            }
+        }
+        let dcfg = dcfg();
+        let targets = compute_targets(&state, &dcfg, 180.0, now);
+
+        // Total discharge target ≈ 80 W (grid 180 - bias 100). After
+        // consolidation: ONE battery near 80, others at 0.
+        let nonzero: Vec<(&String, &f64)> =
+            targets.iter().filter(|(_, t)| t.abs() > 1e-3).collect();
+        assert_eq!(
+            nonzero.len(),
+            1,
+            "expected exactly one non-zero target after MIN_W consolidation, got {nonzero:?}"
+        );
+        let (id, t) = nonzero[0];
+        assert!(
+            *t >= crate::modbus::MARSTEK_MIN_W,
+            "{id}: target {t} should be ≥ MARSTEK_MIN_W after consolidation"
+        );
+        assert!(
+            *t < 100.0,
+            "{id}: target {t} should be ≤ correction ~80, got way more"
+        );
+    }
+
+    /// Above the consolidation threshold the normal weighted split still
+    /// applies — we don't want to concentrate when each battery's share
+    /// is meaningful on its own.
+    #[test]
+    fn compute_targets_keeps_split_when_each_share_above_min_w() {
+        let state = three_battery_state();
+        fresh_grid_snapshot(&state, 1000.0);
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(0.0);
+                b.last_plug_at = Some(now);
+            }
+        }
+        let mut dcfg = dcfg();
+        dcfg.rate_limit_w_per_cycle = 9999.0;
+        let targets = compute_targets(&state, &dcfg, 1000.0, now);
+        // 1000 - bias 100 = 900 W total, 3 batteries → ~300 each. All
+        // above MIN_W → normal split, no consolidation.
+        let nonzero_count = targets.values().filter(|t| t.abs() > 1e-3).count();
+        assert_eq!(
+            nonzero_count, 3,
+            "expected all 3 batteries to share when each share is above MIN_W"
+        );
     }
 
     /// Idle case (plug sum near zero): classic asymmetric bias picks
