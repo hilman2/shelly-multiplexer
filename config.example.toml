@@ -44,11 +44,12 @@ bind_address = "0.0.0.0:8080"
 # to each Marstek (registers 42010/42020/42021). "pulse" keeps the
 # legacy Shelly-3EM-emulation path for non-Modbus setups.
 mode = "modbus"
-# Recompute interval for desired_w + setpoint generation. 1 s is a
-# pragmatic default: Marstek inverters take 1-3 s to ramp toward a
-# new setpoint, so a much faster cycle just queues writes the inverter
-# can't act on. Faster (e.g. 200 ms) is fine in pulse mode.
-cycle_ms = 1000
+# Recompute interval for desired_w + setpoint generation. 500 ms is
+# responsive enough for noisy load profiles (heater PWM, induction
+# cooktops, cloud-driven PV) without queueing commands faster than
+# the Marstek can act on. The min-write-interval throttle and the
+# setpoint deadband still bound the actual write rate.
+cycle_ms = 500
 # Δ below this is ignored (Marstek-quantisation noise) AND is the
 # minimum pulse magnitude we'll issue.
 deadband_w = 50
@@ -94,7 +95,7 @@ modbus_heartbeat_s = 30
 # per battery. Even if the dispatcher decides the setpoint changed
 # enough to warrant a write, the writer task refuses to fire faster
 # than this — gives each Marstek time to ramp toward the new setpoint.
-modbus_min_write_interval_s = 10
+modbus_min_write_interval_s = 5
 # Internal watchdog: if the dispatcher loop hangs for this long, a
 # background task force-writes force_mode=0 and exits. 0 disables.
 modbus_watchdog_grace_s = 30

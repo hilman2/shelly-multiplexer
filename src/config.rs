@@ -384,10 +384,12 @@ impl Default for DispatcherConfig {
 }
 
 fn default_cycle_ms() -> u64 {
-    // 1 s. Slower than the 200 ms used earlier because Marstek inverters
-    // need 1-3 s to ramp toward a new setpoint, and a 4 Hz dispatch
-    // cycle on top of that just generates write queue churn.
-    1000
+    // 500 ms. Fast enough to track real grid swings on noisy load
+    // profiles (heater PWM, induction cooktops, cloud-driven PV), slow
+    // enough that we don't queue commands the Marstek can't act on
+    // (it takes 1-3 s to ramp). The modbus_min_write_interval throttle
+    // and setpoint deadband still keep the actual write rate bounded.
+    500
 }
 fn default_deadband_w() -> f64 {
     // 50 W. Below this we treat the grid as "balanced enough". Larger
@@ -473,7 +475,10 @@ fn default_grid_smoothing_s() -> f64 {
     5.0
 }
 fn default_modbus_min_write_interval_s() -> f64 {
-    10.0
+    // 5 s. Bound on max write rate per battery. Pairs with the
+    // setpoint deadband to keep the bus uncongested without
+    // sacrificing responsiveness to real load changes.
+    5.0
 }
 fn default_modbus_connect_timeout_ms() -> u64 {
     10_000
