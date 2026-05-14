@@ -40,15 +40,18 @@ enable_mdns = true
 bind_address = "0.0.0.0:8080"
 
 [dispatcher]
-# Dispatch backend. "modbus" (v0.7+ default) writes power setpoints
-# directly to each Marstek (registers 42010/42020/42021). "pulse"
-# keeps the legacy Shelly-3EM-emulation path for non-Modbus setups.
+# Dispatch backend. "modbus" (default) writes power setpoints directly
+# to each Marstek (registers 42010/42020/42021). "pulse" keeps the
+# legacy Shelly-3EM-emulation path for non-Modbus setups.
 mode = "modbus"
-# Recompute interval for desired_w + pulse / setpoint generation
-cycle_ms = 200
-# Δ below this is ignored (Marstek-quantisation noise) AND is the minimum
-# pulse magnitude we'll issue.
-deadband_w = 30
+# Recompute interval for desired_w + setpoint generation. 1 s is a
+# pragmatic default: Marstek inverters take 1-3 s to ramp toward a
+# new setpoint, so a much faster cycle just queues writes the inverter
+# can't act on. Faster (e.g. 200 ms) is fine in pulse mode.
+cycle_ms = 1000
+# Δ below this is ignored (Marstek-quantisation noise) AND is the
+# minimum pulse magnitude we'll issue.
+deadband_w = 50
 # Plug-movement threshold that counts a previous pulse as "landed".
 # Must be ≤ deadband_w (every issued pulse moves the plug by at least this).
 hit_tolerance_w = 15
@@ -71,7 +74,7 @@ circuit_headroom = 0.95
 grid_bias_w = 30
 # Time-based pulse-settle fallback: if the plug hasn't moved by
 # hit_tolerance_w within this many seconds, accept and move on.
-settle_timeout_s = 5.0
+settle_timeout_s = 10.0
 # Empirical full/empty detection (PULSE MODE ONLY). When a battery
 # refuses a directional pulse (significant request, no plug movement
 # before settle_timeout_s elapses), that DIRECTION is locked for this
@@ -81,14 +84,24 @@ soc_unknown_lockout_s = 600
 
 # ---- Modbus-dispatch tuning (mode = "modbus") ----
 # Skip the Modbus write when the new setpoint is within this many W
-# of the last successful write. Reduces traffic on slow RS485 bridges.
-setpoint_deadband_w = 20
+# of the last successful write. Reduces traffic on slow RS485 bridges
+# and prevents chasing tiny grid wobble.
+setpoint_deadband_w = 100
 # Re-write the current setpoint at least this often (heartbeat — also
 # our process-liveness signal, Marstek firmware has no watchdog).
-modbus_heartbeat_s = 5
+modbus_heartbeat_s = 30
+# Hard minimum interval (seconds) between successive Modbus writes
+# per battery. Even if the dispatcher decides the setpoint changed
+# enough to warrant a write, the writer task refuses to fire faster
+# than this — gives each Marstek time to ramp toward the new setpoint.
+modbus_min_write_interval_s = 10
 # Internal watchdog: if the dispatcher loop hangs for this long, a
 # background task force-writes force_mode=0 and exits. 0 disables.
 modbus_watchdog_grace_s = 30
+# EMA smoothing on grid_w. PV inverters can swing the raw reading by
+# ±2 kW at 4 Hz; without smoothing we'd chase that noise. 5 s gives
+# a sensible tracking response without lagging real load changes.
+grid_smoothing_s = 5
 
 # ---- Emergency plug cutoff (safety) ----
 # Hard-disconnect a battery via its Shelly Plug PM Gen3 relay when the

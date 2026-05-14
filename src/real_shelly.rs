@@ -85,10 +85,39 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
                         state.energy.write().integrate(&status, dt);
                     }
                 }
+                // EMA smoothing on the grid power reading. Time constant
+                // comes from dispatcher.grid_smoothing_s (live-reloaded).
+                // PV inverter PWM ripple often swings the raw reading by
+                // ±2 kW at 4 Hz; without smoothing the dispatcher would
+                // chase that noise instead of the real load.
+                let smoothed_grid_w = {
+                    let prev_snap = state.snapshot.load_full();
+                    let raw = status.total_act_power;
+                    let tau = config.load_full().dispatcher.grid_smoothing_s.max(0.0);
+                    match (raw, prev_snap.smoothed_grid_w, last_success) {
+                        // First sample or tau=0 → no smoothing, pass through.
+                        (Some(r), None, _) => Some(r),
+                        (Some(r), _, _) if tau == 0.0 => Some(r),
+                        // Stale-prev: more than tau elapsed → reset to current.
+                        (Some(r), Some(_), Some(prev_t))
+                            if now.duration_since(prev_t).as_secs_f64() > tau * 4.0 =>
+                        {
+                            Some(r)
+                        }
+                        (Some(r), Some(prev), Some(prev_t)) => {
+                            let dt = now.duration_since(prev_t).as_secs_f64();
+                            let alpha = 1.0 - (-dt / tau).exp();
+                            Some(prev + alpha * (r - prev))
+                        }
+                        (Some(r), Some(_), None) => Some(r),
+                        (None, prev, _) => prev,
+                    }
+                };
                 last_success = Some(now);
                 state.snapshot.store(Arc::new(EmSnapshot {
                     status,
                     age: Some(now),
+                    smoothed_grid_w,
                 }));
                 if consecutive_errors > 0 {
                     info!("real shelly recovered after {consecutive_errors} failed polls");

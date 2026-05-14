@@ -543,6 +543,9 @@ impl ModbusDispatch {
     pub fn spawn(state: Arc<AppState>, cfg: &Config) -> Self {
         let mut batteries = HashMap::new();
         let heartbeat = Duration::from_secs_f64(cfg.dispatcher.modbus_heartbeat_s.max(1.0));
+        let min_write_interval = Duration::from_secs_f64(
+            cfg.dispatcher.modbus_min_write_interval_s.max(0.0),
+        );
         let deadband_w = cfg.dispatcher.setpoint_deadband_w;
         for b in &cfg.batteries {
             if b.modbus_host.is_none() {
@@ -560,6 +563,7 @@ impl ModbusDispatch {
                 shutdown: shutdown_rx,
                 state: state.clone(),
                 heartbeat,
+                min_write_interval,
                 deadband_w,
                 last_written: None,
                 last_write_at: None,
@@ -652,6 +656,11 @@ struct BatteryWriter {
     shutdown: mpsc::Receiver<()>,
     state: Arc<AppState>,
     heartbeat: Duration,
+    /// Hard minimum interval between successive Modbus writes for this
+    /// battery. Even if `should_write` says yes, we wait at least this
+    /// long after the previous successful write. Lets the Marstek
+    /// actually ramp toward the new setpoint before we change it again.
+    min_write_interval: Duration,
     deadband_w: f64,
     last_written: Option<Setpoint>,
     last_write_at: Option<Instant>,
@@ -699,7 +708,14 @@ impl BatteryWriter {
                 changed = self.rx.changed() => {
                     if changed.is_err() { return; }
                     let desired = *self.rx.borrow();
-                    if self.should_write(desired) {
+                    // Two gates: (a) the change is significant enough,
+                    // AND (b) min_write_interval has elapsed since the
+                    // last write. The throttle protects against churn
+                    // when the dispatcher decides the same battery
+                    // needs a new setpoint multiple times before the
+                    // previous write has had time to take effect on
+                    // the inverter.
+                    if self.should_write(desired) && self.throttle_ok() {
                         let _ = self.do_write(desired).await;
                     }
                 }
@@ -726,6 +742,15 @@ impl BatteryWriter {
         }
         let diff = (desired.to_signed_watts() - last.to_signed_watts()).abs();
         diff >= self.deadband_w
+    }
+
+    /// Throttle gate: refuse a write that arrives sooner than
+    /// `min_write_interval` after the previous one.
+    fn throttle_ok(&self) -> bool {
+        match self.last_write_at {
+            Some(t) => t.elapsed() >= self.min_write_interval,
+            None => true,
+        }
     }
 
     async fn do_write(&mut self, sp: Setpoint) -> Result<()> {

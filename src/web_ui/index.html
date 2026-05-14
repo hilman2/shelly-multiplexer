@@ -341,6 +341,14 @@
               <input name="modbus_watchdog_grace_s" type="number" min="0" step="any">
               <small style="color:var(--fg-faint);font-size:11px">if dispatcher loop hangs, force standby + exit. 0 = disabled</small>
             </label>
+            <label>Modbus min write interval (s)
+              <input name="modbus_min_write_interval_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">hard throttle between successive setpoint writes per battery — lets the inverter ramp before we change it again</small>
+            </label>
+            <label>Grid smoothing (s)
+              <input name="grid_smoothing_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">EMA time constant on grid_w. Filters out sub-second PV inverter PWM ripple. 0 = no smoothing</small>
+            </label>
             <label>Emergency cutoff margin (W)
               <input name="emergency_cutoff_margin_w" type="number" min="0" step="any">
               <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap × headroom + this. 0 = disabled</small>

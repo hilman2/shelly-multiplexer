@@ -285,6 +285,25 @@ pub struct DispatcherConfig {
     #[serde(default = "default_emergency_cutoff_recovery_s")]
     pub emergency_cutoff_recovery_s: f64,
 
+    // ----- Smoothing & pacing -----
+
+    /// Exponential-moving-average time constant (seconds) applied to the
+    /// raw grid_w reading before the dispatcher uses it. Filters out
+    /// sub-second PV-inverter PWM ripple (often ±2 kW @ 4 Hz) so the
+    /// dispatcher tracks meaningful load changes rather than noise.
+    /// Default 5.0 s. Set to 0 to disable smoothing.
+    #[serde(default = "default_grid_smoothing_s")]
+    pub grid_smoothing_s: f64,
+
+    /// Per-battery minimum interval (seconds) between consecutive Modbus
+    /// setpoint writes. Hard throttle on top of `setpoint_deadband_w` —
+    /// even if the dispatcher thinks the setpoint changed enough to
+    /// warrant a write, the writer task will refuse to fire faster than
+    /// this. Gives each Marstek time to actually ramp toward the new
+    /// setpoint before we change it again. Default 10 s.
+    #[serde(default = "default_modbus_min_write_interval_s")]
+    pub modbus_min_write_interval_s: f64,
+
     // ----- Night cutoff (efficiency) -----
 
     /// Disconnect a battery's plug between sunset and sunrise if its
@@ -332,15 +351,23 @@ impl Default for DispatcherConfig {
             emergency_cutoff_recovery_s: default_emergency_cutoff_recovery_s(),
             night_cutoff_enabled: false,
             night_cutoff_soc_margin_pct: default_night_cutoff_soc_margin_pct(),
+            grid_smoothing_s: default_grid_smoothing_s(),
+            modbus_min_write_interval_s: default_modbus_min_write_interval_s(),
         }
     }
 }
 
 fn default_cycle_ms() -> u64 {
-    200
+    // 1 s. Slower than the 200 ms used earlier because Marstek inverters
+    // need 1-3 s to ramp toward a new setpoint, and a 4 Hz dispatch
+    // cycle on top of that just generates write queue churn.
+    1000
 }
 fn default_deadband_w() -> f64 {
-    30.0
+    // 50 W. Below this we treat the grid as "balanced enough". Larger
+    // than v0.7.0 (30 W) because raw grid_w noise often clears 30 W
+    // even on a quiet grid.
+    50.0
 }
 fn default_hit_tolerance_w() -> f64 {
     15.0
@@ -349,7 +376,10 @@ fn default_plug_stable_w() -> f64 {
     10.0
 }
 fn default_plug_stable_duration_s() -> f64 {
-    1.5
+    // 3 s. Marstek inverters can take ~2 s to ramp from one setpoint
+    // to the next; we want the plug to be visibly steady before we
+    // conclude the previous command has landed.
+    3.0
 }
 fn default_pulse_count() -> u32 {
     3
@@ -376,16 +406,27 @@ fn default_grid_bias_w() -> f64 {
     30.0
 }
 fn default_settle_timeout_s() -> f64 {
-    5.0
+    // 10 s. Marstek ramp time + a safety margin. Lower values lead to
+    // the dispatcher giving up before the inverter has actually
+    // committed to the new setpoint.
+    10.0
 }
 fn default_soc_unknown_lockout_s() -> f64 {
     600.0
 }
 fn default_setpoint_deadband_w() -> f64 {
-    20.0
+    // 100 W. Anything smaller is below Marstek quantisation + plug
+    // measurement noise. Writing for sub-100 W deltas just generates
+    // churn on the bus without changing real-world behaviour.
+    100.0
 }
 fn default_modbus_heartbeat_s() -> f64 {
-    5.0
+    // 30 s. We re-arm RS485 control mode (42000=21930) on every
+    // setpoint write anyway, so the heartbeat just covers "dropped
+    // last write" recovery + acts as our process-liveness signal.
+    // 30 s is fast enough that a dead controller would be detected
+    // well before any real damage.
+    30.0
 }
 fn default_modbus_watchdog_grace_s() -> f64 {
     30.0
@@ -401,6 +442,12 @@ fn default_emergency_cutoff_recovery_s() -> f64 {
 }
 fn default_night_cutoff_soc_margin_pct() -> f64 {
     2.0
+}
+fn default_grid_smoothing_s() -> f64 {
+    5.0
+}
+fn default_modbus_min_write_interval_s() -> f64 {
+    10.0
 }
 
 // ---------------------------------------------------------------------------
@@ -951,6 +998,12 @@ impl Config {
         }
         if self.dispatcher.emergency_cutoff_recovery_s < 0.0 {
             anyhow::bail!("dispatcher.emergency_cutoff_recovery_s must not be negative");
+        }
+        if self.dispatcher.grid_smoothing_s < 0.0 {
+            anyhow::bail!("dispatcher.grid_smoothing_s must not be negative");
+        }
+        if self.dispatcher.modbus_min_write_interval_s < 0.0 {
+            anyhow::bail!("dispatcher.modbus_min_write_interval_s must not be negative");
         }
         if self.dispatcher.night_cutoff_soc_margin_pct < 0.0 {
             anyhow::bail!("dispatcher.night_cutoff_soc_margin_pct must not be negative");
