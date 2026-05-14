@@ -99,10 +99,17 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
     let cfg = config.load_full();
 
     // SoC-source routing:
-    //   - modbus dispatch mode → we ALWAYS read SoC via Modbus (we're
-    //     already on the bus for setpoint writes).
+    //   - modbus dispatch mode → BatteryWriter owns the Modbus session
+    //     per battery and piggybacks the SoC read onto its existing
+    //     connection. This standalone poll task idles to avoid a second
+    //     TCP client competing for the inverter's single Modbus slot.
     //   - pulse dispatch mode + HA enabled → HA bridge owns SoC, we idle.
     //   - pulse dispatch mode + HA disabled → we own SoC via Modbus.
+    if matches!(cfg.dispatcher.mode, DispatchMode::Modbus) {
+        info!("modbus dispatch mode → SoC piggybacked on BatteryWriter, standalone poll idle");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
     if matches!(cfg.dispatcher.mode, DispatchMode::Pulse) && cfg.home_assistant.enabled {
         info!("pulse mode + HA enabled → SoC sourced from HA, modbus SoC poll idle");
         std::future::pending::<()>().await;
@@ -116,7 +123,11 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
         return Ok(());
     }
 
-    let read_power_too = matches!(cfg.dispatcher.mode, DispatchMode::Modbus);
+    // In pulse mode there's no BatteryWriter to piggyback on, so we keep
+    // the legacy per-battery poll loop. battery_power is only relevant
+    // in modbus mode (the dispatcher's plug measurement is authoritative
+    // in pulse mode), so we skip that here.
+    let read_power_too = false;
 
     let mut handles = Vec::new();
     for battery in batteries {
@@ -217,13 +228,33 @@ async fn poll_battery_loop(state: Arc<AppState>, battery: BatteryConfig, read_po
     }
 }
 
-async fn read_soc(
-    target: std::net::SocketAddr,
-    unit: Slave,
+// ---------------------------------------------------------------------------
+// Low-level helpers that operate on an EXISTING `&mut Context`. The
+// caller owns the connection lifecycle: BatteryWriter keeps one open
+// for its task lifetime and reconnects only on error; the legacy
+// pulse-mode poll loop and standalone failsafe helpers open + close
+// per operation via the `*_using_*` wrappers further down.
+// ---------------------------------------------------------------------------
+
+async fn read_holding_on(
+    ctx: &mut tokio_modbus::client::Context,
+    register: u16,
+    count: u16,
+) -> Result<Vec<u16>> {
+    let result = time::timeout(request_timeout(), ctx.read_holding_registers(register, count))
+        .await
+        .map_err(|_| anyhow!("modbus read timeout (reg {register})"))?;
+    result
+        .with_context(|| format!("modbus read reg {register}"))?
+        .map_err(|e| anyhow!("modbus exception (reg {register}): {e:?}"))
+}
+
+async fn read_soc_on(
+    ctx: &mut tokio_modbus::client::Context,
     register: u16,
     scale: f64,
 ) -> Result<f64> {
-    let regs = read_holding(target, unit, register, 1).await?;
+    let regs = read_holding_on(ctx, register, 1).await?;
     let raw = regs
         .first()
         .copied()
@@ -235,24 +266,22 @@ async fn read_soc(
     Ok(soc)
 }
 
-async fn read_battery_power(
-    target: std::net::SocketAddr,
-    unit: Slave,
+async fn read_battery_power_on(
+    ctx: &mut tokio_modbus::client::Context,
     register: u16,
     is_int32: bool,
 ) -> Result<f64> {
     if is_int32 {
         // Venus E v1/v2: signed 32-bit power split across TWO registers
         // (big-endian word order — high word first).
-        let regs = read_holding(target, unit, register, 2).await?;
+        let regs = read_holding_on(ctx, register, 2).await?;
         if regs.len() < 2 {
             anyhow::bail!("modbus reg {register}: expected 2 registers, got {}", regs.len());
         }
         let combined = ((regs[0] as u32) << 16) | (regs[1] as u32);
         Ok(f64::from(combined as i32))
     } else {
-        // Single int16 register (A, D, E v3).
-        let regs = read_holding(target, unit, register, 1).await?;
+        let regs = read_holding_on(ctx, register, 1).await?;
         let raw = regs
             .first()
             .copied()
@@ -261,23 +290,32 @@ async fn read_battery_power(
     }
 }
 
-async fn read_holding(
+// Open+op+close wrappers — only used by the legacy pulse-mode SoC
+// poll loop and one-shot failsafe paths. The hot modbus-dispatch path
+// uses the `_on` helpers directly on BatteryWriter::ctx (long-lived).
+
+async fn read_soc(
     target: std::net::SocketAddr,
     unit: Slave,
     register: u16,
-    count: u16,
-) -> Result<Vec<u16>> {
-    let mut ctx = time::timeout(connect_timeout(), tcp::connect_slave(target, unit))
-        .await
-        .map_err(|_| anyhow!("modbus connect timeout to {target}"))?
-        .with_context(|| format!("modbus connect to {target}"))?;
-    let result = time::timeout(request_timeout(), ctx.read_holding_registers(register, count))
-        .await
-        .map_err(|_| anyhow!("modbus read timeout (reg {register})"))?;
+    scale: f64,
+) -> Result<f64> {
+    let mut ctx = open(target, unit).await?;
+    let r = read_soc_on(&mut ctx, register, scale).await;
     let _ = ctx.disconnect().await;
-    result
-        .with_context(|| format!("modbus read reg {register}"))?
-        .map_err(|e| anyhow!("modbus exception (reg {register}): {e:?}"))
+    r
+}
+
+async fn read_battery_power(
+    target: std::net::SocketAddr,
+    unit: Slave,
+    register: u16,
+    is_int32: bool,
+) -> Result<f64> {
+    let mut ctx = open(target, unit).await?;
+    let r = read_battery_power_on(&mut ctx, register, is_int32).await;
+    let _ = ctx.disconnect().await;
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -396,39 +434,50 @@ async fn write_setpoint_once(battery: &BatteryConfig, sp: Setpoint) -> Result<()
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
+    let r = write_setpoint_on(&mut ctx, sp).await;
+    let _ = ctx.disconnect().await;
+    r
+}
 
+/// The actual register-write sequence, operating on a caller-owned
+/// connection. BatteryWriter keeps one Modbus session open for its
+/// task lifetime and reuses it across writes / SoC reads — opening a
+/// fresh TCP socket on every operation puts unnecessary load on the
+/// Marstek (or its bridge) when we already have the bus exclusively.
+async fn write_setpoint_on(
+    ctx: &mut tokio_modbus::client::Context,
+    sp: Setpoint,
+) -> Result<()> {
     // Step 1: re-arm RS485 control mode + give the firmware time.
-    write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
+    write_reg(ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
     time::sleep(Duration::from_millis(100)).await;
 
     match sp {
         Setpoint::Standby => {
             // Park cleanly: zero both power setpoints, THEN force_mode=0.
-            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
-            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
-            write_reg(&mut ctx, REG_FORCE_MODE, 0).await?;
+            write_reg(ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            write_reg(ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
+            write_reg(ctx, REG_FORCE_MODE, 0).await?;
         }
         Setpoint::Charge { watts } => {
             // Zero the opposite (discharge) direction first, then switch
             // mode, then write the new charge power. Sleeps between
             // steps come from the Python reference impl — without them
             // the Marstek silently drops the command.
-            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
+            write_reg(ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
             time::sleep(Duration::from_millis(200)).await;
-            write_reg(&mut ctx, REG_FORCE_MODE, 1).await?;
+            write_reg(ctx, REG_FORCE_MODE, 1).await?;
             time::sleep(Duration::from_millis(500)).await;
-            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, watts).await?;
+            write_reg(ctx, REG_CHARGE_POWER_SETPOINT, watts).await?;
         }
         Setpoint::Discharge { watts } => {
-            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            write_reg(ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
             time::sleep(Duration::from_millis(200)).await;
-            write_reg(&mut ctx, REG_FORCE_MODE, 2).await?;
+            write_reg(ctx, REG_FORCE_MODE, 2).await?;
             time::sleep(Duration::from_millis(500)).await;
-            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, watts).await?;
+            write_reg(ctx, REG_DISCHARGE_POWER_SETPOINT, watts).await?;
         }
     }
-
-    let _ = ctx.disconnect().await;
     Ok(())
 }
 
@@ -454,17 +503,26 @@ pub async fn init_dispatch(battery: &BatteryConfig) -> Result<BmsCutoffs> {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
+    let r = init_dispatch_on(&mut ctx, battery).await;
+    let _ = ctx.disconnect().await;
+    r
+}
+
+async fn init_dispatch_on(
+    ctx: &mut tokio_modbus::client::Context,
+    battery: &BatteryConfig,
+) -> Result<BmsCutoffs> {
     // Enable writes, then explicitly park in standby so we don't leak
     // any stale force_mode left over from a previous run / crash.
-    write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
-    write_reg(&mut ctx, REG_FORCE_MODE, 0).await?;
+    write_reg(ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
+    write_reg(ctx, REG_FORCE_MODE, 0).await?;
 
     // Read BMS cutoffs ONLY when the variant exposes them. The upstream
     // YAMLs list 44000/44001 for Venus E v1/v2 only; A, D, and E v3
     // don't have them, and reading the wrong register on those would
     // either return garbage or a Modbus exception.
     let cutoffs = if battery.marstek_model.supports_bms_cutoffs() {
-        read_bms_cutoffs(&mut ctx).await.unwrap_or_else(|e| {
+        read_bms_cutoffs(ctx).await.unwrap_or_else(|e| {
             warn!(
                 battery = %battery.id,
                 error = %e,
@@ -476,7 +534,6 @@ pub async fn init_dispatch(battery: &BatteryConfig) -> Result<BmsCutoffs> {
         BmsCutoffs::default()
     };
 
-    let _ = ctx.disconnect().await;
     info!(
         battery = %battery.id,
         bms_full_pct = ?cutoffs.charging_cutoff_pct,
@@ -629,6 +686,8 @@ impl ModbusDispatch {
                 deadband_w,
                 last_written: None,
                 last_write_at: None,
+                soc_interval: Duration::from_millis(b.soc_interval_ms.max(1_000)),
+                last_soc_read_at: None,
             };
             tokio::spawn(task.run());
             batteries.insert(
@@ -712,6 +771,16 @@ impl ModbusDispatch {
     }
 }
 
+/// Close a persistent Modbus context cleanly. Used after errors so
+/// the next operation forces a fresh `tcp::connect_slave`. Best-effort
+/// — if disconnect itself errors, we swallow it (the socket is going
+/// away anyway, and the next reconnect will surface real problems).
+async fn drop_ctx(ctx: &mut Option<tokio_modbus::client::Context>) {
+    if let Some(mut c) = ctx.take() {
+        let _ = time::timeout(Duration::from_millis(500), c.disconnect()).await;
+    }
+}
+
 struct BatteryWriter {
     battery: BatteryConfig,
     rx: watch::Receiver<Setpoint>,
@@ -726,32 +795,61 @@ struct BatteryWriter {
     deadband_w: f64,
     last_written: Option<Setpoint>,
     last_write_at: Option<Instant>,
+    /// Upper bound on how often we re-read SoC (and battery_power).
+    /// Piggybacked onto whatever connection we open anyway for setpoint
+    /// writes or heartbeats — no separate TCP socket. If `Some` and
+    /// `last_soc_read_at` is older than this, we tack a SoC read onto
+    /// the next operation.
+    soc_interval: Duration,
+    last_soc_read_at: Option<Instant>,
 }
 
 impl BatteryWriter {
     async fn run(mut self) {
-        // Initialise the inverter: enable RS485 control + force_mode=0,
-        // read BMS cutoffs into AppState so the dispatcher's
-        // effective_soc_*_pct gates use the BMS-truth instead of TOML
-        // defaults. Retried until it sticks; until then the battery
-        // stays inactive.
+        // Persistent Modbus session for this battery's lifetime. The
+        // Marstek (or its RS485-to-LAN bridge) only allows one Modbus
+        // client at a time anyway; we own that slot exclusively in
+        // modbus dispatch mode (the standalone SoC poller is idle).
+        // Reusing the connection across writes + SoC reads removes the
+        // per-op TCP-handshake overhead and the matching teardown load
+        // on the bridge. On any error we close + reconnect on the next
+        // operation.
+        let mut ctx: Option<tokio_modbus::client::Context> = None;
+
+        // Init loop — keeps trying until RS485 control is on and BMS
+        // cutoffs (if supported) are stored. Holds the connection
+        // open afterwards.
         loop {
-            match init_dispatch(&self.battery).await {
-                Ok(cutoffs) => {
-                    self.record_success(Setpoint::Standby);
-                    self.record_bms_cutoffs(cutoffs);
-                    break;
+            let attempt = self.ensure_conn(&mut ctx).await;
+            match attempt {
+                Ok(c) => {
+                    match init_dispatch_on(c, &self.battery).await {
+                        Ok(cutoffs) => {
+                            self.record_success(Setpoint::Standby);
+                            self.record_bms_cutoffs(cutoffs);
+                            break;
+                        }
+                        Err(e) => {
+                            self.record_error(format!("init: {e}"));
+                            warn!(
+                                battery = %self.battery.id,
+                                error = %e,
+                                "modbus init failed, dropping connection + retrying in 5s"
+                            );
+                            drop_ctx(&mut ctx).await;
+                        }
+                    }
                 }
                 Err(e) => {
-                    self.record_error(format!("init: {e}"));
+                    self.record_error(format!("init connect: {e}"));
                     warn!(
                         battery = %self.battery.id,
                         error = %e,
-                        "modbus init failed, retrying in 5s"
+                        "modbus connect failed during init, retrying in 5s"
                     );
-                    time::sleep(Duration::from_secs(5)).await;
                 }
             }
+            time::sleep(Duration::from_secs(5)).await;
         }
 
         loop {
@@ -762,7 +860,14 @@ impl BatteryWriter {
             tokio::select! {
                 biased;
                 _ = self.shutdown.recv() => {
-                    let _ = self.do_write(Setpoint::Standby).await;
+                    // Best-effort park to standby on the existing
+                    // connection, then close it cleanly and write the
+                    // RS485-control-off via a fresh connection (the
+                    // failsafe_shutdown free function opens its own).
+                    if let Ok(c) = self.ensure_conn(&mut ctx).await {
+                        let _ = write_setpoint_on(c, Setpoint::Standby).await;
+                    }
+                    drop_ctx(&mut ctx).await;
                     let _ = failsafe_shutdown(&self.battery).await;
                     info!(battery = %self.battery.id, "modbus writer task exiting");
                     return;
@@ -770,26 +875,39 @@ impl BatteryWriter {
                 changed = self.rx.changed() => {
                     if changed.is_err() { return; }
                     let desired = *self.rx.borrow();
-                    // Two gates: (a) the change is significant enough,
-                    // AND (b) min_write_interval has elapsed since the
-                    // last write. The throttle protects against churn
-                    // when the dispatcher decides the same battery
-                    // needs a new setpoint multiple times before the
-                    // previous write has had time to take effect on
-                    // the inverter.
                     if self.should_write(desired) && self.throttle_ok() {
-                        let _ = self.do_write(desired).await;
+                        let _ = self.do_write(&mut ctx, desired).await;
+                    } else if self.soc_poll_due() {
+                        // Even when no write is needed, take the
+                        // opportunity to refresh SoC on the open
+                        // connection.
+                        let _ = self.poll_soc_only(&mut ctx).await;
                     }
                 }
                 _ = time::sleep(next_heartbeat) => {
                     let desired = *self.rx.borrow();
-                    // Heartbeat: even if unchanged, re-issue so a dropped
-                    // packet or rebooting bridge can't leave the Marstek
-                    // stuck on a stale setpoint.
-                    let _ = self.do_write(desired).await;
+                    // Heartbeat: re-issue the current setpoint AND
+                    // piggyback a SoC read if due (both happen on the
+                    // same persistent connection).
+                    let _ = self.do_write(&mut ctx, desired).await;
                 }
             }
         }
+    }
+
+    /// Open the persistent connection if missing, return a mutable
+    /// reference for use by the caller.
+    async fn ensure_conn<'a>(
+        &self,
+        ctx: &'a mut Option<tokio_modbus::client::Context>,
+    ) -> Result<&'a mut tokio_modbus::client::Context> {
+        if ctx.is_none() {
+            let target = self.battery.modbus_target();
+            let unit = Slave(self.battery.modbus_unit_id);
+            *ctx = Some(open(target, unit).await?);
+            debug!(battery = %self.battery.id, "modbus connection opened");
+        }
+        Ok(ctx.as_mut().unwrap())
     }
 
     /// Decide whether a desired setpoint deserves a Modbus round-trip
@@ -815,19 +933,114 @@ impl BatteryWriter {
         }
     }
 
-    async fn do_write(&mut self, sp: Setpoint) -> Result<()> {
-        match write_setpoint(&self.battery, sp).await {
-            Ok(()) => {
-                self.record_success(sp);
-                debug!(battery = %self.battery.id, ?sp, "setpoint written");
-                Ok(())
-            }
-            Err(e) => {
-                self.record_error(format!("write: {e:#}"));
-                debug!(battery = %self.battery.id, error = %e, "modbus write failed");
-                Err(e)
+    /// True iff it's time to refresh SoC. Drives the piggyback decision
+    /// inside `do_write` and the SoC-only path on watch-channel changes
+    /// that don't warrant a write.
+    fn soc_poll_due(&self) -> bool {
+        match self.last_soc_read_at {
+            Some(t) => t.elapsed() >= self.soc_interval,
+            None => true,
+        }
+    }
+
+    /// Run the setpoint write on the persistent connection, then
+    /// piggyback a SoC + battery_power read if due. On any error,
+    /// close the connection so the next iteration reconnects.
+    async fn do_write(
+        &mut self,
+        ctx_slot: &mut Option<tokio_modbus::client::Context>,
+        sp: Setpoint,
+    ) -> Result<()> {
+        // Retry budget applies here so a single connect blip doesn't
+        // cause a missed setpoint update — without dropping the
+        // connection lifecycle benefit.
+        let max_attempts = write_retries().saturating_add(1);
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=max_attempts {
+            let ctx = match self.ensure_conn(ctx_slot).await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(e);
+                    drop_ctx(ctx_slot).await;
+                    time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
+            };
+            match write_setpoint_on(ctx, sp).await {
+                Ok(()) => {
+                    self.record_success(sp);
+                    debug!(battery = %self.battery.id, ?sp, "setpoint written");
+                    // Piggyback SoC if due. A failure here is logged
+                    // but doesn't roll back the successful write.
+                    if self.soc_poll_due() {
+                        if let Err(e) = self.read_soc_on_open(ctx_slot).await {
+                            debug!(
+                                battery = %self.battery.id,
+                                error = %e,
+                                "SoC piggyback read failed (write was OK)"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    // Stale connection? Drop and reconnect on retry.
+                    drop_ctx(ctx_slot).await;
+                    if attempt < max_attempts {
+                        time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    }
+                }
             }
         }
+        let err = last_err.unwrap_or_else(|| anyhow!("write_setpoint exhausted retries"));
+        self.record_error(format!("write: {err:#}"));
+        debug!(battery = %self.battery.id, error = %err, "modbus write failed");
+        Err(err)
+    }
+
+    /// Read SoC + battery_power on the (already-open) persistent
+    /// connection. Used as the piggyback after a successful write AND
+    /// as the standalone path when the watch channel fires but no
+    /// write is warranted.
+    async fn read_soc_on_open(
+        &mut self,
+        ctx_slot: &mut Option<tokio_modbus::client::Context>,
+    ) -> Result<()> {
+        let model = self.battery.marstek_model;
+        let ctx = self.ensure_conn(ctx_slot).await?;
+        let soc = read_soc_on(ctx, model.soc_register(), model.soc_scale()).await;
+        let bp = read_battery_power_on(
+            ctx,
+            model.battery_power_register(),
+            model.battery_power_is_int32(),
+        )
+        .await;
+        let now = Instant::now();
+        self.last_soc_read_at = Some(now);
+        let mut bats = self.state.batteries.write();
+        if let Some(b) = bats.get_mut(&self.battery.id) {
+            if let Ok(soc) = soc {
+                b.soc_pct = Some(soc);
+                b.soc_at = Some(std::time::Instant::now());
+                b.soc_source = Some(format!("modbus:{}", model.soc_register()));
+            }
+            if let Ok(p) = bp {
+                b.last_battery_power_w = Some(p);
+            }
+        }
+        Ok(())
+    }
+
+    async fn poll_soc_only(
+        &mut self,
+        ctx_slot: &mut Option<tokio_modbus::client::Context>,
+    ) -> Result<()> {
+        if let Err(e) = self.read_soc_on_open(ctx_slot).await {
+            drop_ctx(ctx_slot).await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn record_success(&mut self, sp: Setpoint) {

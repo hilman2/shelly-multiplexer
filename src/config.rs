@@ -663,7 +663,16 @@ fn default_modbus_unit_id() -> u8 {
     1
 }
 fn default_soc_interval_ms() -> u64 {
-    30000
+    // 60 s. SoC moves at most ~1 % per minute under full power on a
+    // 5 kWh Marstek; faster polling adds nothing useful. In modbus
+    // dispatch mode this is just an upper bound — the SoC read is
+    // piggybacked onto the BatteryWriter's existing connection
+    // whenever a setpoint write or heartbeat happens, so SoC actually
+    // refreshes on whichever cadence is smaller (typically the
+    // heartbeat at 30 s). In pulse mode it's the standalone poll
+    // interval. The point: SoC reads never open their own TCP
+    // connection in modbus mode, so the bus stays free for writes.
+    60_000
 }
 
 /// Marstek hardware variants distinguished by their Modbus register

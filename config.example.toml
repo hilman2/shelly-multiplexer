@@ -194,7 +194,7 @@ marstek_model = "venus_e"
 modbus_host = "192.168.1.91"
 modbus_port = 502
 modbus_unit_id = 1
-soc_interval_ms = 30000
+soc_interval_ms = 60000
 # SoC-based power tapering (optional). Real batteries can't accept
 # full max_charge_w near 100 % SoC nor sustain full max_discharge_w
 # near the empty cutoff — the BMS tapers internally. Modelling it here
@@ -224,7 +224,7 @@ marstek_model = "venus_e"
 modbus_host = "192.168.1.92"   # IP of this battery's RS485-to-LAN bridge
 modbus_port = 502
 modbus_unit_id = 1
-soc_interval_ms = 30000
+soc_interval_ms = 60000
 charge_taper_soc_pct = 90
 charge_taper_w = 1000
 discharge_taper_soc_pct = 15
