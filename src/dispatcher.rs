@@ -785,6 +785,70 @@ fn warn_throttled_grid_stale(state: &AppState, now: Instant) {
 }
 
 // ---------------------------------------------------------------------------
+// Grid correction — direction-aware "never cross zero" rule.
+// ---------------------------------------------------------------------------
+//
+// The asymmetric `grid_bias_w` policy is "never cross zero in the
+// direction we don't want":
+//   • while CHARGING (current plug sum < 0): NEVER import. Any positive
+//     grid is a hard policy violation that must be addressed immediately
+//     — bypass the deadband, push the correction through so the next
+//     write reduces charging. On the export side, leave `grid_bias_w` W
+//     of headroom (don't chase tiny export wobble).
+//   • while DISCHARGING (current plug sum > 0): mirror — never export.
+//   • IDLE / near-zero plug sum: classic asymmetric bias picks the
+//     starting direction; deadband filters noise.
+//
+// In every direction-aware branch we cap the correction so `desired_total`
+// can't cross zero from the dispatch direction — a single bad cycle
+// shouldn't flip a charging battery into discharge.
+//
+// Pre-v0.8.1 bug: the bias check looked only at the grid sign, not at
+// the current dispatch direction. With grid = +28 W and bias = 100 W
+// the code computed `(28 - 100).max(0) = 0` and held position — even
+// though the dispatcher was charging at -600 W and the +28 W was a
+// pure policy violation. Symptom: persistent low-watt grid import while
+// the system was nominally "charging from surplus".
+fn compute_grid_correction(grid_w: f64, current_total: f64, dcfg: &DispatcherConfig) -> f64 {
+    let bias = dcfg.grid_bias_w;
+    let deadband = dcfg.deadband_w;
+    let charging_now = current_total < -deadband;
+    let discharging_now = current_total > deadband;
+    if charging_now {
+        if grid_w > 0.0 {
+            // Violation: importing while charging. React immediately,
+            // no deadband. Cap so desired_total ≤ 0 (no direction flip).
+            (grid_w + bias).min(-current_total)
+        } else {
+            // Charging with export — pull toward grid = -bias if the
+            // adjustment is bigger than the deadband, else hold.
+            let raw = (grid_w + bias).min(-current_total);
+            if raw.abs() < deadband { 0.0 } else { raw }
+        }
+    } else if discharging_now {
+        if grid_w < 0.0 {
+            // Violation: exporting while discharging. React immediately.
+            // Cap so desired_total ≥ 0.
+            (grid_w - bias).max(-current_total)
+        } else {
+            let raw = (grid_w - bias).max(-current_total);
+            if raw.abs() < deadband { 0.0 } else { raw }
+        }
+    } else {
+        // Idle / near-zero plug sum — classic asymmetric bias on
+        // whichever side the grid is sitting on. Deadband filters noise.
+        let raw = if grid_w > bias {
+            grid_w - bias
+        } else if grid_w < -bias {
+            grid_w + bias
+        } else {
+            0.0
+        };
+        if raw.abs() < deadband { 0.0 } else { raw }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SoC-aware bounds (live, from current plug + soc)
 // ---------------------------------------------------------------------------
 
@@ -862,20 +926,14 @@ fn compute_deltas(
         return deltas;
     }
 
-    // Asymmetric bias + deadband.
-    let raw = grid_w;
-    let grid_correction_raw = if raw > 0.0 {
-        (raw - dcfg.grid_bias_w).max(0.0)
-    } else if raw < 0.0 {
-        (raw + dcfg.grid_bias_w).min(0.0)
-    } else {
-        0.0
-    };
-    let grid_correction = if grid_correction_raw.abs() < dcfg.deadband_w {
-        0.0
-    } else {
-        grid_correction_raw
-    };
+    // Direction-aware asymmetric bias. See `compute_grid_correction`
+    // for the policy. Compute current_total first because the bias
+    // logic needs to know which direction we're already dispatching in.
+    let current_total: f64 = eligible
+        .iter()
+        .map(|b| b.last_plug_w.unwrap_or(0.0))
+        .sum();
+    let grid_correction = compute_grid_correction(grid_w, current_total, dcfg);
 
     // Conflict detection: any active circuit with opposing flows above
     // deadband must be realigned even when the grid itself is balanced.
@@ -898,10 +956,6 @@ fn compute_deltas(
         return deltas;
     }
 
-    let current_total: f64 = eligible
-        .iter()
-        .map(|b| b.last_plug_w.unwrap_or(0.0))
-        .sum();
     let desired_total = current_total + grid_correction;
     let charging = desired_total < 0.0;
 
@@ -1079,22 +1133,10 @@ fn compute_targets(
         return targets;
     }
 
-    // Asymmetric grid bias (same as pulse mode).
-    let raw = grid_w;
-    let grid_correction_raw = if raw > 0.0 {
-        (raw - dcfg.grid_bias_w).max(0.0)
-    } else if raw < 0.0 {
-        (raw + dcfg.grid_bias_w).min(0.0)
-    } else {
-        0.0
-    };
-    let grid_correction = if grid_correction_raw.abs() < dcfg.deadband_w {
-        0.0
-    } else {
-        grid_correction_raw
-    };
-
+    // Direction-aware asymmetric bias (same as pulse mode). See
+    // `compute_grid_correction` for the rule.
     let current_total: f64 = eligible.iter().map(|b| b.last_plug_w.unwrap_or(0.0)).sum();
+    let grid_correction = compute_grid_correction(grid_w, current_total, dcfg);
     let desired_total = current_total + grid_correction;
     let charging = desired_total < 0.0;
 
@@ -1286,6 +1328,98 @@ mod tests {
 
     fn dcfg() -> DispatcherConfig {
         DispatcherConfig::default()
+    }
+
+    // -----------------------------------------------------------------
+    // compute_grid_correction — direction-aware asymmetric bias rule.
+    // -----------------------------------------------------------------
+
+    /// Regression test for the v0.8.0 "persistent import while
+    /// charging" bug. With current_total = -600 (charging hard) and
+    /// grid = +28 (small import), the old code computed
+    /// `(28 - 100).max(0) = 0` and held position. The new code
+    /// recognises this as a policy violation and pushes a +128 W
+    /// correction (reduce charging by 128 W → grid lands at -100 W).
+    #[test]
+    fn grid_correction_charging_with_small_import_is_violation() {
+        let cfg = dcfg();
+        // current_total = -600 W, grid = +28 W, bias = 100 W.
+        let corr = compute_grid_correction(28.0, -600.0, &cfg);
+        // raw = 28 + 100 = 128, capped at -current_total = 600.
+        // 128 ≤ 600 → correction = 128.
+        assert!(
+            (corr - 128.0).abs() < 1e-6,
+            "expected +128 W correction (= grid+bias), got {corr}"
+        );
+    }
+
+    /// Mirror: discharging with a small export is the same policy
+    /// violation in the other direction.
+    #[test]
+    fn grid_correction_discharging_with_small_export_is_violation() {
+        let cfg = dcfg();
+        let corr = compute_grid_correction(-28.0, 600.0, &cfg);
+        // raw = -28 - 100 = -128, capped at -current_total = -600.
+        assert!(
+            (corr - (-128.0)).abs() < 1e-6,
+            "expected -128 W correction, got {corr}"
+        );
+    }
+
+    /// Violation correction is capped so desired_total can't cross
+    /// zero — a battery dispatching at -100 W shouldn't flip to +200 W
+    /// because of a single +200 W import spike.
+    #[test]
+    fn grid_correction_violation_capped_at_zero_crossing() {
+        let cfg = dcfg();
+        // current_total = -100 (clearly charging), grid = +200 (heavy
+        // import). Naive correction = 200 + 100 = 300. Capped to
+        // -current_total = 100 → desired_total = 0 (standby), no flip.
+        let corr = compute_grid_correction(200.0, -100.0, &cfg);
+        assert!(
+            (corr - 100.0).abs() < 1e-6,
+            "expected correction capped to 100 W, got {corr}"
+        );
+    }
+
+    /// Normal case: charging with healthy export. Correction pulls
+    /// grid toward -bias (= 100 W export). Was working before the
+    /// fix; must still work.
+    #[test]
+    fn grid_correction_charging_with_big_export_increases_charging() {
+        let cfg = dcfg();
+        // current_total = -1000, grid = -600, bias = 100.
+        // raw = -600 + 100 = -500. Capped at -current_total = 1000.
+        // |abs| = 500 > deadband 50 → correction = -500.
+        let corr = compute_grid_correction(-600.0, -1000.0, &cfg);
+        assert!(
+            (corr - (-500.0)).abs() < 1e-6,
+            "expected -500 W correction, got {corr}"
+        );
+    }
+
+    /// Charging with export already inside the bias band → no action.
+    #[test]
+    fn grid_correction_charging_inside_bias_band_does_nothing() {
+        let cfg = dcfg();
+        // current_total = -1000, grid = -90 (close to bias).
+        // raw = -90 + 100 = 10. |10| < deadband 50 → 0.
+        let corr = compute_grid_correction(-90.0, -1000.0, &cfg);
+        assert_eq!(corr, 0.0);
+    }
+
+    /// Idle case (plug sum near zero): classic asymmetric bias picks
+    /// the starting direction, deadband filters noise.
+    #[test]
+    fn grid_correction_idle_uses_classic_bias() {
+        let cfg = dcfg();
+        // Idle, grid = +200, bias = 100 → raw = 100 → fires, start
+        // discharging.
+        assert!((compute_grid_correction(200.0, 0.0, &cfg) - 100.0).abs() < 1e-6);
+        // Idle, grid = +50 (< bias) → 0, hold.
+        assert_eq!(compute_grid_correction(50.0, 0.0, &cfg), 0.0);
+        // Idle, grid = -300, bias = 100 → raw = -200 → fires, charge.
+        assert!((compute_grid_correction(-300.0, 0.0, &cfg) - (-200.0)).abs() < 1e-6);
     }
 
     fn make_battery(id: &str, plug_w: f64, max_charge: f64, max_discharge: f64) -> BatteryState {
