@@ -209,12 +209,40 @@ function renderBatteriesStatus(batteries) {
       }
       const stateCell = pills.join(" ");
 
-      const plug = b.plug_w == null ? 0 : b.plug_w;
+      // Direction shown next to the battery name should reflect the
+      // ACTUAL operating state, not just plug power. The Marstek
+      // inverter pulls ~5-10 W in standby and the plug PM Gen3 sees
+      // that — without filtering we'd read "Charge" for a battery
+      // that's doing nothing.
+      //
+      // Source priority:
+      //  1. Modbus commanded setpoint (we KNOW what we asked for)
+      //  2. Battery's own reported power (via Modbus reg 30001/32102)
+      //  3. Plug reading, but only above a standby-loss threshold
+      const STANDBY_DEADBAND_W = 20;
+      let dirState;
+      if (b.last_modbus_setpoint_w != null) {
+        if (Math.abs(b.last_modbus_setpoint_w) < 1) dirState = "standby";
+        else if (b.last_modbus_setpoint_w > 0) dirState = "discharge";
+        else dirState = "charge";
+      } else if (b.last_battery_power_w != null) {
+        if (Math.abs(b.last_battery_power_w) < STANDBY_DEADBAND_W) dirState = "standby";
+        else if (b.last_battery_power_w > 0) dirState = "discharge";
+        else dirState = "charge";
+      } else if (b.plug_w != null) {
+        if (Math.abs(b.plug_w) < STANDBY_DEADBAND_W) dirState = "standby";
+        else if (b.plug_w > 0) dirState = "discharge";
+        else dirState = "charge";
+      } else {
+        dirState = null;
+      }
       const dir =
-        plug > 5
+        dirState === "discharge"
           ? '<span class="dir-tag dir-discharge">discharge</span>'
-          : plug < -5
+          : dirState === "charge"
           ? '<span class="dir-tag dir-charge">charge</span>'
+          : dirState === "standby"
+          ? '<span class="dir-tag dir-standby">standby</span>'
           : "";
       const pulseCell =
         b.pulse_remaining > 0

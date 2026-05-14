@@ -172,6 +172,10 @@ td .state + .state { margin-left: 4px; }
 }
 .dir-tag.dir-discharge { background: rgba(255, 154, 74, 0.18); color: var(--accent-warm); }
 .dir-tag.dir-charge { background: rgba(74, 158, 255, 0.18); color: var(--accent); }
+/* Standby — battery is powered up but neither charging nor discharging.
+   The ~5-10 W inverter standby loss shows up on the plug; we filter it
+   out so the label tracks the battery's actual operating state. */
+.dir-tag.dir-standby { background: rgba(148, 163, 184, 0.18); color: var(--fg-faint); }
 .pulses {
   display: inline-block; background: rgba(192, 132, 252, 0.18); color: var(--pulsing);
   padding: 1px 8px; border-radius: 10px; font-weight: 600;
