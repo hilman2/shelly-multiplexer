@@ -809,11 +809,35 @@ fn warn_throttled_grid_stale(state: &AppState, now: Instant) {
 // though the dispatcher was charging at -600 W and the +28 W was a
 // pure policy violation. Symptom: persistent low-watt grid import while
 // the system was nominally "charging from surplus".
-fn compute_grid_correction(grid_w: f64, current_total: f64, dcfg: &DispatcherConfig) -> f64 {
+//
+// Pre-v0.8.3 bug: direction was detected via `deadband_w`, but the
+// Marstek's idle inverter loss (~5-15 W per battery while plugged in
+// but not actively dispatching) plus a sub-50 W `deadband_w` config
+// (user-tunable) made the system mistake standby losses for "we're
+// charging". The zero-crossing cap then blocked any discharge dispatch
+// even when the grid imported 400+ W. Fix: use a dedicated idle
+// threshold that scales with battery count and sits in the dead zone
+// between observed standby losses and the smallest active command
+// (Marstek MIN_W = 50 W, so `MIN_W / 2` per battery is safe).
+fn compute_grid_correction(
+    grid_w: f64,
+    current_total: f64,
+    eligible_count: usize,
+    dcfg: &DispatcherConfig,
+) -> f64 {
     let bias = dcfg.grid_bias_w;
     let deadband = dcfg.deadband_w;
-    let charging_now = current_total < -deadband;
-    let discharging_now = current_total > deadband;
+    // Direction-detection threshold: |current dispatch power| must
+    // exceed this to count as "actively charging/discharging". Below it
+    // we treat the system as idle. Scales with battery count so the
+    // Marstek standby loss across N inverters doesn't add up over the
+    // threshold by itself (observed 5-15 W per battery at idle vs.
+    // MIN_W = 50 W as the smallest commanded value — a `MIN_W / 2`
+    // per-battery slice sits cleanly in the gap).
+    let idle_threshold = (crate::modbus::MARSTEK_MIN_W * eligible_count as f64 / 2.0)
+        .max(deadband);
+    let charging_now = current_total < -idle_threshold;
+    let discharging_now = current_total > idle_threshold;
     if charging_now {
         if grid_w > 0.0 {
             // Violation: importing while charging. React immediately,
@@ -933,7 +957,8 @@ fn compute_deltas(
         .iter()
         .map(|b| b.last_plug_w.unwrap_or(0.0))
         .sum();
-    let grid_correction = compute_grid_correction(grid_w, current_total, dcfg);
+    let grid_correction =
+        compute_grid_correction(grid_w, current_total, eligible.len(), dcfg);
 
     // Conflict detection: any active circuit with opposing flows above
     // deadband must be realigned even when the grid itself is balanced.
@@ -1136,7 +1161,8 @@ fn compute_targets(
     // Direction-aware asymmetric bias (same as pulse mode). See
     // `compute_grid_correction` for the rule.
     let current_total: f64 = eligible.iter().map(|b| b.last_plug_w.unwrap_or(0.0)).sum();
-    let grid_correction = compute_grid_correction(grid_w, current_total, dcfg);
+    let grid_correction =
+        compute_grid_correction(grid_w, current_total, eligible.len(), dcfg);
     let desired_total = current_total + grid_correction;
     let charging = desired_total < 0.0;
 
@@ -1422,8 +1448,9 @@ mod tests {
     #[test]
     fn grid_correction_charging_with_small_import_is_violation() {
         let cfg = dcfg();
-        // current_total = -600 W, grid = +28 W, bias = 100 W.
-        let corr = compute_grid_correction(28.0, -600.0, &cfg);
+        // current_total = -600 W, grid = +28 W, bias = 100 W, 2 batt.
+        // idle_threshold = max(50, 50 * 2 / 2) = 50. |-600| > 50 → charging.
+        let corr = compute_grid_correction(28.0, -600.0, 2, &cfg);
         // raw = 28 + 100 = 128, capped at -current_total = 600.
         // 128 ≤ 600 → correction = 128.
         assert!(
@@ -1437,7 +1464,7 @@ mod tests {
     #[test]
     fn grid_correction_discharging_with_small_export_is_violation() {
         let cfg = dcfg();
-        let corr = compute_grid_correction(-28.0, 600.0, &cfg);
+        let corr = compute_grid_correction(-28.0, 600.0, 2, &cfg);
         // raw = -28 - 100 = -128, capped at -current_total = -600.
         assert!(
             (corr - (-128.0)).abs() < 1e-6,
@@ -1454,7 +1481,8 @@ mod tests {
         // current_total = -100 (clearly charging), grid = +200 (heavy
         // import). Naive correction = 200 + 100 = 300. Capped to
         // -current_total = 100 → desired_total = 0 (standby), no flip.
-        let corr = compute_grid_correction(200.0, -100.0, &cfg);
+        // With 1 battery: idle_threshold = max(50, 25) = 50. |-100| > 50.
+        let corr = compute_grid_correction(200.0, -100.0, 1, &cfg);
         assert!(
             (corr - 100.0).abs() < 1e-6,
             "expected correction capped to 100 W, got {corr}"
@@ -1470,7 +1498,7 @@ mod tests {
         // current_total = -1000, grid = -600, bias = 100.
         // raw = -600 + 100 = -500. Capped at -current_total = 1000.
         // |abs| = 500 > deadband 50 → correction = -500.
-        let corr = compute_grid_correction(-600.0, -1000.0, &cfg);
+        let corr = compute_grid_correction(-600.0, -1000.0, 2, &cfg);
         assert!(
             (corr - (-500.0)).abs() < 1e-6,
             "expected -500 W correction, got {corr}"
@@ -1483,8 +1511,47 @@ mod tests {
         let cfg = dcfg();
         // current_total = -1000, grid = -90 (close to bias).
         // raw = -90 + 100 = 10. |10| < deadband 50 → 0.
-        let corr = compute_grid_correction(-90.0, -1000.0, &cfg);
+        let corr = compute_grid_correction(-90.0, -1000.0, 2, &cfg);
         assert_eq!(corr, 0.0);
+    }
+
+    /// Regression test for the v0.8.2 "standby loss misread as charging"
+    /// bug. Both batteries idle (plug = -7 W each from inverter standby
+    /// loss only). Grid imports +192 W. With deadband=5 (user-tunable)
+    /// the old code saw current_total = -13 < -5 and concluded "we're
+    /// charging" → zero-crossing cap on the violation correction →
+    /// desired_total = 0 (Standby). Result: grid stuck at +192 W
+    /// indefinitely. The dedicated idle_threshold (= MIN_W * N / 2 = 50
+    /// for 2 batt) correctly classifies this as idle → idle branch →
+    /// pull toward grid = +bias by discharging.
+    #[test]
+    fn grid_correction_ignores_marstek_standby_loss() {
+        let mut cfg = dcfg();
+        // User config from the field report.
+        cfg.deadband_w = 5.0;
+        cfg.grid_bias_w = 20.0;
+        let corr = compute_grid_correction(192.0, -13.0, 2, &cfg);
+        // idle_threshold = max(5, 50 * 2 / 2) = 50. |-13| < 50 → idle.
+        // idle branch: grid > bias → raw = 192 - 20 = 172. > deadband.
+        assert!(
+            (corr - 172.0).abs() < 1e-6,
+            "expected +172 W discharge correction (idle), got {corr}"
+        );
+    }
+
+    /// Sanity: actual charging (current_total clearly past idle_threshold)
+    /// still triggers the charging branch and its violation rules.
+    #[test]
+    fn grid_correction_actively_charging_still_uses_charging_branch() {
+        let cfg = dcfg();
+        // current_total = -800 W (clearly charging, well past threshold
+        // of 50 for any sane battery count). Grid +30 W = violation.
+        let corr = compute_grid_correction(30.0, -800.0, 2, &cfg);
+        // raw = 30 + 100 = 130, capped at -current_total = 800.
+        assert!(
+            (corr - 130.0).abs() < 1e-6,
+            "expected +130 W correction, got {corr}"
+        );
     }
 
     /// Regression test for the v0.8.1 "persistent low-watt import while
@@ -1566,11 +1633,11 @@ mod tests {
         let cfg = dcfg();
         // Idle, grid = +200, bias = 100 → raw = 100 → fires, start
         // discharging.
-        assert!((compute_grid_correction(200.0, 0.0, &cfg) - 100.0).abs() < 1e-6);
+        assert!((compute_grid_correction(200.0, 0.0, 2, &cfg) - 100.0).abs() < 1e-6);
         // Idle, grid = +50 (< bias) → 0, hold.
-        assert_eq!(compute_grid_correction(50.0, 0.0, &cfg), 0.0);
+        assert_eq!(compute_grid_correction(50.0, 0.0, 2, &cfg), 0.0);
         // Idle, grid = -300, bias = 100 → raw = -200 → fires, charge.
-        assert!((compute_grid_correction(-300.0, 0.0, &cfg) - (-200.0)).abs() < 1e-6);
+        assert!((compute_grid_correction(-300.0, 0.0, 2, &cfg) - (-200.0)).abs() < 1e-6);
     }
 
     fn make_battery(id: &str, plug_w: f64, max_charge: f64, max_discharge: f64) -> BatteryState {
