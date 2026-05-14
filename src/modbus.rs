@@ -60,6 +60,15 @@ const REG_DISCHARGE_POWER_SETPOINT: u16 = 42021;
 
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Marstek firmware floor (W): commands below this magnitude collapse to
+/// Standby because the inverter silently ignores tiny setpoints. Per the
+/// hilman2/MarstekVenus reference impl. Exposed `pub` so the dispatcher
+/// can run a consolidation pass — splitting a setpoint of e.g. 80 W
+/// across two batteries gives 40 W each, which then rounds back to
+/// Standby on both. The consolidation pass concentrates such cases onto
+/// one battery so the command actually fires.
+pub const MARSTEK_MIN_W: f64 = 50.0;
+
 fn connect_timeout() -> Duration {
     Duration::from_millis(crate::config::MODBUS_CONNECT_TIMEOUT_MS)
 }
@@ -321,20 +330,19 @@ impl Setpoint {
     /// own max_charge_w / max_discharge_w and Marstek's hard 2500 W
     /// firmware cap.
     ///
-    /// Power magnitudes below the firmware's `MIN_W` threshold (50 W,
-    /// per the hilman2/MarstekVenus reference impl) collapse to
-    /// `Standby` because the Marstek silently ignores tiny commands —
-    /// safer to explicitly stop than to issue a command that won't act.
+    /// Power magnitudes below the firmware's `MARSTEK_MIN_W` threshold
+    /// collapse to `Standby` because the Marstek silently ignores tiny
+    /// commands — safer to explicitly stop than to issue a command that
+    /// won't act.
     pub fn from_signed_watts(w: f64, max_charge: f64, max_discharge: f64) -> Self {
         const HARD_MAX_W: f64 = 2500.0;
-        const MIN_W: f64 = 50.0;
-        if w.abs() < MIN_W {
+        if w.abs() < MARSTEK_MIN_W {
             Setpoint::Standby
         } else if w < 0.0 {
-            let watts = (-w).clamp(MIN_W, max_charge.min(HARD_MAX_W)) as u16;
+            let watts = (-w).clamp(MARSTEK_MIN_W, max_charge.min(HARD_MAX_W)) as u16;
             Setpoint::Charge { watts }
         } else {
-            let watts = w.clamp(MIN_W, max_discharge.min(HARD_MAX_W)) as u16;
+            let watts = w.clamp(MARSTEK_MIN_W, max_discharge.min(HARD_MAX_W)) as u16;
             Setpoint::Discharge { watts }
         }
     }
