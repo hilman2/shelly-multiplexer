@@ -534,8 +534,10 @@ function addBatteryCard(b = {}) {
       <label>priority_weight<input data-f="priority_weight" type="number" min="0.01" step="any" value="${b.priority_weight ?? 1.0}" required></label>
       <label class="soc-modbus">marstek_model
         <select data-f="marstek_model">
-          <option value="venus_e"${(b.marstek_model || "venus_e") === "venus_e" ? " selected" : ""}>Venus E (v1 / v2 / v3) — reg 34002</option>
-          <option value="venus_e_v12"${b.marstek_model === "venus_e_v12" ? " selected" : ""}>Venus E v1.2 — reg 32104</option>
+          <option value="venus_e_v1_v2"${(["venus_e_v1_v2", "venus_e_v12", "venus_e_v1v2", undefined, null, ""].includes(b.marstek_model) || !b.marstek_model) ? " selected" : ""}>Venus E v1 / v2 (most common — SoC reg 32104)</option>
+          <option value="venus_e_v3"${(b.marstek_model === "venus_e_v3" || b.marstek_model === "venus_e") ? " selected" : ""}>Venus E v3 (SoC reg 34002)</option>
+          <option value="venus_d"${b.marstek_model === "venus_d" ? " selected" : ""}>Venus D</option>
+          <option value="venus_a"${b.marstek_model === "venus_a" ? " selected" : ""}>Venus A</option>
         </select>
       </label>
       <label class="soc-modbus">modbus_host — IP of the RS485-to-LAN bridge (Waveshare / EW11 / DR134 / M5Stack). On Venus E V3 with Ethernet cable, use the same value as "address". Leave blank to keep the battery inactive.<input data-f="modbus_host" type="text" placeholder="e.g. 192.168.1.91" value="${escapeAttr(b.modbus_host || "")}"></label>
@@ -612,7 +614,7 @@ function readBatteries() {
       max_discharge_w: num("max_discharge_w"),
       capacity_wh: num("capacity_wh") ?? 0,
       priority_weight: num("priority_weight") ?? 1.0,
-      marstek_model: get("marstek_model") || "venus_e",
+      marstek_model: get("marstek_model") || "venus_e_v1_v2",
       modbus_port: num("modbus_port") ?? 502,
       modbus_unit_id: num("modbus_unit_id") ?? 1,
       soc_interval_ms: num("soc_interval_ms") ?? 30000,

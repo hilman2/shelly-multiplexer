@@ -130,24 +130,30 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
 async fn poll_battery_loop(state: Arc<AppState>, battery: BatteryConfig, read_power_too: bool) {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
-    let soc_register = battery.marstek_model.soc_register();
-    let power_register = battery.marstek_model.battery_power_register();
+    let model = battery.marstek_model;
+    let soc_register = model.soc_register();
+    let soc_scale = model.soc_scale();
+    let power_register = model.battery_power_register();
+    let power_is_int32 = model.battery_power_is_int32();
     let interval = Duration::from_millis(battery.soc_interval_ms.max(1000));
 
     info!(
         battery = %battery.id,
         target = %target,
         unit = battery.modbus_unit_id,
+        ?model,
         soc_register,
+        soc_scale,
         power_register,
+        power_is_int32,
         read_power_too,
         "modbus poller starting"
     );
 
     loop {
-        let soc_result = read_soc(target, unit, soc_register).await;
+        let soc_result = read_soc(target, unit, soc_register, soc_scale).await;
         let power_result = if read_power_too {
-            Some(read_battery_power(target, unit, power_register).await)
+            Some(read_battery_power(target, unit, power_register, power_is_int32).await)
         } else {
             None
         };
@@ -184,18 +190,18 @@ async fn poll_battery_loop(state: Arc<AppState>, battery: BatteryConfig, read_po
     }
 }
 
-async fn read_soc(target: std::net::SocketAddr, unit: Slave, register: u16) -> Result<f64> {
+async fn read_soc(
+    target: std::net::SocketAddr,
+    unit: Slave,
+    register: u16,
+    scale: f64,
+) -> Result<f64> {
     let regs = read_holding(target, unit, register, 1).await?;
     let raw = regs
         .first()
         .copied()
         .ok_or_else(|| anyhow!("modbus reg {register}: empty response"))?;
-    // Some firmware variants report decipercent (0..=1000); accept either.
-    let soc = if raw > 100 {
-        f64::from(raw) / 10.0
-    } else {
-        f64::from(raw)
-    };
+    let soc = f64::from(raw) * scale;
     if !(0.0..=100.0).contains(&soc) {
         anyhow::bail!("modbus reg {register}: SoC {soc} out of range");
     }
@@ -206,15 +212,26 @@ async fn read_battery_power(
     target: std::net::SocketAddr,
     unit: Slave,
     register: u16,
+    is_int32: bool,
 ) -> Result<f64> {
-    let regs = read_holding(target, unit, register, 1).await?;
-    let raw = regs
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("modbus reg {register}: empty response"))?;
-    // int16 — Marstek encodes signed power as two's complement uint16.
-    let signed = raw as i16;
-    Ok(f64::from(signed))
+    if is_int32 {
+        // Venus E v1/v2: signed 32-bit power split across TWO registers
+        // (big-endian word order — high word first).
+        let regs = read_holding(target, unit, register, 2).await?;
+        if regs.len() < 2 {
+            anyhow::bail!("modbus reg {register}: expected 2 registers, got {}", regs.len());
+        }
+        let combined = ((regs[0] as u32) << 16) | (regs[1] as u32);
+        Ok(f64::from(combined as i32))
+    } else {
+        // Single int16 register (A, D, E v3).
+        let regs = read_holding(target, unit, register, 1).await?;
+        let raw = regs
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("modbus reg {register}: empty response"))?;
+        Ok(f64::from(raw as i16))
+    }
 }
 
 async fn read_holding(
@@ -357,16 +374,22 @@ pub async fn init_dispatch(battery: &BatteryConfig) -> Result<BmsCutoffs> {
     write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
     write_reg(&mut ctx, REG_FORCE_MODE, 0).await?;
 
-    // Read BMS cutoffs. These are 0..=1000 raw (scale 0.1), so the
-    // upper-bound check on percentage applies after scaling.
-    let cutoffs = read_bms_cutoffs(&mut ctx).await.unwrap_or_else(|e| {
-        warn!(
-            battery = %battery.id,
-            error = %e,
-            "could not read BMS cutoffs (44000/44001) — falling back to dispatcher defaults"
-        );
+    // Read BMS cutoffs ONLY when the variant exposes them. The upstream
+    // YAMLs list 44000/44001 for Venus E v1/v2 only; A, D, and E v3
+    // don't have them, and reading the wrong register on those would
+    // either return garbage or a Modbus exception.
+    let cutoffs = if battery.marstek_model.supports_bms_cutoffs() {
+        read_bms_cutoffs(&mut ctx).await.unwrap_or_else(|e| {
+            warn!(
+                battery = %battery.id,
+                error = %e,
+                "could not read BMS cutoffs (44000/44001) — falling back to dispatcher defaults"
+            );
+            BmsCutoffs::default()
+        })
+    } else {
         BmsCutoffs::default()
-    });
+    };
 
     let _ = ctx.disconnect().await;
     info!(

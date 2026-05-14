@@ -571,7 +571,8 @@ fn default_priority_weight() -> f64 {
     1.0
 }
 fn default_marstek_model() -> MarstekModel {
-    MarstekModel::VenusE
+    // Venus E v1/v2 is the most-installed variant in the wild.
+    MarstekModel::VenusEV1V2
 }
 fn default_modbus_port() -> u16 {
     502
@@ -583,38 +584,95 @@ fn default_soc_interval_ms() -> u64 {
     30000
 }
 
-/// Marstek hardware variants distinguished by their Modbus register map.
-/// Mapping per the ViperRNMC marstek_venus_modbus integration:
-///   - Venus E v1 / v2 / E v3  → SoC at holding register 34002
-///   - Venus E v1.2            → SoC at holding register 32104
+/// Marstek hardware variants distinguished by their Modbus register
+/// map. Sourced from the ViperRNMC marstek_venus_modbus integration's
+/// per-variant YAMLs — the upstream HA add-on's "Mit Marstek Venus per
+/// Modbus verbinden" dialog uses the same four-way split.
+///
+/// | variant       | SoC reg | SoC scale | bp reg | bp dtype | BMS cutoffs  |
+/// |---------------|---------|-----------|--------|----------|--------------|
+/// | Venus A       | 32104   | 1         | 30001  | int16    | not defined  |
+/// | Venus D       | 32104   | 1         | 30001  | int16    | not defined  |
+/// | Venus E v1/v2 | 32104   | 1         | 32102  | **int32**| 44000/44001  |
+/// | Venus E v3    | 34002   | **0.1**   | 30001  | int16    | not defined  |
+///
+/// Control registers (RS485 control 42000, force_mode 42010, charge
+/// power 42020, discharge power 42021, user work mode 43000) are
+/// identical across all four variants.
+///
+/// Serde aliases preserve backward-compat with pre-v0.7.2 configs that
+/// used `marstek_model = "venus_e"` (now Venus E v3) and
+/// `marstek_model = "venus_e_v12"` (now Venus E v1/v2 — the earlier
+/// naming wrongly read "v12" as "v1.2"; upstream file `e_v12.yaml`
+/// combines v1 AND v2).
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum MarstekModel {
-    /// Venus E (v1, v2, v3) — SoC register 34002.
-    VenusE,
-    /// Venus E v1.2 — SoC register 32104.
-    VenusEV12,
+    #[serde(rename = "venus_a")]
+    VenusA,
+    #[serde(rename = "venus_d")]
+    VenusD,
+    /// Venus E v1 / v2 — upstream file `e_v12.yaml`. By far the most
+    /// installed Venus E in the wild → multiplexer default. Aliases
+    /// `venus_e_v12` and `venus_e_v1v2` keep old configs loading.
+    #[serde(
+        rename = "venus_e_v1_v2",
+        alias = "venus_e_v12",
+        alias = "venus_e_v1v2"
+    )]
+    VenusEV1V2,
+    /// Venus E v3 — newer firmware with native Ethernet Modbus support.
+    /// Alias `venus_e` for pre-v0.7.2 configs.
+    #[serde(rename = "venus_e_v3", alias = "venus_e")]
+    VenusEV3,
 }
 
 impl MarstekModel {
-    /// Holding-register address that holds battery SoC (uint16, percent).
+    /// Holding-register address that holds battery SoC (uint16). Scale
+    /// varies per variant — see `soc_scale`.
     pub fn soc_register(self) -> u16 {
         match self {
-            MarstekModel::VenusE => 34002,
-            MarstekModel::VenusEV12 => 32104,
+            MarstekModel::VenusA => 32104,
+            MarstekModel::VenusD => 32104,
+            MarstekModel::VenusEV1V2 => 32104,
+            MarstekModel::VenusEV3 => 34002,
         }
     }
 
-    /// Holding-register address that reports current battery output power
-    /// (int16, watts; sign indicates direction). Cross-referenced against
-    /// the plug PM Gen3 in modbus dispatch mode for closed-loop refinement.
+    /// Multiplier applied to the raw SoC register value. V3 reports
+    /// decipercent (raw 0..=1000 → 0..=100 %); all others report whole
+    /// percent.
+    pub fn soc_scale(self) -> f64 {
+        match self {
+            MarstekModel::VenusEV3 => 0.1,
+            _ => 1.0,
+        }
+    }
+
+    /// Holding-register address that reports current battery output
+    /// power (signed watts). See `battery_power_is_int32` for encoding.
     pub fn battery_power_register(self) -> u16 {
         match self {
-            // v3 (and the A/D ETH variants) report battery_power at 30001.
-            // v1.2 sits at 32102.
-            MarstekModel::VenusE => 30001,
-            MarstekModel::VenusEV12 => 32102,
+            MarstekModel::VenusA => 30001,
+            MarstekModel::VenusD => 30001,
+            // Venus E v1/v2 packs power into TWO consecutive registers
+            // as a signed 32-bit int — the only variant that does this.
+            MarstekModel::VenusEV1V2 => 32102,
+            MarstekModel::VenusEV3 => 30001,
         }
+    }
+
+    /// True iff battery_power_register spans 2 registers as int32 (big-
+    /// endian word order). Single-register int16 otherwise.
+    pub fn battery_power_is_int32(self) -> bool {
+        matches!(self, MarstekModel::VenusEV1V2)
+    }
+
+    /// True iff this variant's firmware exposes the BMS-configured
+    /// charging / discharging cutoff registers (44000 / 44001). The
+    /// upstream YAMLs only list those for Venus E v1/v2; for the other
+    /// variants we fall back to the dispatcher's TOML default.
+    pub fn supports_bms_cutoffs(self) -> bool {
+        matches!(self, MarstekModel::VenusEV1V2)
     }
 }
 
@@ -1161,11 +1219,53 @@ soc_entity_id = "sensor.battery_a"
     }
 
     /// MarstekModel enum is wired up to the SoC register map per the
-    /// ViperRNMC integration. Regression test for the v0.5.0 Modbus rewrite.
+    /// ViperRNMC integration. The four-way split matches the upstream
+    /// HA add-on's connection dialog (Venus A / D / E v1/v2 / E v3).
     #[test]
     fn marstek_model_register_map() {
-        assert_eq!(MarstekModel::VenusE.soc_register(), 34002);
-        assert_eq!(MarstekModel::VenusEV12.soc_register(), 32104);
+        // SoC register addresses
+        assert_eq!(MarstekModel::VenusA.soc_register(), 32104);
+        assert_eq!(MarstekModel::VenusD.soc_register(), 32104);
+        assert_eq!(MarstekModel::VenusEV1V2.soc_register(), 32104);
+        assert_eq!(MarstekModel::VenusEV3.soc_register(), 34002);
+        // SoC scale (only v3 reports decipercent)
+        assert_eq!(MarstekModel::VenusA.soc_scale(), 1.0);
+        assert_eq!(MarstekModel::VenusEV3.soc_scale(), 0.1);
+        // battery_power register
+        assert_eq!(MarstekModel::VenusA.battery_power_register(), 30001);
+        assert_eq!(MarstekModel::VenusD.battery_power_register(), 30001);
+        assert_eq!(MarstekModel::VenusEV1V2.battery_power_register(), 32102);
+        assert_eq!(MarstekModel::VenusEV3.battery_power_register(), 30001);
+        // int32 encoding (only v1/v2)
+        assert!(!MarstekModel::VenusA.battery_power_is_int32());
+        assert!(!MarstekModel::VenusD.battery_power_is_int32());
+        assert!(MarstekModel::VenusEV1V2.battery_power_is_int32());
+        assert!(!MarstekModel::VenusEV3.battery_power_is_int32());
+        // BMS cutoffs (only v1/v2 has them defined)
+        assert!(!MarstekModel::VenusA.supports_bms_cutoffs());
+        assert!(!MarstekModel::VenusD.supports_bms_cutoffs());
+        assert!(MarstekModel::VenusEV1V2.supports_bms_cutoffs());
+        assert!(!MarstekModel::VenusEV3.supports_bms_cutoffs());
+    }
+
+    /// Backward-compat aliases for pre-v0.7.2 configs.
+    #[test]
+    fn marstek_model_legacy_aliases() {
+        use serde::de::IntoDeserializer;
+        // Old "venus_e" → VenusEV3
+        let m: MarstekModel = serde::Deserialize::deserialize(
+            <&str as IntoDeserializer<serde::de::value::Error>>::into_deserializer("venus_e"),
+        )
+        .unwrap();
+        assert_eq!(m, MarstekModel::VenusEV3);
+        // Old "venus_e_v12" → VenusEV1V2
+        let m: MarstekModel = serde::Deserialize::deserialize(
+            <&str as IntoDeserializer<serde::de::value::Error>>::into_deserializer(
+                "venus_e_v12",
+            ),
+        )
+        .unwrap();
+        assert_eq!(m, MarstekModel::VenusEV1V2);
     }
 
     /// In Modbus mode a battery WITHOUT modbus_host loads but is marked
@@ -1338,6 +1438,7 @@ modbus_host = "192.168.1.91"
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.batteries[0].marstek_model, MarstekModel::VenusEV12);
+        // Legacy "venus_e_v12" alias maps to the new VenusEV1V2 variant.
+        assert_eq!(cfg.batteries[0].marstek_model, MarstekModel::VenusEV1V2);
     }
 }
