@@ -1,4 +1,4 @@
-# ShellyMultiplexer — example configuration (v0.4.0+, pulse architecture).
+# ShellyMultiplexer — example configuration (v0.8.0).
 #
 # Before starting the multiplexer the real Shelly Pro 3EM MUST be moved
 # off the default UDP-RPC port 1010 (e.g. 2020) so the multiplexer can
@@ -7,6 +7,18 @@
 #
 # Every battery REQUIRES a dedicated Shelly Plug PM Gen3 (`plug_url`).
 # The plug is the single safety ground truth for circuit-cap enforcement.
+#
+# v0.8 simplified the dispatcher knob set from ~25 down to ~12. Old TOMLs
+# load unchanged — removed fields are silently ignored. The removed
+# knobs (modbus_*_timeout_ms, modbus_heartbeat_s, modbus_min_write_interval_s,
+# modbus_watchdog_grace_s, setpoint_deadband_w, grid_smoothing_s,
+# hit_tolerance_w, pulse_count, group_silent_after_stale_s,
+# soc_unknown_lockout_s, emergency_cutoff_grace_s, emergency_cutoff_recovery_s,
+# night_cutoff_soc_margin_pct) are now compile-time constants with sensible
+# defaults in dispatcher.rs / modbus.rs. The new `rate_limit_w_per_cycle`
+# replaces EMA smoothing, the per-write throttle, and the heartbeat with
+# a single algorithm-level ramp limit — same pattern as the upstream
+# Python reference impl (hilman2/MarstekVenus).
 
 [real_shelly]
 # IP of the real Shelly Pro 3EM (the grid measurement source)
@@ -40,94 +52,53 @@ enable_mdns = true
 bind_address = "0.0.0.0:8080"
 
 [dispatcher]
-# Dispatch backend. "modbus" (default) writes power setpoints directly
-# to each Marstek (registers 42010/42020/42021). "pulse" keeps the
-# legacy Shelly-3EM-emulation path for non-Modbus setups.
+# Dispatch backend.
+#   "modbus" (default): writes absolute power setpoints every cycle
+#                       via registers 42010 / 42020 / 42021. Direct,
+#                       cap-safe, requires `modbus_host` per battery.
+#   "pulse"  (legacy):  Shelly-Pro-3EM CT emulation. For installs
+#                       without per-battery Modbus reach.
 mode = "modbus"
-# Recompute interval for desired_w + setpoint generation. 500 ms is
-# responsive enough for noisy load profiles (heater PWM, induction
-# cooktops, cloud-driven PV) without queueing commands faster than
-# the Marstek can act on. The min-write-interval throttle and the
-# setpoint deadband still bound the actual write rate.
-cycle_ms = 500
-# Δ below this is ignored (Marstek-quantisation noise) AND is the
-# minimum pulse magnitude we'll issue.
+# Tick rate. 2 s matches the Marstek ramp window — going faster just
+# queues commands the inverter can't act on. Combined with the rate
+# limit below, this controls the overall response speed.
+cycle_ms = 2000
+# Grid-imbalance noise floor. Imbalances smaller than this are ignored.
 deadband_w = 50
-# Plug-movement threshold that counts a previous pulse as "landed".
-# Must be ≤ deadband_w (every issued pulse moves the plug by at least this).
-hit_tolerance_w = 15
-# Pulses sent per delta change (Marstek needs ≥ 2; 3 = safety margin)
-pulse_count = 3
-# SoC eligibility gates (per-battery overrides under [[batteries]])
+# Asymmetric "never cross zero" margin. Charging: leaves this many W
+# of grid EXPORT unaddressed (never pulls import). Discharging: leaves
+# this many W of grid IMPORT unaddressed (never pushes into export).
+grid_bias_w = 100
+# Max change of a battery's setpoint per cycle. Smooths big steps into
+# a ramp — going 0 W → 2.5 kW takes ceil(2500 / 500) = 5 cycles ≈ 10 s.
+# Replaces the EMA grid smoother + per-write throttle + heartbeat the
+# v0.7 schema exposed. Same pattern as the Python reference impl's
+# "max 750 W/cycle" rate limit.
+rate_limit_w_per_cycle = 500
+# SoC gates. BMS-reported cutoffs (Modbus reg 44000 / 44001) take
+# precedence when available — those reflect the user's actual setting
+# in the Marstek app and are far more authoritative.
 soc_full_pct = 95
 soc_empty_pct = 5
-# Stale-measurement timeouts. If exceeded, the affected circuit (plug) /
-# all circuits (grid) go silent for `group_silent_after_stale_s` so the
-# Marstek watchdog clears its integrator.
-plug_stale_s = 2.0
-grid_stale_s = 5.0
-group_silent_after_stale_s = 60.0
-# Use only this fraction of the circuit fuse cap (jitter buffer)
+# Fraction of the circuit fuse cap the dispatcher will actually use.
+# 0.95 = 5 % jitter buffer.
 circuit_headroom = 0.95
-# Asymmetric grid bias: leave this many W on the import side when
-# discharging (avoid accidental export) and on the export side when
-# charging (avoid paying for grid). 0 = dispatch to exact 0.
-grid_bias_w = 30
-# Time-based pulse-settle fallback: if the plug hasn't moved by
-# hit_tolerance_w within this many seconds, accept and move on.
-settle_timeout_s = 10.0
-# Empirical full/empty detection (PULSE MODE ONLY). When a battery
-# refuses a directional pulse (significant request, no plug movement
-# before settle_timeout_s elapses), that DIRECTION is locked for this
-# many seconds. Modbus mode doesn't need it — direct telemetry (SoC,
-# force_mode, battery_power) tells us the truth.
-soc_unknown_lockout_s = 600
-
-# ---- Modbus-dispatch tuning (mode = "modbus") ----
-# Skip the Modbus write when the new setpoint is within this many W
-# of the last successful write. Reduces traffic on slow RS485 bridges
-# and prevents chasing tiny grid wobble.
-setpoint_deadband_w = 100
-# Re-write the current setpoint at least this often (heartbeat — also
-# our process-liveness signal, Marstek firmware has no watchdog).
-modbus_heartbeat_s = 30
-# Hard minimum interval (seconds) between successive Modbus writes
-# per battery. Even if the dispatcher decides the setpoint changed
-# enough to warrant a write, the writer task refuses to fire faster
-# than this — gives each Marstek time to ramp toward the new setpoint.
-modbus_min_write_interval_s = 5
-# Internal watchdog: if the dispatcher loop hangs for this long, a
-# background task force-writes force_mode=0 and exits. 0 disables.
-modbus_watchdog_grace_s = 30
-# EMA smoothing on grid_w. PV inverters can swing the raw reading by
-# ±2 kW at 4 Hz; without smoothing we'd chase that noise. 5 s gives
-# a sensible tracking response without lagging real load changes.
-grid_smoothing_s = 5
-# Modbus connect + request timeouts. Venus E V3 (native Ethernet
-# Modbus) is noticeably slower to respond than v1/v2 behind an Elfin
-# or Waveshare bridge — the bridge has its own TCP stack and acks
-# instantly, V3 goes straight to the inverter's own Modbus server.
-# 10s / 5s are V3-safe and don't hurt v1/v2.
-modbus_connect_timeout_ms = 10000
-modbus_request_timeout_ms = 5000
-# Per-write retry budget on transient failures (connect timeout,
-# Modbus exception, etc.). Exponential 200ms × attempt backoff.
-modbus_write_retries = 2
-
-# ---- Emergency plug cutoff (safety) ----
-# Hard-disconnect a battery via its Shelly Plug PM Gen3 relay when the
-# circuit's measured plug sum exceeds cap × headroom + margin for the
-# grace window. Last line of defence — soft control should keep us
-# under cap normally. 0 disables.
+# Plug silent this long → mute its circuit (cap math goes stale).
+plug_stale_s = 5
+# Real Shelly silent this long → mute every circuit.
+grid_stale_s = 5
+# Settle escape hatch: after a battery write, accept the cycle as done
+# after this long even without observable plug movement. Bounds the
+# wait if a Marstek refuses to react.
+settle_timeout_s = 10
+# Hardware safety: when the SIGNED plug-power sum on a circuit exceeds
+# cap × headroom + this, physically open the worst offender's Shelly
+# Plug relay. 0 disables. Grace + recovery are hardcoded at 5 s / 600 s.
 emergency_cutoff_margin_w = 200
-emergency_cutoff_grace_s = 5
-emergency_cutoff_recovery_s = 600
-
-# ---- Night cutoff (efficiency) ----
-# Cut empty batteries between sunset and sunrise to skip the Marstek's
-# ~5-15 W inverter standby loss. Requires [location] below to be set.
+# Optional efficiency feature: between sunset and sunrise, disconnect
+# empty batteries to skip the Marstek inverter's ~5-15 W standby loss.
+# Requires [location] below. Hysteresis is hardcoded at 2 % SoC.
 night_cutoff_enabled = false
-night_cutoff_soc_margin_pct = 2
 
 [location]
 # Required when [dispatcher].night_cutoff_enabled = true. Decimal
@@ -139,7 +110,7 @@ night_cutoff_soc_margin_pct = 2
 [home_assistant]
 # SoC source switch (global).
 #   enabled = false → SoC is read via Modbus TCP directly from each
-#                     Marstek battery (default port 502). HA is not used.
+#                     Marstek battery (default port 502). HA not used.
 #   enabled = true  → SoC is read from HA entities. Every battery MUST
 #                     have a soc_entity_id; Modbus is not used.
 # Token can be left blank inside the add-on (sourced from
@@ -173,28 +144,29 @@ max_charge_w = 2500
 max_discharge_w = 800
 capacity_wh = 2500
 priority_weight = 1.0
-# Modbus SoC source (used when [home_assistant].enabled = false).
-# marstek_model picks the register map per the ViperRNMC integration:
-#   "venus_e"     → SoC holding register 34002 (v1 / v2 / v3)
-#   "venus_e_v12" → SoC holding register 32104 (Venus E v1.2)
-marstek_model = "venus_e"
+# marstek_model picks the Modbus register map per the ViperRNMC
+# integration. Matches the four-way split in the HA "Mit Marstek
+# Venus per Modbus verbinden" dialog:
+#   "venus_a"       → Venus A
+#   "venus_d"       → Venus D
+#   "venus_e_v1_v2" → Venus E V1 / V2 (most common; default)
+#   "venus_e_v3"    → Venus E V3 (newer, native Ethernet Modbus)
+marstek_model = "venus_e_v1_v2"
 # modbus_host: IP of the RS485-to-LAN bridge connected to the
 # battery's RS485 port — most Marstek variants (A / D / E v1 / v2 /
 # v1.2 / E 2.0) do NOT expose Modbus on their own WiFi interface.
-# Common bridges:
-#   - Waveshare RS485-to-RJ45 Ethernet Converter
-#   - Elfin EW11 (WiFi)
-#   - PUSR DR134
-#   - M5Stack Atom S3 Lite + RS485 base
+# Common bridges: Waveshare, Elfin EW11, PUSR DR134, M5Stack Atom S3.
 # For Venus E V3 with an Ethernet cable (recent firmware), set this to
 # the same IP as `address` — the battery speaks Modbus TCP natively.
 # If you leave this OUT, the battery loads as INACTIVE: the dispatcher
-# skips it entirely (no pulses, no SoC poll) until you configure a
-# source. Old v0.4.x configs with `vendor` / `marstek_port` continue to
-# load — those fields are now ignored.
+# skips it entirely until you configure a source. Old v0.4.x configs
+# with `vendor` / `marstek_port` continue to load — those fields are
+# now ignored.
 modbus_host = "192.168.1.91"
 modbus_port = 502
 modbus_unit_id = 1
+# Upper bound on SoC poll frequency. The SoC read is piggybacked onto
+# the BatteryWriter's existing connection — no separate TCP socket.
 soc_interval_ms = 60000
 # SoC-based power tapering (optional). Real batteries can't accept
 # full max_charge_w near 100 % SoC nor sustain full max_discharge_w
@@ -221,7 +193,7 @@ max_charge_w = 2500
 max_discharge_w = 800
 capacity_wh = 2500
 priority_weight = 1.0
-marstek_model = "venus_e"
+marstek_model = "venus_e_v1_v2"
 modbus_host = "192.168.1.92"   # IP of this battery's RS485-to-LAN bridge
 modbus_port = 502
 modbus_unit_id = 1

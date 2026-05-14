@@ -182,7 +182,7 @@ fn enforce_night_cutoff(
         for b in bats.values_mut() {
             // Resolve the effective empty threshold (BMS > TOML > default).
             let empty = b.effective_soc_empty_pct(dcfg.soc_empty_pct);
-            let margin = dcfg.night_cutoff_soc_margin_pct;
+            let margin = crate::config::NIGHT_CUTOFF_SOC_MARGIN_PCT;
             let is_empty = matches!(b.soc_pct, Some(soc) if soc <= empty + margin);
 
             // Is THIS battery currently cut because of a night cutoff?
@@ -315,8 +315,8 @@ fn enforce_circuit_safety(state: Arc<AppState>, dcfg: &DispatcherConfig) {
         return;
     }
     let now = Instant::now();
-    let grace = Duration::from_secs_f64(dcfg.emergency_cutoff_grace_s.max(0.5));
-    let recovery = Duration::from_secs_f64(dcfg.emergency_cutoff_recovery_s.max(60.0));
+    let grace = Duration::from_secs_f64(crate::config::EMERGENCY_CUTOFF_GRACE_S.max(0.5));
+    let recovery = Duration::from_secs_f64(crate::config::EMERGENCY_CUTOFF_RECOVERY_S.max(60.0));
 
     let mut to_trip: Vec<(String, String, String)> = Vec::new(); // (id, plug_url, reason)
     let mut to_reenable: Vec<(String, String)> = Vec::new(); // (id, plug_url)
@@ -500,13 +500,11 @@ fn step_modbus(
         return Ok(());
     }
 
-    // Prefer the EMA-smoothed grid reading over the raw one. Falls
-    // back to raw if smoothing is disabled or no sample yet.
+    // Raw grid reading. Smoothing has moved to the algorithm level
+    // (`rate_limit_w_per_cycle`) so we don't need to pre-filter here.
     let grid_w = {
         let snap = state.snapshot.load_full();
-        snap.smoothed_grid_w
-            .or(snap.status.total_act_power)
-            .unwrap_or(0.0)
+        snap.status.total_act_power.unwrap_or(0.0)
     };
     let targets = compute_targets(state, dcfg, grid_w, now);
 
@@ -522,9 +520,10 @@ fn step_modbus(
     //     delivers, A's plug shows the actual power and the next
     //     candidate on the circuit gets the remainder.
     //
-    // The writer task's own heartbeat re-issues unchanged setpoints
-    // every `modbus_heartbeat_s` so batteries we DIDN'T pick this cycle
-    // still get periodic "I'm still here" writes.
+    // No write heartbeat: the dispatcher itself drives every
+    // setpoint change. Batteries we don't pick this cycle hold their
+    // previous setpoint at the Marstek end (firmware persists the
+    // last force_mode + power) until they're picked again.
     let bats = state.batteries.read();
     let circuits = state.circuits.read();
     for cs in circuits.values() {
@@ -542,7 +541,7 @@ fn step_modbus(
             .filter_map(|id| bats.get(id))
             .filter(|b| b.plug_cut_until.is_none())
             .filter(|b| {
-                b.modbus_settled(dcfg.plug_stable_duration_s, dcfg.settle_timeout_s)
+                b.modbus_settled(crate::config::PLUG_STABLE_DURATION_S, dcfg.settle_timeout_s)
             })
             .map(|b| {
                 let target = targets.get(&b.id).copied().unwrap_or(0.0);
@@ -559,7 +558,7 @@ fn step_modbus(
             // Skip the write if it's below the setpoint deadband — saves
             // Modbus traffic on micro-jitters. The writer task's
             // heartbeat covers the "I'm still here" angle.
-            if delta < dcfg.setpoint_deadband_w {
+            if delta < dcfg.deadband_w {
                 continue;
             }
             let sp = Setpoint::from_signed_watts(target_w, b.max_charge_w, b.max_discharge_w);
@@ -594,9 +593,7 @@ fn step_pulse(state: &AppState, dcfg: &DispatcherConfig) -> anyhow::Result<()> {
     }
     let grid_w = {
         let snap = state.snapshot.load_full();
-        snap.smoothed_grid_w
-            .or(snap.status.total_act_power)
-            .unwrap_or(0.0)
+        snap.status.total_act_power.unwrap_or(0.0)
     };
     let deltas = compute_deltas(state, dcfg, grid_w, now);
     queue_pulses(state, dcfg, &deltas, now);
@@ -640,7 +637,7 @@ fn detect_pulse_outcomes(state: &AppState, dcfg: &DispatcherConfig, now: Instant
         };
         let moved = (plug - snap).abs();
 
-        if moved >= dcfg.plug_stable_w {
+        if moved >= crate::config::PLUG_STABLE_W {
             // Pulse landed. The Marstek IS responding in this direction,
             // so any prior lockout for it is stale — drop it.
             if delta < 0.0 {
@@ -665,13 +662,13 @@ fn detect_pulse_outcomes(state: &AppState, dcfg: &DispatcherConfig, now: Instant
         }
         // Refusal confirmed: significant directional request, no plug
         // movement, settle window over. Lock the offending direction.
-        let until = now + Duration::from_secs_f64(dcfg.soc_unknown_lockout_s);
+        let until = now + Duration::from_secs_f64(crate::config::SOC_UNKNOWN_LOCKOUT_S);
         if delta < 0.0 {
             b.charge_locked_until = Some(until);
             warn!(
                 battery = %b.id,
                 delta_w = delta,
-                lockout_s = dcfg.soc_unknown_lockout_s,
+                lockout_s = crate::config::SOC_UNKNOWN_LOCKOUT_S,
                 "charge refused (likely full) — locking charge direction"
             );
         } else {
@@ -679,7 +676,7 @@ fn detect_pulse_outcomes(state: &AppState, dcfg: &DispatcherConfig, now: Instant
             warn!(
                 battery = %b.id,
                 delta_w = delta,
-                lockout_s = dcfg.soc_unknown_lockout_s,
+                lockout_s = crate::config::SOC_UNKNOWN_LOCKOUT_S,
                 "discharge refused (likely empty) — locking discharge direction"
             );
         }
@@ -704,7 +701,7 @@ fn any_pulse_in_flight(state: &AppState, dcfg: &DispatcherConfig, now: Instant) 
         if muted {
             return false;
         }
-        !b.pulse_settled(dcfg.plug_stable_duration_s, dcfg.settle_timeout_s)
+        !b.pulse_settled(crate::config::PLUG_STABLE_DURATION_S, dcfg.settle_timeout_s)
     })
 }
 
@@ -724,7 +721,7 @@ fn update_circuit_mute(state: &AppState, dcfg: &DispatcherConfig, now: Instant) 
     // force_mode (not following CT at all), so there's no integrator
     // to clear — recovery is immediate, no cooldown needed.
     let silence = match dcfg.mode {
-        DispatchMode::Pulse => Duration::from_secs_f64(dcfg.group_silent_after_stale_s),
+        DispatchMode::Pulse => Duration::from_secs_f64(crate::config::GROUP_SILENT_AFTER_STALE_S),
         DispatchMode::Modbus => Duration::ZERO,
     };
 
@@ -1166,6 +1163,29 @@ fn compute_targets(
         active.retain(|b| !clamped_ids.contains(&b.id));
     }
 
+    // Per-battery rate limit: clamp each target's distance from the
+    // CURRENT plug-measured power to ±rate_limit_w_per_cycle. Smooths
+    // big swings into ramps — going 0 W → 2.5 kW takes
+    // ceil(2500 / rate_limit) cycles. Replaces the EMA grid smoother
+    // + per-write throttle + min_write_interval we used to expose: one
+    // knob, applied at the algorithm level. Inspired by the Python ref
+    // impl's "max 750 W/cycle" rate limit.
+    //
+    // Apply BEFORE the per-circuit cap: this only ever SHRINKS target
+    // magnitudes (clamping a delta toward zero can't grow |target|
+    // unless plug and target have opposite signs, in which case the
+    // post-rate-limit |target| ≤ |plug| + rate_limit ≤ |original|),
+    // so the circuit cap below remains a hard upper bound.
+    let rate_limit = dcfg.rate_limit_w_per_cycle.max(1.0);
+    for b in &eligible {
+        let plug = b.last_plug_w.unwrap_or(0.0);
+        if let Some(t) = targets.get_mut(&b.id) {
+            let delta = *t - plug;
+            let limited = delta.clamp(-rate_limit, rate_limit);
+            *t = plug + limited;
+        }
+    }
+
     // Per-circuit cap on the sum of TARGETS (modbus path enforces the
     // fuse limit on commanded power, not on plug+delta — much simpler).
     for cs in circuits.values() {
@@ -1240,7 +1260,7 @@ fn queue_pulses(
         }
 
         b.pending_pulse_w = delta;
-        b.pulse_remaining = dcfg.pulse_count;
+        b.pulse_remaining = crate::config::PULSE_COUNT;
         b.plug_w_at_pulse_send = b.last_plug_w;
         b.last_pulse_completed_at = None;
         // Remember the magnitude+direction we're about to commit, so
@@ -1250,7 +1270,7 @@ fn queue_pulses(
             battery = %b.id,
             delta,
             plug_at_send = ?b.plug_w_at_pulse_send,
-            pulses = dcfg.pulse_count,
+            pulses = crate::config::PULSE_COUNT,
             "armed pulse"
         );
     }
@@ -1504,7 +1524,6 @@ modbus_host = "192.168.1.93"
                 ..Default::default()
             },
             age: Some(Instant::now()),
-            smoothed_grid_w: Some(total_w),
         }));
     }
 
@@ -1798,14 +1817,18 @@ modbus_host = "192.168.1.93"
                 b.last_plug_at = Some(now);
             }
         }
-        let dcfg = dcfg();
+        // Lift the rate-limit so this test exercises the distribution
+        // math, not the per-cycle ramp. There's a dedicated test for
+        // rate-limit ramping below.
+        let mut dcfg = dcfg();
+        dcfg.rate_limit_w_per_cycle = 9999.0;
         let targets = compute_targets(&state, &dcfg, 1500.0, now);
 
         let sum: f64 = targets.values().sum();
-        // Grid bias of 30 W: corrected import is 1470 W; expect ~1470 W
+        // Grid bias of 100 W: corrected import is 1400 W; expect ~1400 W
         // total discharge spread across 3 batteries.
         assert!(
-            (sum - 1470.0).abs() < 1.0,
+            (sum - 1400.0).abs() < 1.0,
             "sum of targets should equal grid - bias, got {sum}"
         );
         // Each battery gets roughly a third — positive (discharge).
@@ -1815,6 +1838,37 @@ modbus_host = "192.168.1.93"
                 "{id}: target {t} not within expected third"
             );
         }
+    }
+
+    /// With the rate limit at 500 W/cycle and three batteries starting
+    /// at plug=0, a 5 kW grid import must NOT instantly push them to
+    /// max — each one ramps by at most 500 W toward the desired target.
+    #[test]
+    fn compute_targets_rate_limit_clamps_per_cycle_ramp() {
+        let state = three_battery_state();
+        fresh_grid_snapshot(&state, 5000.0);
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(0.0);
+                b.last_plug_at = Some(now);
+            }
+        }
+        let mut dcfg = dcfg();
+        dcfg.rate_limit_w_per_cycle = 500.0;
+        let targets = compute_targets(&state, &dcfg, 5000.0, now);
+
+        // Each battery from plug=0: |target - 0| ≤ 500 → |target| ≤ 500.
+        for (id, t) in &targets {
+            assert!(
+                t.abs() <= 500.0 + 1e-3,
+                "{id}: |target {t}| should be ≤ rate_limit 500"
+            );
+        }
+        // Sum across the eligible three ≤ 1500.
+        let sum: f64 = targets.values().sum();
+        assert!(sum.abs() <= 1500.0 + 1e-3, "sum {sum} exceeds 1500");
     }
 
     /// Charge-locked battery must NOT receive any charge target even if
@@ -1872,7 +1926,10 @@ modbus_host = "192.168.1.93"
             }
         }
         fresh_grid_snapshot(&state, 9000.0);
-        let dcfg = dcfg();
+        // Disable the rate limit for this test — we're verifying the
+        // per-circuit cap math, not the per-cycle ramp.
+        let mut dcfg = dcfg();
+        dcfg.rate_limit_w_per_cycle = 9999.0;
         let targets = compute_targets(&state, &dcfg, 9000.0, now);
 
         let cap = 32.0 * 230.0 * 0.95;
@@ -1960,7 +2017,9 @@ modbus_host = "192.168.1.93"
         {
             let mut circuits = state.circuits.write();
             circuits.get_mut("c1").unwrap().overload_started_at = Some(
-                now - Duration::from_secs_f64(dcfg().emergency_cutoff_grace_s + 1.0),
+                now - Duration::from_secs_f64(
+                    crate::config::EMERGENCY_CUTOFF_GRACE_S + 1.0,
+                ),
             );
         }
         let dcfg = dcfg();

@@ -66,9 +66,7 @@
         <p class="hint">
           Cap is enforced from the live plug measurements (signed sum).
           If any plug in a circuit goes stale &gt; <strong>plug_stale_s</strong>,
-          the entire circuit is muted: CT silent for
-          <strong>group_silent_after_stale_s</strong> so every Marstek's
-          watchdog clears its integrator.
+          the entire circuit is muted until plugs recover.
         </p>
         <table class="data-table">
           <colgroup>
@@ -97,10 +95,9 @@
         <h2>Batteries</h2>
         <p class="hint">
           Plug reading (<code>plug</code>) is the only ground truth.
-          Each cycle the dispatcher computes a per-battery delta from
-          grid_w and queues it as a CT-pulse burst; the next pulse only
-          arms once the plug has moved by <code>hit_tolerance_w</code>
-          or <code>settle_timeout_s</code> has elapsed.
+          In modbus mode each battery is told an absolute power setpoint
+          every cycle, smoothed by <code>rate_limit_w_per_cycle</code>.
+          In pulse mode the dispatcher queues CT-pulse deltas instead.
         </p>
         <table class="data-table">
           <colgroup>
@@ -284,23 +281,31 @@
             </label>
             <label>Cycle (ms)
               <input name="cycle_ms" type="number" min="50" max="5000" required>
+              <small style="color:var(--fg-faint);font-size:11px">how often the dispatcher recomputes targets. 2000 ms matches Marstek ramp speed</small>
             </label>
             <label>Deadband (W)
               <input name="deadband_w" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">minimum pulse magnitude AND noise floor</small>
+              <small style="color:var(--fg-faint);font-size:11px">noise floor — ignore grid imbalances below this</small>
             </label>
-            <label>Hit tolerance (W)
-              <input name="hit_tolerance_w" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">plug-movement threshold for "pulse landed". Must be ≤ deadband_w</small>
+            <label>Grid bias (W)
+              <input name="grid_bias_w" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">never cross 0: import side when discharging, export side when charging</small>
             </label>
-            <label>Pulse count
-              <input name="pulse_count" type="number" min="2" max="10" required>
+            <label>Rate limit (W / cycle)
+              <input name="rate_limit_w_per_cycle" type="number" min="1" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">max change of a battery's setpoint per cycle. Smooths big steps into a ramp</small>
             </label>
             <label>SoC full (%)
               <input name="soc_full_pct" type="number" min="0" max="100" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">BMS cutoff (reg 44000) wins when available</small>
             </label>
             <label>SoC empty (%)
               <input name="soc_empty_pct" type="number" min="0" max="100" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">BMS cutoff (reg 44001) wins when available</small>
+            </label>
+            <label>Circuit headroom (0–1)
+              <input name="circuit_headroom" type="number" min="0" max="1" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">fraction of fuse cap to actually use. 0.95 = 5 % jitter buffer</small>
             </label>
             <label>Plug stale (s)
               <input name="plug_stale_s" type="number" min="0" step="any" required>
@@ -310,76 +315,17 @@
               <input name="grid_stale_s" type="number" min="0" step="any" required>
               <small style="color:var(--fg-faint);font-size:11px">real Shelly silent this long → mute every circuit</small>
             </label>
-            <label>Group silent (s)
-              <input name="group_silent_after_stale_s" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">how long to stay muted after recovery (Marstek watchdog clears at ~60 s)</small>
-            </label>
-            <label>Circuit headroom (0–1)
-              <input name="circuit_headroom" type="number" min="0" max="1" step="any" required>
-            </label>
-            <label>Grid bias (W)
-              <input name="grid_bias_w" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">never cross 0: import side when discharging, export side when charging</small>
-            </label>
             <label>Settle timeout (s)
               <input name="settle_timeout_s" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">accept the cycle as done after this long (modbus: write to next battery, pulse: queue next delta)</small>
-            </label>
-            <label>SoC-unknown lockout (s)
-              <input name="soc_unknown_lockout_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">pulse mode only: lockout duration after empirical refusal</small>
-            </label>
-            <label>Setpoint deadband (W)
-              <input name="setpoint_deadband_w" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">modbus: skip writes when new setpoint is within this many W of last</small>
-            </label>
-            <label>Modbus heartbeat (s)
-              <input name="modbus_heartbeat_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">re-write current setpoint at least this often (liveness signal)</small>
-            </label>
-            <label>Modbus watchdog grace (s)
-              <input name="modbus_watchdog_grace_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">if dispatcher loop hangs, force standby + exit. 0 = disabled</small>
-            </label>
-            <label>Modbus min write interval (s)
-              <input name="modbus_min_write_interval_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">hard throttle between successive setpoint writes per battery — lets the inverter ramp before we change it again</small>
-            </label>
-            <label>Grid smoothing (s)
-              <input name="grid_smoothing_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">EMA time constant on grid_w. Filters out sub-second PV inverter PWM ripple. 0 = no smoothing</small>
-            </label>
-            <label>Modbus connect timeout (ms)
-              <input name="modbus_connect_timeout_ms" type="number" min="500" max="60000" step="100">
-              <small style="color:var(--fg-faint);font-size:11px">V3 talks directly to the Marstek Modbus server (slower than Elfin/Waveshare bridges). 10000 is V3-safe.</small>
-            </label>
-            <label>Modbus request timeout (ms)
-              <input name="modbus_request_timeout_ms" type="number" min="500" max="60000" step="100">
-              <small style="color:var(--fg-faint);font-size:11px">Per-register read / write timeout</small>
-            </label>
-            <label>Modbus write retries
-              <input name="modbus_write_retries" type="number" min="0" max="10" step="1">
-              <small style="color:var(--fg-faint);font-size:11px">retry the full write sequence on transient failures (200ms × attempt backoff). 0 disables</small>
+              <small style="color:var(--fg-faint);font-size:11px">accept the cycle as done after this long (next battery / next delta)</small>
             </label>
             <label>Emergency cutoff margin (W)
-              <input name="emergency_cutoff_margin_w" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap × headroom + this. 0 = disabled</small>
-            </label>
-            <label>Emergency cutoff grace (s)
-              <input name="emergency_cutoff_grace_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">how long the over-cap state must persist before tripping</small>
-            </label>
-            <label>Emergency cutoff recovery (s)
-              <input name="emergency_cutoff_recovery_s" type="number" min="0" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">auto-reset after this long; manual reset always available</small>
+              <input name="emergency_cutoff_margin_w" type="number" min="0" step="any" required>
+              <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap × headroom + this. 0 = disabled. Grace/recovery hardcoded at 5 s / 600 s</small>
             </label>
             <label class="checkbox">
               <input name="night_cutoff_enabled" type="checkbox">
               <span>Night cutoff (cut empty batteries between sunset and sunrise)</span>
-            </label>
-            <label>Night cutoff SoC margin (%)
-              <input name="night_cutoff_soc_margin_pct" type="number" min="0" max="50" step="any">
-              <small style="color:var(--fg-faint);font-size:11px">hysteresis above effective empty cutoff</small>
             </label>
           </div>
           <div class="form-actions">

@@ -116,12 +116,6 @@ async fn main() -> Result<()> {
 
     let state = AppState::from_config(&cfg);
     let dispatch_mode = cfg.dispatcher.mode;
-    let modbus_watchdog_grace_s = cfg.dispatcher.modbus_watchdog_grace_s;
-
-    // Initialise the Modbus timeouts + retry budget from config. Has to
-    // happen BEFORE we spawn any writer task — the atomics it touches
-    // are read on every modbus operation.
-    modbus::init_timings(&cfg);
 
     // ModbusDispatch (= per-battery writer task pool) only spins up in
     // modbus mode. We hand a clone into the dispatcher AND keep one
@@ -240,8 +234,9 @@ async fn main() -> Result<()> {
 
     // Graceful shutdown: drain the ModbusDispatch handle so each writer
     // task gets a chance to fire its failsafe (force_mode=0,
-    // RS485 control off) before we drop the runtime.
-    let shutdown_grace = Duration::from_secs_f64(modbus_watchdog_grace_s.max(2.0));
+    // RS485 control off) before we drop the runtime. 5 s is enough for
+    // each writer to push one final write (≈ 1 s of Modbus traffic).
+    let shutdown_grace = Duration::from_secs(5);
     let signal_md = modbus_dispatch.clone();
     let signal_outcome: Result<()> = tokio::select! {
         _ = tokio::signal::ctrl_c() => {

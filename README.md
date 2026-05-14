@@ -15,42 +15,51 @@ the per-circuit fuse cap.
 
 ```
                   ┌────────────────────────────────────────────────────┐
-                  │  ShellyMultiplexer                                  │
+                  │  ShellyMultiplexer (v0.8+)                          │
                   │                                                    │
    Real Shelly    │   Grid poller (UDP-RPC, ~4 Hz)                     │
    ──────────    │            │                                       │
    :2020 (RPC) ◀─┤            ▼                                       │
-                  │   Dispatcher tick (200 ms)                         │
+                  │   Dispatcher tick (2 s, mode = modbus by default)  │
                   │   • desired_total = Σ plug + grid_correction       │
                   │   • split target across batteries weighted by      │
                   │     priority × capacity × soc_room                 │
                   │   • clamp each target to [low_bound, high_bound]   │
-                  │   • delta = target - plug; queue pulse_count       │
-                  │     copies of delta for the next polls             │
+                  │   • clamp Δ from current plug to                   │
+                  │     ±rate_limit_w_per_cycle (the only ramp knob)   │
+                  │   • per-circuit cap on sum-of-targets              │
                   │            │                                       │
                   │            ▼                                       │
-   Marsteks    ──▶│   Virtual Shelly UDP server (:1010)                │
-   poll :1010    │   • route by source IP → battery                   │
-                  │   • drain one pulse per poll                       │
-                  │   • drop the response while circuit is muted       │
+   Marsteks    ──▶│   Per-battery BatteryWriter task                   │
+   (RS485 →      │   • persistent Modbus TCP session per battery       │
+    LAN bridge)  │   • write force_mode + power on every setpoint     │
+                  │     change ≥ deadband_w                            │
+                  │   • piggyback SoC + battery_power reads on the     │
+                  │     same connection (no second TCP slot)           │
                   │                                                    │
-   Plugs (one    │   Plug HTTP poller (per-battery, 200 ms)           │
+   Plugs (one    │   Plug HTTP poller (per-battery, cycle_ms)         │
    per battery) ─▶│   • Switch.GetStatus → last_plug_w                │
-   GET /rpc      │   • track last_plug_movement_at (±10 W)             │
-                  │   • stale > plug_stale_s → mute the circuit        │
+   GET /rpc      │   • stale > plug_stale_s → mute the circuit        │
+                  │   • signed plug sum > cap + margin → EMERGENCY    │
+                  │     cutoff via Switch.Set(on = false)              │
                   │                                                    │
    Browser   ───▶│   Admin UI (:8080) — live status + full live       │
                   │                       config editor                │
                   └────────────────────────────────────────────────────┘
 ```
 
-The dispatcher gates the next pulse on **two** plug observations:
-the plug must have moved by more than `plug_stable_w` (proving the
-battery reacted) AND then stayed within that band for at least
-`plug_stable_duration_s` (proving the reaction has finished). This
-prevents stacking a new delta on top of a still-in-flight one. A
-`settle_timeout_s` escape hatch releases the gate if a battery
-refuses to react.
+In **modbus mode** (default) the dispatcher writes absolute power
+setpoints — no delta math, no settle guesswork. The
+`rate_limit_w_per_cycle` knob smooths big swings into ramps at the
+algorithm level, replacing the EMA grid smoother + per-write throttle
++ heartbeat the v0.7 schema used to expose. Per-circuit sequential
+dispatch (one write per circuit per cycle, gated on plug response)
+gives the structural "circuit can't go over cap" property.
+
+**Pulse mode** keeps the legacy Shelly-Pro-3EM CT emulation for
+installs without per-battery Modbus reach: the dispatcher queues CT-
+pulse deltas via a virtual `:1010` UDP server and gates the next pulse
+on plug movement plus a stability window.
 
 > ⚠ **Required configuration on the real Shelly:** move its UDP-RPC port
 > off the default 1010 (e.g. to 2020). Otherwise the multiplexer can't
@@ -75,9 +84,10 @@ refuses to react.
   the deltas toward zero; the dispatcher never flips direction to
   "fix" an over-cap state.
 - **Stale-measurement safety** — a stale plug mutes its circuit; a
-  stale grid measurement mutes every circuit. CT signal goes silent
-  for `group_silent_after_stale_s` (≥ 60 s) so every battery's
-  watchdog clears its integrator. Resumes once measurements recover.
+  stale grid measurement mutes every circuit. In pulse mode the CT
+  signal goes silent for 60 s (hardcoded) so every battery's CT
+  integrator clears. In modbus mode recovery is immediate — `force_mode`
+  bypasses CT integration entirely.
 - **SoC-aware power tapering** — optional per-battery taper knobs
   reduce the effective charge / discharge cap near the SoC edges, so
   the dispatcher doesn't try to push more than the BMS will accept.
@@ -110,11 +120,11 @@ refuses to react.
   effective full / empty thresholds. The user's BMS setting is the
   authoritative truth, far better than the dispatcher's TOML default.
 - **Emergency plug cutoff (safety)** — if a circuit's measured plug
-  sum exceeds `cap × headroom + emergency_cutoff_margin_w` for
-  `emergency_cutoff_grace_s` seconds, the worst-offending battery's
-  Shelly Plug PM Gen3 relay is opened (`Switch.Set`, `on = false`).
-  Auto-recovery after `emergency_cutoff_recovery_s`; manual reset
-  via the admin UI's "reset" button on the offending row.
+  sum exceeds `cap × headroom + emergency_cutoff_margin_w` for 5 s
+  (grace, hardcoded), the worst-offending battery's Shelly Plug PM
+  Gen3 relay is opened (`Switch.Set`, `on = false`). Auto-recovery
+  after 10 minutes (hardcoded); manual reset via the admin UI's
+  "reset" button on the offending row.
 - **Night cutoff (efficiency)** — between sunset and sunrise, empty
   batteries can have their plugs opened to skip the Marstek's
   inverter standby loss (~5-15 W per unit, ~60-180 Wh per winter
@@ -268,22 +278,14 @@ most installs don't need to touch them.
 |---|---|---|
 | `mode` | `modbus` | Dispatch backend. `modbus` writes setpoints directly via Modbus (v0.7+ default — requires `modbus_host` per battery). `pulse` keeps the legacy CT-emulation path (Shelly Pro 3EM virtual server). |
 
-#### Cycle & deadband
+#### Cycle, ramp & deadband
 
 | Field | Default | Purpose |
 |---|---|---|
-| `cycle_ms` | 200 | Dispatcher tick rate. Also the plug poll rate (clamped to ≥ 100 ms). |
-| `deadband_w` | 30 | Minimum delta magnitude before a pulse is queued (pulse mode) / before a setpoint is changed (modbus mode). Both a noise filter and Marstek-quantisation buffer. |
-| `pulse_count` | 3 | Number of identical CT samples per delta. Marstek commits a value after 2 polls; 3 is a safety margin. (Pulse mode only.) |
-| `grid_bias_w` | 30 | Asymmetric grid setpoint. The dispatcher leaves this margin on the import side when discharging and on the export side when charging — never tries to hit grid_w = 0 exactly. Set to 0 for symmetric dispatching. |
-
-#### Modbus dispatch tuning (mode = "modbus")
-
-| Field | Default | Purpose |
-|---|---|---|
-| `setpoint_deadband_w` | 20 | Skip the Modbus write when the new setpoint is within this many watts of the last successfully written value. Reduces Modbus traffic over slow RS485-to-LAN bridges. |
-| `modbus_heartbeat_s` | 5 | Re-write the current setpoint at least this often even when unchanged — serves as both a "recovery from dropped writes" mechanism AND a process-level liveness signal (Marstek firmware has no watchdog). |
-| `modbus_watchdog_grace_s` | 30 | If the dispatcher loop hasn't ticked for this long, the watchdog task force-writes `force_mode = 0` to every battery and exits. Catches hangs the SIGTERM handler can't see. 0 disables the watchdog. |
+| `cycle_ms` | 2000 | Dispatcher tick rate. Marstek inverters take 1-3 s to ramp toward a setpoint, so faster ticks just queue commands the inverter can't act on. |
+| `deadband_w` | 50 | Minimum delta magnitude before a pulse is queued (pulse mode) / before a setpoint is changed (modbus mode). Noise filter + Marstek-quantisation buffer. |
+| `grid_bias_w` | 100 | Asymmetric grid setpoint. The dispatcher leaves this margin on the import side when discharging and on the export side when charging — never tries to hit grid_w = 0 exactly. Set to 0 for symmetric dispatching. |
+| `rate_limit_w_per_cycle` | 500 | Max change of a battery's setpoint per cycle. Smooths big steps into a ramp (e.g. 0 → 2.5 kW takes 5 cycles ≈ 10 s). Replaces the EMA grid smoother + per-write throttle + heartbeat the v0.7 schema exposed — one knob, applied at the algorithm level. |
 
 #### Emergency plug cutoff
 
@@ -293,8 +295,8 @@ when soft control fails and a circuit drifts over its fuse cap.
 | Field | Default | Purpose |
 |---|---|---|
 | `emergency_cutoff_margin_w` | 200 | Trigger threshold: cap × headroom + this margin. 0 disables the feature. |
-| `emergency_cutoff_grace_s` | 5 | The over-cap condition has to persist this long before the relay opens (lets startup transients pass). |
-| `emergency_cutoff_recovery_s` | 600 | Auto-reset after this many seconds. Manual reset via admin UI is also available. |
+
+Grace (5 s) + recovery (600 s) are hardcoded — see `EMERGENCY_*` constants in `config.rs`.
 
 #### Night cutoff
 
@@ -304,7 +306,8 @@ Marstek's ~5-15 W inverter standby loss. Requires `[location]`.
 | Field | Default | Purpose |
 |---|---|---|
 | `night_cutoff_enabled` | `false` | Master switch. Validation requires `[location].latitude` + `longitude` when set. |
-| `night_cutoff_soc_margin_pct` | 2.0 | Hysteresis margin: a battery has to be within this % of the effective empty cutoff to be cut, and rise more than this % above to be restored. |
+
+Hysteresis margin is hardcoded at 2 % SoC — see `NIGHT_CUTOFF_SOC_MARGIN_PCT` in `config.rs`.
 
 ### `[location]` — geographic location for sun-based features
 
@@ -313,18 +316,18 @@ Marstek's ~5-15 W inverter standby loss. Requires `[location]`.
 | `latitude` | — | Decimal degrees (-90 to 90). Required when `night_cutoff_enabled = true`. |
 | `longitude` | — | Decimal degrees (-180 to 180). Required when `night_cutoff_enabled = true`. |
 
-#### Pulse-settle gate
+#### Settle gate
 
-After a pulse the dispatcher waits for the plug to actually move and
-then stop moving before queueing the next one. This prevents stacking
-deltas on top of a still-in-flight reaction.
+After a write (modbus) / pulse (pulse mode) the dispatcher waits for the
+plug to actually move and then stop moving before issuing the next one.
+This prevents stacking deltas on top of a still-in-flight reaction.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `plug_stable_w` | 10 | Plug-reading delta (W) below which two consecutive samples count as "no movement". |
-| `plug_stable_duration_s` | 1.5 | The plug must stay within `plug_stable_w` for this long before the previous pulse is considered done. |
-| `settle_timeout_s` | 5.0 | Hard escape hatch: accept the cycle as done after this long, even if the battery refused to react. |
-| `hit_tolerance_w` | 15 | **Deprecated.** Still loaded from old configs; ignored. |
+| `settle_timeout_s` | 10.0 | Hard escape hatch: accept the cycle as done after this long, even if the battery refused to react. |
+
+`plug_stable_w` (10 W) and `plug_stable_duration_s` (3 s) are hardcoded
+in `config.rs`.
 
 #### SoC gates
 
@@ -339,28 +342,23 @@ Per-battery overrides are also available (see `[[batteries]]`).
 
 | Field | Default | Purpose |
 |---|---|---|
-| `plug_stale_s` | 2.0 | Plug silent this long → mute its circuit. |
+| `plug_stale_s` | 5.0 | Plug silent this long → mute its circuit. |
 | `grid_stale_s` | 5.0 | Real Shelly silent this long → mute every circuit. |
-| `group_silent_after_stale_s` | 60.0 | After recovery, drop UDP responses for this long so every Marstek's watchdog clears its integrator. Must be ≥ Marstek watchdog timeout (~60 s). |
 | `circuit_headroom` | 0.95 | Use only this fraction of the calculated fuse cap (jitter buffer). |
 
-#### Empirical full/empty detection (no-SoC mode)
+In pulse mode there's an additional 60 s "silent after stale" cooldown
+to let the Marstek's internal CT integrator clear. In modbus mode that
+cooldown is 0 — force_mode bypasses the CT integrator entirely.
+
+#### Empirical full/empty detection (pulse mode, no-SoC fallback)
 
 For installs without a SoC source (no Modbus bridge, no HA sensor) the
-dispatcher infers "full" / "empty" from refused pulses: if a
-significant directional pulse goes out and the plug doesn't move
-within `settle_timeout_s`, that direction is locked for the lockout
-duration. The opposite direction stays free — a battery that won't
-take more charge (full) is still used for discharge, and vice versa.
-After the lockout expires the direction is retried; a successful
-pulse anywhere clears the matching lockout early.
-
-This acts as a backstop even when SoC IS available: if the SoC reading
-is wrong or stale, the empirical layer still catches refusals.
-
-| Field | Default | Purpose |
-|---|---|---|
-| `soc_unknown_lockout_s` | 600 | How long a direction is locked after a refusal (seconds). |
+pulse-mode dispatcher infers "full" / "empty" from refused pulses: if
+a significant directional pulse goes out and the plug doesn't move
+within `settle_timeout_s`, that direction is locked for 10 minutes
+(hardcoded). The opposite direction stays free. Modbus mode doesn't
+need this — direct telemetry (SoC, force_mode, battery_power, BMS
+cutoffs) tells the dispatcher the truth.
 
 ### `[home_assistant]` — SoC source switch
 
@@ -457,15 +455,17 @@ Per cycle, with N eligible batteries on one or more circuits:
    `[low_bound, high_bound]` window (hardware caps plus optional
    tapers). Any clipped excess is redistributed to the remaining
    batteries up to six times.
-5. For each battery, `delta = target - plug_w`. Deltas below
-   `deadband_w` are dropped.
-6. Per-circuit cap check: if the post-pulse plug sum would exceed
-   `fuse cap × circuit_headroom`, all of that circuit's deltas are
-   scaled toward zero (never sign-flipped) so the sum lands on the cap.
-7. Each surviving delta is queued as `pulse_count` identical CT samples
-   for the next Marstek polls. The dispatcher waits for plug stability
-   before queueing the next delta to the same battery (see
-   `plug_stable_*`).
+5. **Modbus mode**: each target's distance from the current plug-
+   measured power is clamped to `±rate_limit_w_per_cycle` so big swings
+   become ramps. Then per-circuit cap on the sum of targets; if it
+   would exceed `fuse cap × circuit_headroom`, every target on that
+   circuit is scaled toward zero. The BatteryWriter writes the
+   resulting absolute setpoint to its battery via Modbus.
+6. **Pulse mode**: `delta = target - plug_w` for each battery. Deltas
+   below `deadband_w` are dropped; the per-circuit cap is enforced on
+   the plug+delta sum. Surviving deltas are queued as 3 identical CT
+   samples for the next Marstek polls. The dispatcher waits for plug
+   stability before queueing the next delta to the same battery.
 
 This means: (a) the primary goal — meeting the grid setpoint — is
 always pursued within physical limits, (b) batteries on the same
