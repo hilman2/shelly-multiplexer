@@ -44,6 +44,10 @@ pub struct BatteryState {
     pub id: String,
     pub circuit: String,
     pub address: IpAddr,
+    /// HTTP base URL of this battery's Shelly Plug PM Gen3. Copied
+    /// from BatteryConfig at startup so the emergency cutoff path
+    /// can reach the plug without re-walking the config.
+    pub plug_url: String,
 
     /// Has a configured SoC source for the currently active mode
     /// (Modbus: `modbus_host` set; HA: `soc_entity_id` set). Inactive
@@ -121,6 +125,49 @@ pub struct BatteryState {
     pub charge_locked_until: Option<Instant>,
     pub discharge_locked_until: Option<Instant>,
 
+    // ----- Modbus dispatch (v0.7+) -----
+    /// Most recently COMMANDED setpoint via Modbus (signed: + = discharge,
+    /// − = charge, 0 = standby). None until the first successful write.
+    /// Compared against the desired setpoint to decide whether the next
+    /// cycle should send a new write (skip if Δ < `setpoint_deadband_w`).
+    pub last_modbus_setpoint_w: Option<f64>,
+    /// Wall-clock of the last successful Modbus write. Used by the
+    /// heartbeat: if `modbus_heartbeat_s` elapsed since this, we re-write
+    /// the setpoint even when unchanged.
+    pub last_modbus_write_at: Option<Instant>,
+    /// Last Modbus write error message (per-battery). Cleared by the
+    /// next successful write. Surfaced in /api/status so the user can
+    /// see at a glance which Marsteks are unreachable.
+    pub last_modbus_write_error: Option<String>,
+    /// Last battery_power reading via Modbus (W). Useful as a sanity
+    /// check against the plug measurement — if they disagree by a lot,
+    /// either the plug is on the wrong battery or one of the two is
+    /// reading wrong.
+    pub last_battery_power_w: Option<f64>,
+    /// BMS-configured charging cutoff (% SoC). Read once on dispatch
+    /// init from Modbus register 44000 — this is the user's actual
+    /// "battery full" threshold from the Marstek app, much more
+    /// authoritative than the dispatcher's defaulted `soc_full_pct`.
+    /// `low_bound` prefers this over the config default when present.
+    pub bms_full_pct: Option<f64>,
+    /// BMS-configured discharging cutoff (% SoC). Register 44001.
+    /// `high_bound` prefers this over the config default.
+    pub bms_empty_pct: Option<f64>,
+
+    /// Last observed plug relay state (true = closed/on, false = cut).
+    /// Populated from each `Switch.GetStatus` poll. None if not yet read.
+    pub plug_relay_state: Option<bool>,
+    /// When the dispatcher last tripped this plug via emergency cutoff.
+    /// While `plug_cut_until > now`, the dispatcher keeps the plug off
+    /// and won't try to re-enable; after expiry it attempts a
+    /// re-enable on the next cycle (the user can also reset manually
+    /// via the admin API).
+    pub plug_cut_until: Option<Instant>,
+    /// Why the plug was cut — surfaced in the UI so the user knows
+    /// what triggered the safety relay. Cleared on successful
+    /// re-enable.
+    pub plug_cut_reason: Option<String>,
+
     /// Last error from any subsystem, surfaced in the UI.
     pub last_error: Option<String>,
 }
@@ -131,6 +178,7 @@ impl BatteryState {
             id: cfg.id.clone(),
             circuit: cfg.circuit.clone(),
             address: cfg.address,
+            plug_url: cfg.plug_url.trim_end_matches('/').to_string(),
             active: cfg.has_soc_source(ha_enabled),
             max_charge_w: cfg.max_charge_w,
             max_discharge_w: cfg.max_discharge_w,
@@ -160,6 +208,15 @@ impl BatteryState {
             last_pulse_delta_w: None,
             charge_locked_until: None,
             discharge_locked_until: None,
+            last_modbus_setpoint_w: None,
+            last_modbus_write_at: None,
+            last_modbus_write_error: None,
+            last_battery_power_w: None,
+            bms_full_pct: None,
+            bms_empty_pct: None,
+            plug_relay_state: None,
+            plug_cut_until: None,
+            plug_cut_reason: None,
             last_error: None,
         }
     }
@@ -207,13 +264,47 @@ impl BatteryState {
         }
     }
 
-    /// Effective full / empty thresholds: per-battery override, falling
-    /// back to dispatcher defaults if unset.
+    /// Modbus equivalent of `pulse_settled`. A Modbus setpoint write is
+    /// "settled" when one of these is true:
+    ///   1. We've never written to this battery yet (initial state).
+    ///   2. The plug moved AFTER the write went out AND has been stable
+    ///      (no further movement) for `stable_duration_s` seconds.
+    ///   3. `settle_timeout_s` elapsed since the write (Marstek refused
+    ///      to react — escape hatch to keep the dispatcher moving).
+    ///
+    /// Used by the sequential modbus dispatcher: per circuit, we only
+    /// issue a new write to a battery when its previous write has
+    /// settled. That gives the circuit-cap-safety property — the
+    /// commanded power across a circuit can't exceed the cap because
+    /// every write observes the plug response before the next one fires.
+    pub fn modbus_settled(&self, stable_duration_s: f64, settle_timeout_s: f64) -> bool {
+        let Some(written_at) = self.last_modbus_write_at else {
+            return true;
+        };
+        let since_write = written_at.elapsed().as_secs_f64();
+        if since_write >= settle_timeout_s {
+            return true;
+        }
+        match self.last_plug_movement_at {
+            Some(t) if t >= written_at => t.elapsed().as_secs_f64() >= stable_duration_s,
+            _ => false,
+        }
+    }
+
+    /// Effective full threshold. Precedence (most specific wins):
+    ///   1. Per-battery `soc_full_pct` from TOML (explicit user intent).
+    ///   2. BMS-reported `bms_full_pct` from Modbus reg 44000 (= what
+    ///      the user actually set in the Marstek app — most reliable).
+    ///   3. Dispatcher default (`fallback`).
     pub fn effective_soc_full_pct(&self, fallback: f64) -> f64 {
-        self.soc_full_pct.unwrap_or(fallback)
+        self.soc_full_pct
+            .or(self.bms_full_pct)
+            .unwrap_or(fallback)
     }
     pub fn effective_soc_empty_pct(&self, fallback: f64) -> f64 {
-        self.soc_empty_pct.unwrap_or(fallback)
+        self.soc_empty_pct
+            .or(self.bms_empty_pct)
+            .unwrap_or(fallback)
     }
 
     /// Effective max charge power given the current SoC. Above the taper
@@ -321,6 +412,11 @@ pub struct CircuitState {
     /// to all members so their watchdogs clear (60 s by default), then we
     /// resume only once plugs are healthy again.
     pub silent_until: Option<Instant>,
+    /// Wall-clock when this circuit FIRST exceeded its fuse cap by more
+    /// than the emergency margin. Reset to None as soon as the sum drops
+    /// back under cap. Used by `enforce_circuit_safety` to enforce the
+    /// `emergency_cutoff_grace_s` debounce before tripping a plug.
+    pub overload_started_at: Option<Instant>,
 }
 
 impl CircuitState {
@@ -367,6 +463,7 @@ impl AppState {
                     config: c.clone(),
                     member_ids: members,
                     silent_until: None,
+                    overload_started_at: None,
                 },
             );
         }
@@ -449,6 +546,7 @@ mod tests {
             id: "test".into(),
             circuit: "c1".into(),
             address: "127.0.0.1".parse().unwrap(),
+            plug_url: "http://127.0.0.2".into(),
             active: true,
             max_charge_w: 2500.0,
             max_discharge_w: 800.0,
@@ -474,6 +572,15 @@ mod tests {
             last_pulse_delta_w: None,
             charge_locked_until: None,
             discharge_locked_until: None,
+            last_modbus_setpoint_w: None,
+            last_modbus_write_at: None,
+            last_modbus_write_error: None,
+            last_battery_power_w: None,
+            bms_full_pct: None,
+            bms_empty_pct: None,
+            plug_relay_state: None,
+            plug_cut_until: None,
+            plug_cut_reason: None,
             last_error: None,
         }
     }
@@ -623,6 +730,42 @@ mod tests {
         assert!(b.is_discharge_tapered());
         b.soc_pct = Some(50.0);
         assert!(!b.is_discharge_tapered());
+    }
+
+    /// BMS cutoff from Modbus (reg 44000) overrides the dispatcher
+    /// default — it represents the user's "battery full" setting in
+    /// the Marstek app and is far more authoritative.
+    #[test]
+    fn effective_soc_full_uses_bms_cutoff_when_present() {
+        let mut b = make_battery(Some(0.0));
+        b.bms_full_pct = Some(92.0);
+        // Per-battery TOML override stays NULL → BMS wins over fallback.
+        assert_eq!(b.effective_soc_full_pct(95.0), 92.0);
+    }
+
+    /// Per-battery TOML override wins over BMS — explicit user intent
+    /// outranks the BMS-derived default.
+    #[test]
+    fn effective_soc_full_per_battery_override_beats_bms() {
+        let mut b = make_battery(Some(0.0));
+        b.bms_full_pct = Some(92.0);
+        b.soc_full_pct = Some(98.0);
+        assert_eq!(b.effective_soc_full_pct(95.0), 98.0);
+    }
+
+    /// No BMS cutoff and no override → fall back to dispatcher default.
+    #[test]
+    fn effective_soc_full_falls_back_when_nothing_set() {
+        let b = make_battery(Some(0.0));
+        assert_eq!(b.effective_soc_full_pct(95.0), 95.0);
+    }
+
+    /// Same precedence for the empty cutoff.
+    #[test]
+    fn effective_soc_empty_uses_bms_cutoff_when_present() {
+        let mut b = make_battery(Some(0.0));
+        b.bms_empty_pct = Some(8.0);
+        assert_eq!(b.effective_soc_empty_pct(5.0), 8.0);
     }
 
     #[test]

@@ -26,6 +26,11 @@ use crate::state::AppState;
 struct SwitchStatus {
     /// Active power in watts. Sign: positive = flowing into the load.
     apower: Option<f64>,
+    /// Relay state (true = closed, current can flow). Cross-referenced
+    /// against `BatteryState.plug_relay_state` so the dispatcher's
+    /// emergency-cutoff logic knows whether the plug is currently
+    /// physically connected.
+    output: Option<bool>,
 }
 
 pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<()> {
@@ -81,8 +86,8 @@ async fn poll_plug_loop(
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        match fetch_apower(&client, &url).await {
-            Ok(apower) => {
+        match fetch_status(&client, &url).await {
+            Ok((apower, relay_on)) => {
                 // Plug sign -> app sign: invert.
                 let signed_w = -apower;
                 let now = std::time::Instant::now();
@@ -102,6 +107,7 @@ async fn poll_plug_loop(
                     }
                     b.last_plug_w = Some(signed_w);
                     b.last_plug_at = Some(now);
+                    b.plug_relay_state = relay_on;
                     // Any previous error is now stale — the plug is reachable
                     // again and the marstek SoC poller has its own clearing
                     // logic, so leaving its message would be misleading.
@@ -111,7 +117,7 @@ async fn poll_plug_loop(
                         }
                     }
                 }
-                debug!(battery = %battery_id, apower, signed_w, "plug reading");
+                debug!(battery = %battery_id, apower, signed_w, relay_on = ?relay_on, "plug reading");
             }
             Err(e) => {
                 warn!(battery = %battery_id, url = %url, error = %e, "plug poll failed");
@@ -124,7 +130,10 @@ async fn poll_plug_loop(
     }
 }
 
-async fn fetch_apower(client: &reqwest::Client, url: &str) -> Result<f64> {
+async fn fetch_status(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(f64, Option<bool>)> {
     let res = client
         .get(url)
         .send()
@@ -134,5 +143,40 @@ async fn fetch_apower(client: &reqwest::Client, url: &str) -> Result<f64> {
         anyhow::bail!("plug http {}", res.status());
     }
     let body: SwitchStatus = res.json().await.context("plug json parse")?;
-    body.apower.ok_or_else(|| anyhow::anyhow!("plug omitted apower"))
+    let apower = body
+        .apower
+        .ok_or_else(|| anyhow::anyhow!("plug omitted apower"))?;
+    Ok((apower, body.output))
+}
+
+// ---------------------------------------------------------------------------
+// Hard cut-off — toggle the plug's relay via Shelly Gen3 HTTP-RPC.
+// ---------------------------------------------------------------------------
+//
+// This is the last line of defence: if a battery refuses to honour its
+// commanded setpoint AND the resulting plug power pushes a circuit over
+// its fuse cap, the dispatcher uses `set_relay(false)` to physically
+// disconnect that battery. Re-enabling happens automatically after the
+// recovery window or manually via the admin UI.
+//
+// Shelly Gen3 HTTP-RPC sometimes refuses query-string form for write
+// methods, so we POST the JSON-RPC body. Both `Switch.Set` (modern) and
+// the GET fallback work on Gen3 firmware ≥ 1.4.
+pub async fn set_relay(plug_url: &str, on: bool) -> Result<()> {
+    let url = format!("{}/rpc/Switch.Set", plug_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "id": 0, "on": on });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("building plug relay client")?;
+    let res = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("plug Switch.Set request failed")?;
+    if !res.status().is_success() {
+        anyhow::bail!("plug Switch.Set http {}", res.status());
+    }
+    Ok(())
 }

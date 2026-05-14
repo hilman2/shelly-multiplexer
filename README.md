@@ -81,6 +81,21 @@ refuses to react.
 - **SoC-aware power tapering** — optional per-battery taper knobs
   reduce the effective charge / discharge cap near the SoC edges, so
   the dispatcher doesn't try to push more than the BMS will accept.
+- **Direct Modbus dispatch (v0.7 default)** — instead of emulating a
+  Shelly Pro 3EM and steering each Marstek via per-poll CT deltas,
+  the dispatcher writes absolute power setpoints directly via Modbus
+  (`force_mode` register 42010 + `set_charge_power` 42020 /
+  `set_discharge_power` 42021). No more delta math, no settle
+  guesswork — we tell each battery exactly what to do, and the plug
+  feedback confirms it landed. Pulse mode is still available as
+  `dispatcher.mode = "pulse"` for installs without per-battery Modbus
+  access (or for non-Marstek inverters).
+- **Sequential per-circuit dispatch** — within a circuit we issue at
+  most ONE new setpoint per cycle, and only to a battery whose
+  previous write has settled (plug confirms the new power). This
+  gives the structural property that **a circuit can't go over cap**
+  even when commands are batched or BMS taper kicks in: the plug
+  measurement is always up-to-date before the next decision fires.
 - **Marstek SoC via Modbus TCP** — the multiplexer reads SoC from the
   Modbus register matched by `marstek_model`. Only **Venus E V3 with
   Ethernet** speaks Modbus TCP natively; every other Marstek variant
@@ -89,6 +104,28 @@ refuses to react.
   Atom S3 + RS485, …) wired to the battery's RS485 port. `modbus_host`
   on each battery points at that bridge. Power telemetry still comes
   from the plug, not the battery itself.
+- **BMS cutoffs as SoC gate** — at startup we read each Marstek's
+  configured `charging_cutoff_capacity` (register 44000) and
+  `discharging_cutoff_capacity` (44001) and use those as the
+  effective full / empty thresholds. The user's BMS setting is the
+  authoritative truth, far better than the dispatcher's TOML default.
+- **Emergency plug cutoff (safety)** — if a circuit's measured plug
+  sum exceeds `cap × headroom + emergency_cutoff_margin_w` for
+  `emergency_cutoff_grace_s` seconds, the worst-offending battery's
+  Shelly Plug PM Gen3 relay is opened (`Switch.Set`, `on = false`).
+  Auto-recovery after `emergency_cutoff_recovery_s`; manual reset
+  via the admin UI's "reset" button on the offending row.
+- **Night cutoff (efficiency)** — between sunset and sunrise, empty
+  batteries can have their plugs opened to skip the Marstek's
+  inverter standby loss (~5-15 W per unit, ~60-180 Wh per winter
+  night). Requires `[location].latitude` + `longitude` and
+  `dispatcher.night_cutoff_enabled = true`. Restored automatically
+  at sunrise.
+- **Failsafe shutdown** — Marstek firmware has no Modbus watchdog,
+  so the multiplexer carries the responsibility. SIGTERM / Ctrl-C
+  handlers AND a Rust `panic_hook` write `force_mode = 0` plus
+  `rs485_control = off` to every battery before exit, so the
+  Marsteks fall back to their auto behaviour.
 - **Home Assistant SoC mode** — alternative SoC source. When
   `[home_assistant].enabled = true`, every battery's SoC is read from
   its `soc_entity_id` via the HA Core REST API and the Modbus poller
@@ -182,10 +219,11 @@ All sections in one diagram:
 
 ```
 [real_shelly]              ← grid measurement source
-[virtual_shelly]           ← face we present to the batteries
+[virtual_shelly]           ← face we present to the batteries (pulse mode only)
 [management]               ← admin UI bind address
-[dispatcher]               ← global control-loop tuning
-[home_assistant]           ← optional SoC bridge
+[dispatcher]               ← global control-loop tuning + safety thresholds
+[home_assistant]           ← SoC source switch (HA mode)
+[location]                 ← lat/lon (only used by night cutoff)
 [[circuits]] ...           ← shared fuses
 [[batteries]] ...          ← one entry per Marstek + its plug
 ```
@@ -224,14 +262,56 @@ The real Shelly Pro 3EM that measures the house's grid power.
 The defaults reflect empirically measured Marstek Venus E behaviour;
 most installs don't need to touch them.
 
+#### Mode
+
+| Field | Default | Purpose |
+|---|---|---|
+| `mode` | `modbus` | Dispatch backend. `modbus` writes setpoints directly via Modbus (v0.7+ default — requires `modbus_host` per battery). `pulse` keeps the legacy CT-emulation path (Shelly Pro 3EM virtual server). |
+
 #### Cycle & deadband
 
 | Field | Default | Purpose |
 |---|---|---|
 | `cycle_ms` | 200 | Dispatcher tick rate. Also the plug poll rate (clamped to ≥ 100 ms). |
-| `deadband_w` | 30 | Minimum delta magnitude before a pulse is queued. Both a noise filter and Marstek-quantisation buffer. |
-| `pulse_count` | 3 | Number of identical CT samples per delta. Marstek commits a value after 2 polls; 3 is a safety margin. |
+| `deadband_w` | 30 | Minimum delta magnitude before a pulse is queued (pulse mode) / before a setpoint is changed (modbus mode). Both a noise filter and Marstek-quantisation buffer. |
+| `pulse_count` | 3 | Number of identical CT samples per delta. Marstek commits a value after 2 polls; 3 is a safety margin. (Pulse mode only.) |
 | `grid_bias_w` | 30 | Asymmetric grid setpoint. The dispatcher leaves this margin on the import side when discharging and on the export side when charging — never tries to hit grid_w = 0 exactly. Set to 0 for symmetric dispatching. |
+
+#### Modbus dispatch tuning (mode = "modbus")
+
+| Field | Default | Purpose |
+|---|---|---|
+| `setpoint_deadband_w` | 20 | Skip the Modbus write when the new setpoint is within this many watts of the last successfully written value. Reduces Modbus traffic over slow RS485-to-LAN bridges. |
+| `modbus_heartbeat_s` | 5 | Re-write the current setpoint at least this often even when unchanged — serves as both a "recovery from dropped writes" mechanism AND a process-level liveness signal (Marstek firmware has no watchdog). |
+| `modbus_watchdog_grace_s` | 30 | If the dispatcher loop hasn't ticked for this long, the watchdog task force-writes `force_mode = 0` to every battery and exits. Catches hangs the SIGTERM handler can't see. 0 disables the watchdog. |
+
+#### Emergency plug cutoff
+
+Last line of defence: physically opens the Shelly Plug PM Gen3 relay
+when soft control fails and a circuit drifts over its fuse cap.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `emergency_cutoff_margin_w` | 200 | Trigger threshold: cap × headroom + this margin. 0 disables the feature. |
+| `emergency_cutoff_grace_s` | 5 | The over-cap condition has to persist this long before the relay opens (lets startup transients pass). |
+| `emergency_cutoff_recovery_s` | 600 | Auto-reset after this many seconds. Manual reset via admin UI is also available. |
+
+#### Night cutoff
+
+Disconnects empty batteries between sunset and sunrise to skip the
+Marstek's ~5-15 W inverter standby loss. Requires `[location]`.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `night_cutoff_enabled` | `false` | Master switch. Validation requires `[location].latitude` + `longitude` when set. |
+| `night_cutoff_soc_margin_pct` | 2.0 | Hysteresis margin: a battery has to be within this % of the effective empty cutoff to be cut, and rise more than this % above to be restored. |
+
+### `[location]` — geographic location for sun-based features
+
+| Field | Default | Purpose |
+|---|---|---|
+| `latitude` | — | Decimal degrees (-90 to 90). Required when `night_cutoff_enabled = true`. |
+| `longitude` | — | Decimal degrees (-180 to 180). Required when `night_cutoff_enabled = true`. |
 
 #### Pulse-settle gate
 

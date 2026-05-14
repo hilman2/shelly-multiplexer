@@ -63,25 +63,509 @@ use arc_swap::ArcSwap;
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, DispatcherConfig};
+use crate::config::{Config, DispatchMode, DispatcherConfig, LocationConfig};
+use crate::modbus::{ModbusDispatch, Setpoint};
+use crate::plug;
 use crate::state::{AppState, BatteryState};
 
-pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) {
+pub async fn run(
+    state: Arc<AppState>,
+    config: Arc<ArcSwap<Config>>,
+    modbus_dispatch: Option<ModbusDispatch>,
+) {
     let cfg0 = config.load_full();
     let cycle = Duration::from_millis(cfg0.dispatcher.cycle_ms.max(50));
     let mut tick = time::interval(cycle);
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    info!(cycle_ms = cfg0.dispatcher.cycle_ms, "pulse dispatcher started (v0.3 delta-only)");
+    let mode = cfg0.dispatcher.mode;
+    info!(
+        cycle_ms = cfg0.dispatcher.cycle_ms,
+        ?mode,
+        "dispatcher started"
+    );
     loop {
         tick.tick().await;
         let cfg = config.load_full();
-        if let Err(e) = step(&state, &cfg.dispatcher) {
+        // Run the emergency-cutoff check FIRST: if a circuit is already
+        // over cap on incoming plug readings, we cut the worst offender
+        // BEFORE the dispatcher math gets a chance to issue setpoints
+        // that the rogue battery would ignore anyway.
+        enforce_circuit_safety(state.clone(), &cfg.dispatcher);
+        // Night cutoff: cut empty batteries between sunset and sunrise
+        // to skip the Marstek inverter's standby losses.
+        enforce_night_cutoff(state.clone(), &cfg.dispatcher, &cfg.location, chrono::Utc::now());
+        let result = match cfg.dispatcher.mode {
+            DispatchMode::Pulse => step_pulse(&state, &cfg.dispatcher),
+            DispatchMode::Modbus => step_modbus(&state, &cfg.dispatcher, &modbus_dispatch),
+        };
+        if let Err(e) = result {
             warn!(error = %e, "dispatcher step failed");
         }
     }
 }
 
-fn step(state: &AppState, dcfg: &DispatcherConfig) -> anyhow::Result<()> {
+// ---------------------------------------------------------------------------
+// Night cutoff — skip inverter standby losses between sunset and sunrise.
+// ---------------------------------------------------------------------------
+//
+// A Marstek Venus E pulls ~5-15 W in standby. Over a 12-hour winter
+// night that's ~60-180 Wh per battery — small per night, but a real
+// efficiency win across a year and a fleet. When the battery is empty
+// (no point keeping it powered up to sit idle), we cut its plug at
+// sunset and re-enable at sunrise (when PV could start charging it
+// again).
+//
+// Uses the same plug_cut_until / plug_cut_reason fields as the
+// emergency cutoff — the UI distinguishes the two by reason prefix.
+// The recovery boundary is sunrise (not a fixed window), so the cut
+// duration grows in winter and shrinks in summer automatically.
+fn enforce_night_cutoff(
+    state: Arc<AppState>,
+    dcfg: &DispatcherConfig,
+    location: &LocationConfig,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) {
+    if !dcfg.night_cutoff_enabled {
+        return;
+    }
+    let (Some(lat), Some(lon)) = (location.latitude, location.longitude) else {
+        // Validation guarantees this can't be reached if enabled.
+        return;
+    };
+
+    // Today's sunrise / sunset (UTC), plus tomorrow's sunrise as the
+    // recovery boundary when we cut after midnight UTC and "today" already
+    // passed sunset.
+    let today = now_utc.date_naive();
+    let coord = match sunrise::Coordinates::new(lat, lon) {
+        Some(c) => c,
+        None => return,
+    };
+    let solar_today = sunrise::SolarDay::new(coord, today);
+    let sunrise_today = solar_today.event_time(sunrise::SolarEvent::Sunrise);
+    let sunset_today = solar_today.event_time(sunrise::SolarEvent::Sunset);
+    let solar_tomorrow =
+        sunrise::SolarDay::new(coord, today.succ_opt().unwrap_or(today));
+    let sunrise_tomorrow = solar_tomorrow.event_time(sunrise::SolarEvent::Sunrise);
+
+    // Polar day / night: no sunrise OR sunset on a given date. We
+    // conservatively skip the cutoff feature in that case rather than
+    // guessing — users in those latitudes can use time-window logic
+    // (not yet exposed) instead.
+    let (sunrise_today, sunset_today, sunrise_tomorrow) =
+        match (sunrise_today, sunset_today, sunrise_tomorrow) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return,
+        };
+
+    // "Night" = before today's sunrise OR after today's sunset.
+    let is_night = now_utc < sunrise_today || now_utc >= sunset_today;
+    let next_sunrise = if now_utc < sunrise_today {
+        sunrise_today
+    } else {
+        sunrise_tomorrow
+    };
+
+    // Convert next_sunrise to Instant (best-effort: the diff between
+    // wall clock and Instant clocks is small for the lifetime of the
+    // process; we add the duration from now_utc onto Instant::now()).
+    let now_inst = Instant::now();
+    let recovery_inst = match (next_sunrise - now_utc).to_std() {
+        Ok(d) => now_inst + d,
+        Err(_) => now_inst + Duration::from_secs(8 * 3600),
+    };
+
+    let mut to_cut: Vec<(String, String)> = Vec::new();
+    let mut to_restore: Vec<(String, String)> = Vec::new();
+    {
+        let mut bats = state.batteries.write();
+        for b in bats.values_mut() {
+            // Resolve the effective empty threshold (BMS > TOML > default).
+            let empty = b.effective_soc_empty_pct(dcfg.soc_empty_pct);
+            let margin = dcfg.night_cutoff_soc_margin_pct;
+            let is_empty = matches!(b.soc_pct, Some(soc) if soc <= empty + margin);
+
+            // Is THIS battery currently cut because of a night cutoff?
+            let cut_for_night = b
+                .plug_cut_reason
+                .as_deref()
+                .map(|s| s.starts_with("night cutoff:"))
+                .unwrap_or(false);
+
+            if is_night && is_empty && b.plug_cut_until.is_none() {
+                // Eligible: arm the cut.
+                let reason = format!(
+                    "night cutoff: SoC {:.0}% ≤ {:.0}% + {:.0}% margin, sunset to sunrise",
+                    b.soc_pct.unwrap_or(0.0),
+                    empty,
+                    margin
+                );
+                b.plug_cut_until = Some(recovery_inst);
+                b.plug_cut_reason = Some(reason.clone());
+                b.plug_relay_state = Some(false);
+                to_cut.push((b.id.clone(), b.plug_url.clone()));
+            } else if cut_for_night {
+                // Recovery: if it's day OR SoC rose above empty + margin,
+                // restore the plug.
+                let soc_recovered =
+                    matches!(b.soc_pct, Some(soc) if soc > empty + margin);
+                if !is_night || soc_recovered {
+                    b.plug_cut_until = None;
+                    b.plug_cut_reason = None;
+                    to_restore.push((b.id.clone(), b.plug_url.clone()));
+                }
+            }
+        }
+    }
+
+    for (id, plug_url) in to_cut {
+        let id2 = id.clone();
+        let plug_url2 = plug_url.clone();
+        let state_for_task = state.clone();
+        tokio::spawn(async move {
+            match plug::set_relay(&plug_url2, false).await {
+                Ok(()) => {
+                    info!(battery = %id2, "night cutoff: plug relay opened");
+                }
+                Err(e) => {
+                    warn!(
+                        battery = %id2,
+                        error = %e,
+                        "night cutoff: plug write failed — reverting state"
+                    );
+                    let mut bats = state_for_task.batteries.write();
+                    if let Some(b) = bats.get_mut(&id2) {
+                        b.plug_cut_until = None;
+                        b.plug_cut_reason = Some(format!("night cutoff failed: {e}"));
+                    }
+                }
+            }
+        });
+    }
+
+    for (id, plug_url) in to_restore {
+        let id2 = id.clone();
+        let plug_url2 = plug_url.clone();
+        let state_for_task = state.clone();
+        tokio::spawn(async move {
+            match plug::set_relay(&plug_url2, true).await {
+                Ok(()) => {
+                    info!(battery = %id2, "night cutoff: plug restored at sunrise");
+                    let mut bats = state_for_task.batteries.write();
+                    if let Some(b) = bats.get_mut(&id2) {
+                        b.plug_relay_state = Some(true);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        battery = %id2,
+                        error = %e,
+                        "night cutoff recovery FAILED — will retry next cycle"
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// Public entrypoint for the admin API: manually resets the cutoff
+/// flag and re-enables the plug. Returns the plug HTTP call's result.
+pub async fn manual_reset_cutoff(state: Arc<AppState>, battery_id: &str) -> anyhow::Result<()> {
+    let plug_url = {
+        let bats = state.batteries.read();
+        let b = bats
+            .get(battery_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown battery: {battery_id}"))?;
+        if b.plug_cut_until.is_none() {
+            anyhow::bail!("battery {battery_id} is not in cutoff state");
+        }
+        b.plug_url.clone()
+    };
+    plug::set_relay(&plug_url, true).await?;
+    let mut bats = state.batteries.write();
+    if let Some(b) = bats.get_mut(battery_id) {
+        b.plug_cut_until = None;
+        b.plug_cut_reason = None;
+        b.plug_relay_state = Some(true);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Emergency circuit cutoff — hard safety relay layer.
+// ---------------------------------------------------------------------------
+//
+// The dispatcher's soft control (Modbus setpoints / CT pulses) keeps
+// the circuit under cap in normal operation. This layer catches the
+// pathological case where soft control failed:
+//   - we commanded standby but the battery kept charging anyway, or
+//   - measurement glitch let us issue setpoints past the cap, or
+//   - a battery's BMS overrode our command for its own reasons.
+//
+// Detection: signed sum of plug_w across the circuit > effective cap
+// + `emergency_cutoff_margin_w` for `emergency_cutoff_grace_s` seconds.
+// Action: identify the battery contributing the most to the over-cap
+// direction and trigger `plug::set_relay(url, false)` on its plug.
+//
+// Recovery: after `emergency_cutoff_recovery_s` the dispatcher re-enables
+// the relay. If the condition recurs, the cut is re-armed.
+fn enforce_circuit_safety(state: Arc<AppState>, dcfg: &DispatcherConfig) {
+    if dcfg.emergency_cutoff_margin_w <= 0.0 {
+        // Feature disabled — skip everything.
+        return;
+    }
+    let now = Instant::now();
+    let grace = Duration::from_secs_f64(dcfg.emergency_cutoff_grace_s.max(0.5));
+    let recovery = Duration::from_secs_f64(dcfg.emergency_cutoff_recovery_s.max(60.0));
+
+    let mut to_trip: Vec<(String, String, String)> = Vec::new(); // (id, plug_url, reason)
+    let mut to_reenable: Vec<(String, String)> = Vec::new(); // (id, plug_url)
+
+    {
+        let bats = state.batteries.read();
+        let mut circuits = state.circuits.write();
+
+        for cs in circuits.values_mut() {
+            let cap = cs.cap_w() * dcfg.circuit_headroom;
+            let margin = dcfg.emergency_cutoff_margin_w;
+            // Only consider batteries whose plug is currently on (otherwise
+            // they can't contribute, and we don't want to count a stale
+            // reading from a recently-cut plug).
+            let members: Vec<&BatteryState> = cs
+                .member_ids
+                .iter()
+                .filter_map(|id| bats.get(id))
+                .filter(|b| b.plug_relay_state.unwrap_or(true)) // assume on if unknown
+                .collect();
+            if members.is_empty() {
+                cs.overload_started_at = None;
+                continue;
+            }
+            let signed_sum: f64 = members.iter().filter_map(|b| b.last_plug_w).sum();
+            let overload = signed_sum.abs() > cap + margin;
+
+            if overload {
+                let started = *cs.overload_started_at.get_or_insert(now);
+                if now.duration_since(started) >= grace {
+                    // Trip: find the worst offender in the violating
+                    // direction. We only cut ONE plug per cycle even if
+                    // the margin is huge — the next cycle's measurement
+                    // will tell us whether more cuts are needed.
+                    let dir = signed_sum.signum();
+                    let worst = members
+                        .iter()
+                        .filter(|b| {
+                            b.plug_cut_until.map_or(true, |t| t <= now)
+                                && b.last_plug_w
+                                    .map(|w| w.signum() == dir && w.abs() > 0.0)
+                                    .unwrap_or(false)
+                        })
+                        .max_by(|a, b| {
+                            let av = a.last_plug_w.unwrap_or(0.0).abs();
+                            let bv = b.last_plug_w.unwrap_or(0.0).abs();
+                            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    if let Some(b) = worst {
+                        let reason = format!(
+                            "circuit {} over cap: |{:.0} W| > {:.0} W + {:.0} W margin for {:.1}s",
+                            cs.config.id,
+                            signed_sum,
+                            cap,
+                            margin,
+                            now.duration_since(started).as_secs_f64()
+                        );
+                        to_trip.push((b.id.clone(), b.plug_url.clone(), reason));
+                    }
+                }
+            } else {
+                cs.overload_started_at = None;
+            }
+        }
+
+        // Recovery sweep: any battery whose cut window has expired
+        // gets its plug re-enabled.
+        for b in bats.values() {
+            if let Some(t) = b.plug_cut_until {
+                // `t` is the cut_until timestamp — if it's already in
+                // the past, the recovery window has elapsed.
+                if t <= now {
+                    to_reenable.push((b.id.clone(), b.plug_url.clone()));
+                }
+            }
+        }
+    }
+
+    // Optimistically stamp the state so the SAME cycle's subsequent
+    // dispatch math sees "this battery is cut" — the HTTP call still
+    // runs in the background. If the HTTP fails we revert below.
+    if !to_trip.is_empty() {
+        let mut bats = state.batteries.write();
+        for (id, _, reason) in &to_trip {
+            if let Some(b) = bats.get_mut(id) {
+                b.plug_cut_until = Some(now + recovery);
+                b.plug_cut_reason = Some(reason.clone());
+                b.plug_relay_state = Some(false);
+            }
+        }
+    }
+
+    for (id, plug_url, reason) in to_trip {
+        let id2 = id.clone();
+        let plug_url2 = plug_url.clone();
+        let reason2 = reason.clone();
+        let state_for_task = state.clone();
+        tokio::spawn(async move {
+            match plug::set_relay(&plug_url2, false).await {
+                Ok(()) => {
+                    warn!(
+                        battery = %id2,
+                        reason = %reason2,
+                        "EMERGENCY CUTOFF: plug relay opened"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        battery = %id2,
+                        error = %e,
+                        "EMERGENCY CUTOFF http call failed — clearing the cut flag so the next cycle retries"
+                    );
+                    let mut bats = state_for_task.batteries.write();
+                    if let Some(b) = bats.get_mut(&id2) {
+                        b.plug_cut_until = None;
+                        b.plug_cut_reason = Some(format!("cutoff failed: {e}"));
+                    }
+                }
+            }
+        });
+    }
+
+    for (id, plug_url) in to_reenable {
+        let id2 = id.clone();
+        let plug_url2 = plug_url.clone();
+        let state_for_task = state.clone();
+        tokio::spawn(async move {
+            match plug::set_relay(&plug_url2, true).await {
+                Ok(()) => {
+                    info!(battery = %id2, "emergency cutoff recovery: plug relay closed");
+                    let mut bats = state_for_task.batteries.write();
+                    if let Some(b) = bats.get_mut(&id2) {
+                        b.plug_cut_until = None;
+                        b.plug_cut_reason = None;
+                        b.plug_relay_state = Some(true);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        battery = %id2,
+                        error = %e,
+                        "emergency cutoff recovery FAILED — plug still off, will retry next cycle"
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// Modbus-dispatch tick — compute absolute setpoints and push them
+/// through `ModbusDispatch`. Way simpler than the pulse path: no
+/// settle gate, no in-flight tracking, no virtual Shelly. Just
+/// figure out the target per battery and tell each Marstek exactly
+/// what to do.
+fn step_modbus(
+    state: &AppState,
+    dcfg: &DispatcherConfig,
+    dispatch: &Option<ModbusDispatch>,
+) -> anyhow::Result<()> {
+    let Some(dispatch) = dispatch else {
+        // Modbus mode requested but the writer pool didn't spin up
+        // (likely no batteries with modbus_host). Nothing to do.
+        return Ok(());
+    };
+    let now = Instant::now();
+    let grid_fresh = update_circuit_mute(state, dcfg, now);
+    // No `detect_setpoint_outcomes` call here — in modbus mode we
+    // have direct telemetry (SoC, force_mode_actual, battery_power)
+    // and the BMS cutoffs (44000/44001) which feed low_bound /
+    // high_bound. A "full" battery's charge bound is already pinned
+    // to 0 before we issue any command, so empirical refusal
+    // detection is redundant. Pulse mode still relies on it.
+
+    if !grid_fresh {
+        // Grid stale → command every battery to standby so they don't
+        // keep churning on a stale assumption. Same safety stance as
+        // the pulse path's silence window.
+        for id in dispatch.battery_ids() {
+            dispatch.send(&id, Setpoint::Standby);
+        }
+        return Ok(());
+    }
+
+    let grid_w = {
+        let snap = state.snapshot.load_full();
+        snap.status.total_act_power.unwrap_or(0.0)
+    };
+    let targets = compute_targets(state, dcfg, grid_w, now);
+
+    // SEQUENTIAL per circuit: we issue at most ONE new setpoint per
+    // circuit per cycle, and only to a battery whose previous write
+    // has settled (plug confirmed via `modbus_settled`). Why:
+    //
+    //   - Circuit cap is structurally safe — between writes the plug
+    //     reflects the latest commanded setpoint, so the next decision
+    //     uses real measurements, not assumptions about commands that
+    //     haven't materialised yet.
+    //   - BMS taper / refusal handled naturally — if battery A under-
+    //     delivers, A's plug shows the actual power and the next
+    //     candidate on the circuit gets the remainder.
+    //
+    // The writer task's own heartbeat re-issues unchanged setpoints
+    // every `modbus_heartbeat_s` so batteries we DIDN'T pick this cycle
+    // still get periodic "I'm still here" writes.
+    let bats = state.batteries.read();
+    let circuits = state.circuits.read();
+    for cs in circuits.values() {
+        // Skip muted circuits — same as compute_targets does for
+        // eligibility (deltas computed for them are already zero).
+        if cs.silent_until.map(|t| t > now).unwrap_or(false) {
+            continue;
+        }
+        // Find the candidate with the BIGGEST delta between desired
+        // target and last-written setpoint, among settled members
+        // whose plug isn't currently cut.
+        let pick = cs
+            .member_ids
+            .iter()
+            .filter_map(|id| bats.get(id))
+            .filter(|b| b.plug_cut_until.is_none())
+            .filter(|b| {
+                b.modbus_settled(dcfg.plug_stable_duration_s, dcfg.settle_timeout_s)
+            })
+            .map(|b| {
+                let target = targets.get(&b.id).copied().unwrap_or(0.0);
+                let last = b.last_modbus_setpoint_w.unwrap_or(0.0);
+                let delta = (target - last).abs();
+                (b, target, delta)
+            })
+            .max_by(|a, c| {
+                a.2.partial_cmp(&c.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        if let Some((b, target_w, delta)) = pick {
+            // Skip the write if it's below the setpoint deadband — saves
+            // Modbus traffic on micro-jitters. The writer task's
+            // heartbeat covers the "I'm still here" angle.
+            if delta < dcfg.setpoint_deadband_w {
+                continue;
+            }
+            let sp = Setpoint::from_signed_watts(target_w, b.max_charge_w, b.max_discharge_w);
+            dispatch.send(&b.id, sp);
+        }
+    }
+    Ok(())
+}
+
+fn step_pulse(state: &AppState, dcfg: &DispatcherConfig) -> anyhow::Result<()> {
     let now = Instant::now();
     let grid_fresh = update_circuit_mute(state, dcfg, now);
     if !grid_fresh {
@@ -535,6 +1019,164 @@ fn compute_deltas(
 }
 
 // ---------------------------------------------------------------------------
+// Step 3 / modbus path: absolute setpoint computation
+// ---------------------------------------------------------------------------
+//
+// Same overall math as compute_deltas (eligibility, grid correction,
+// weighted share with [low_bound, high_bound] clamping, iterative
+// redistribution of clamped surplus). The only differences:
+//
+//   - we return ABSOLUTE targets, not deltas (the writer doesn't care
+//     about the plug delta — Modbus accepts wattages directly),
+//   - the circuit cap is enforced on the SUM of targets, not on the
+//     plug+delta sum (cleaner: no measurement loop in the math).
+//
+// Inactive batteries (= no SoC source) participate via empirical
+// detect_setpoint_outcomes — same lockout semantics as pulse mode.
+fn compute_targets(
+    state: &AppState,
+    dcfg: &DispatcherConfig,
+    grid_w: f64,
+    now: Instant,
+) -> HashMap<String, f64> {
+    let bats = state.batteries.read();
+    let circuits = state.circuits.read();
+
+    let mut targets: HashMap<String, f64> = HashMap::new();
+    for b in bats.values() {
+        targets.insert(b.id.clone(), 0.0);
+    }
+
+    let muted_circuit = |cid: &str| -> bool {
+        circuits
+            .get(cid)
+            .and_then(|c| c.silent_until)
+            .map(|t| t > now)
+            .unwrap_or(false)
+    };
+
+    let eligible: Vec<&BatteryState> = bats
+        .values()
+        .filter(|b| !muted_circuit(&b.circuit) && b.last_plug_w.is_some())
+        .collect();
+    if eligible.is_empty() {
+        return targets;
+    }
+
+    // Asymmetric grid bias (same as pulse mode).
+    let raw = grid_w;
+    let grid_correction_raw = if raw > 0.0 {
+        (raw - dcfg.grid_bias_w).max(0.0)
+    } else if raw < 0.0 {
+        (raw + dcfg.grid_bias_w).min(0.0)
+    } else {
+        0.0
+    };
+    let grid_correction = if grid_correction_raw.abs() < dcfg.deadband_w {
+        0.0
+    } else {
+        grid_correction_raw
+    };
+
+    let current_total: f64 = eligible.iter().map(|b| b.last_plug_w.unwrap_or(0.0)).sum();
+    let desired_total = current_total + grid_correction;
+    let charging = desired_total < 0.0;
+
+    let weight_of = |b: &BatteryState| -> f64 {
+        if charging && b.is_charge_locked(now) {
+            return 0.0;
+        }
+        if !charging && b.is_discharge_locked(now) {
+            return 0.0;
+        }
+        let cap = if b.capacity_wh > 0.0 {
+            b.capacity_wh
+        } else {
+            b.max_charge_w + b.max_discharge_w
+        };
+        let soc_room = match b.soc_pct {
+            Some(soc) => {
+                if charging {
+                    (b.effective_soc_full_pct(dcfg.soc_full_pct) - soc).max(0.0)
+                } else {
+                    (soc - b.effective_soc_empty_pct(dcfg.soc_empty_pct)).max(0.0)
+                }
+            }
+            None => 50.0,
+        };
+        b.priority_weight * cap * soc_room
+    };
+
+    let mut active: Vec<&BatteryState> = eligible.iter().copied().collect();
+    let mut remaining = desired_total;
+
+    for _ in 0..6 {
+        if active.is_empty() || remaining.abs() < 1e-3 {
+            break;
+        }
+        let total_weight: f64 = active.iter().map(|b| weight_of(b)).sum();
+        if total_weight <= 0.0 {
+            break;
+        }
+        let mut clamped_ids: Vec<String> = Vec::new();
+        for b in &active {
+            let prev = targets.get(&b.id).copied().unwrap_or(0.0);
+            let share = remaining * weight_of(b) / total_weight;
+            let proposed = prev + share;
+            let lo = low_bound(b, dcfg, now);
+            let hi = high_bound(b, dcfg, now);
+            let clamped = proposed.clamp(lo, hi);
+            targets.insert(b.id.clone(), clamped);
+            if (clamped - proposed).abs() > 1e-3 {
+                clamped_ids.push(b.id.clone());
+            }
+        }
+        let assigned: f64 = active
+            .iter()
+            .map(|b| targets.get(&b.id).copied().unwrap_or(0.0))
+            .sum::<f64>()
+            + targets
+                .iter()
+                .filter(|(id, _)| !active.iter().any(|b| &b.id == *id))
+                .map(|(_, v)| *v)
+                .sum::<f64>();
+        remaining = desired_total - assigned;
+        if clamped_ids.is_empty() {
+            break;
+        }
+        active.retain(|b| !clamped_ids.contains(&b.id));
+    }
+
+    // Per-circuit cap on the sum of TARGETS (modbus path enforces the
+    // fuse limit on commanded power, not on plug+delta — much simpler).
+    for cs in circuits.values() {
+        let cap = cs.cap_w() * dcfg.circuit_headroom;
+        let member_ids: Vec<String> = cs.member_ids.clone();
+        let target_sum: f64 = member_ids
+            .iter()
+            .filter_map(|id| targets.get(id).copied())
+            .sum();
+        if target_sum.abs() > cap {
+            let scale = cap / target_sum.abs();
+            warn!(
+                circuit = %cs.config.id,
+                cap_w = cap,
+                target_sum,
+                applied_scale = scale,
+                "circuit cap engaged — scaling targets"
+            );
+            for id in &member_ids {
+                if let Some(t) = targets.get_mut(id) {
+                    *t *= scale;
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+// ---------------------------------------------------------------------------
 // Step 4: queue pulses
 // ---------------------------------------------------------------------------
 
@@ -614,6 +1256,7 @@ mod tests {
             address: format!("127.0.0.{}", id.bytes().last().unwrap_or(1))
                 .parse()
                 .unwrap(),
+            plug_url: format!("http://127.0.0.{}", id.bytes().last().unwrap_or(1) + 100),
             active: true,
             max_charge_w: max_charge,
             max_discharge_w: max_discharge,
@@ -639,6 +1282,15 @@ mod tests {
             last_pulse_delta_w: None,
             charge_locked_until: None,
             discharge_locked_until: None,
+            last_modbus_setpoint_w: None,
+            last_modbus_write_at: None,
+            last_modbus_write_error: None,
+            last_battery_power_w: None,
+            bms_full_pct: None,
+            bms_empty_pct: None,
+            plug_relay_state: None,
+            plug_cut_until: None,
+            plug_cut_reason: None,
             last_error: None,
         }
     }
@@ -876,7 +1528,7 @@ modbus_host = "192.168.1.93"
         }
 
         let dcfg = Default::default();
-        step(&state, &dcfg).unwrap();
+        step_pulse(&state, &dcfg).unwrap();
 
         let bats = state.batteries.read();
         // The whole point: A must NOT receive a fresh pulse, even though
@@ -917,7 +1569,7 @@ modbus_host = "192.168.1.93"
         }
 
         let dcfg = Default::default();
-        step(&state, &dcfg).unwrap();
+        step_pulse(&state, &dcfg).unwrap();
 
         let bats = state.batteries.read();
         // Each battery should now carry an armed pulse (negative = charge).
@@ -963,7 +1615,7 @@ modbus_host = "192.168.1.93"
             b.plug_w_at_pulse_send = Some(0.0); // didn't move
         }
 
-        step(&state, &dcfg).unwrap();
+        step_pulse(&state, &dcfg).unwrap();
 
         let bats = state.batteries.read();
         // Gate released → all three got fresh pulses.
@@ -1103,6 +1755,266 @@ modbus_host = "192.168.1.93"
         b.charge_locked_until = Some(now - Duration::from_secs(1));
         assert!(!b.is_charge_locked(now));
         assert_eq!(low_bound(&b, &cfg, now), -2500.0);
+    }
+
+    // -----------------------------------------------------------------
+    // Modbus-mode tests (v0.7) — compute_targets math and
+    // detect_setpoint_outcomes lockout semantics.
+    // -----------------------------------------------------------------
+
+    /// With grid importing 1500 W and three idle batteries, compute_targets
+    /// must distribute the discharge target across all three (weighted
+    /// equally — identical capacity_wh) so that their sum equals the
+    /// desired_total within the deadband.
+    #[test]
+    fn compute_targets_distributes_import_correction_evenly() {
+        let state = three_battery_state();
+        fresh_grid_snapshot(&state, 1500.0);
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(0.0);
+                b.last_plug_at = Some(now);
+            }
+        }
+        let dcfg = dcfg();
+        let targets = compute_targets(&state, &dcfg, 1500.0, now);
+
+        let sum: f64 = targets.values().sum();
+        // Grid bias of 30 W: corrected import is 1470 W; expect ~1470 W
+        // total discharge spread across 3 batteries.
+        assert!(
+            (sum - 1470.0).abs() < 1.0,
+            "sum of targets should equal grid - bias, got {sum}"
+        );
+        // Each battery gets roughly a third — positive (discharge).
+        for (id, t) in &targets {
+            assert!(
+                *t > 400.0 && *t < 600.0,
+                "{id}: target {t} not within expected third"
+            );
+        }
+    }
+
+    /// Charge-locked battery must NOT receive any charge target even if
+    /// its weight would otherwise win — the locked direction is bound to 0.
+    /// Verifies that low_bound's lockout pin propagates through compute_targets.
+    #[test]
+    fn compute_targets_skips_charge_locked_battery() {
+        let state = three_battery_state();
+        // Grid exporting 3000 W → batteries should charge.
+        fresh_grid_snapshot(&state, -3000.0);
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(0.0);
+                b.last_plug_at = Some(now);
+            }
+            // A is locked from charging (= "full").
+            let a = bats.get_mut("a").unwrap();
+            a.charge_locked_until = Some(now + Duration::from_secs(120));
+        }
+        let dcfg = dcfg();
+        let targets = compute_targets(&state, &dcfg, -3000.0, now);
+
+        let a = *targets.get("a").unwrap();
+        assert_eq!(
+            a, 0.0,
+            "locked battery should get 0 charge target, got {a}"
+        );
+        // B and C take the load.
+        assert!(*targets.get("b").unwrap() < -0.5);
+        assert!(*targets.get("c").unwrap() < -0.5);
+    }
+
+    /// Circuit cap on the SUM of targets — if everyone wants 2500 W
+    /// discharge on a 16 A / 230 V circuit (cap 3680 W * 0.95 = 3496 W),
+    /// the sum must scale down to land on the cap.
+    #[test]
+    fn compute_targets_scales_to_circuit_cap() {
+        let state = three_battery_state();
+        // Massive import → every battery would max out at 800 W discharge.
+        // 3 × 800 = 2400 W which is UNDER the c1 cap (32 A * 230 V * 0.95
+        // = 6992 W), so to test the cap scaling I need a smaller cap.
+        // The three_battery_state uses fuse_amps = 32; let me check by
+        // first making batteries with high max_discharge so sum > cap.
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(0.0);
+                b.last_plug_at = Some(now);
+                // Bump per-battery max_discharge to 3000 so sum could
+                // exceed 6992 (3 × 3000 = 9000).
+                b.max_discharge_w = 3000.0;
+            }
+        }
+        fresh_grid_snapshot(&state, 9000.0);
+        let dcfg = dcfg();
+        let targets = compute_targets(&state, &dcfg, 9000.0, now);
+
+        let cap = 32.0 * 230.0 * 0.95;
+        let sum: f64 = targets.values().sum();
+        // After cap scaling, sum should be at the cap (within a small epsilon).
+        assert!(
+            (sum - cap).abs() < 5.0,
+            "sum {sum} should land near cap {cap}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Emergency plug cutoff — v0.7 hard safety layer.
+    // -----------------------------------------------------------------
+
+    /// Below the margin → no overload tracker, no trip.
+    #[test]
+    fn cutoff_no_overload_when_within_cap() {
+        let state = three_battery_state();
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for (i, b) in bats.values_mut().enumerate() {
+                b.last_plug_w = Some(1000.0 + i as f64);
+                b.last_plug_at = Some(now);
+                b.plug_relay_state = Some(true);
+            }
+        }
+        let dcfg = dcfg();
+        enforce_circuit_safety(state.clone(), &dcfg);
+        let circuits = state.circuits.read();
+        let cs = circuits.get("c1").unwrap();
+        assert!(
+            cs.overload_started_at.is_none(),
+            "no overload should be tracked under cap"
+        );
+    }
+
+    /// Over cap by more than the margin → overload tracker starts.
+    /// Grace not yet elapsed → no trip.
+    #[test]
+    fn cutoff_starts_tracker_on_first_overload() {
+        let state = three_battery_state();
+        let now = Instant::now();
+        // c1 cap = 32 A * 230 V * 0.95 = ~6992 W. Push sum WAY over.
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(3000.0); // 3 × 3000 = 9000 > 6992 + 200
+                b.last_plug_at = Some(now);
+                b.plug_relay_state = Some(true);
+            }
+        }
+        let dcfg = dcfg();
+        enforce_circuit_safety(state.clone(), &dcfg);
+        let circuits = state.circuits.read();
+        let cs = circuits.get("c1").unwrap();
+        assert!(
+            cs.overload_started_at.is_some(),
+            "overload tracker should start on first overload"
+        );
+    }
+
+    /// Sustained overload past the grace window picks the worst
+    /// offender and stamps plug_cut_until. The HTTP call is fired in a
+    /// detached task (we use tokio::test so spawn works; the spawned
+    /// task tries to hit an unreachable plug URL and fails, but the
+    /// state stamping happens synchronously before that).
+    #[tokio::test]
+    async fn cutoff_trips_worst_offender_after_grace() {
+        let state = three_battery_state();
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            // Set up: a + b mild; c is the worst offender.
+            bats.get_mut("a").unwrap().last_plug_w = Some(2500.0);
+            bats.get_mut("b").unwrap().last_plug_w = Some(2500.0);
+            bats.get_mut("c").unwrap().last_plug_w = Some(4500.0);
+            for b in bats.values_mut() {
+                b.last_plug_at = Some(now);
+                b.plug_relay_state = Some(true);
+            }
+        }
+        // Pretend the overload has been going on for longer than grace.
+        {
+            let mut circuits = state.circuits.write();
+            circuits.get_mut("c1").unwrap().overload_started_at = Some(
+                now - Duration::from_secs_f64(dcfg().emergency_cutoff_grace_s + 1.0),
+            );
+        }
+        let dcfg = dcfg();
+        enforce_circuit_safety(state.clone(), &dcfg);
+        let bats = state.batteries.read();
+        let c = bats.get("c").unwrap();
+        assert!(
+            c.plug_cut_until.is_some(),
+            "worst offender c should be marked for cutoff"
+        );
+        // a and b should not be cut (only ONE per cycle).
+        assert!(bats.get("a").unwrap().plug_cut_until.is_none());
+        assert!(bats.get("b").unwrap().plug_cut_until.is_none());
+    }
+
+    /// Disabled feature (margin = 0) is a complete no-op.
+    #[test]
+    fn cutoff_disabled_when_margin_zero() {
+        let state = three_battery_state();
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(5000.0); // massively over cap
+                b.last_plug_at = Some(now);
+                b.plug_relay_state = Some(true);
+            }
+        }
+        let mut dcfg = dcfg();
+        dcfg.emergency_cutoff_margin_w = 0.0; // disable
+        enforce_circuit_safety(state.clone(), &dcfg);
+        let circuits = state.circuits.read();
+        let cs = circuits.get("c1").unwrap();
+        assert!(
+            cs.overload_started_at.is_none(),
+            "disabled feature must not even start the tracker"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Sequential dispatch: modbus_settled() + per-circuit single-write
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn modbus_settled_initial_state() {
+        let b = make_battery("a", 0.0, 2500.0, 800.0);
+        assert!(b.modbus_settled(1.5, 5.0));
+    }
+
+    #[test]
+    fn modbus_settled_blocks_during_settle_window() {
+        let mut b = make_battery("a", 0.0, 2500.0, 800.0);
+        b.last_modbus_write_at = Some(Instant::now() - Duration::from_millis(500));
+        // Plug hasn't moved since write → not settled, well within 5s timeout.
+        assert!(!b.modbus_settled(1.5, 5.0));
+    }
+
+    #[test]
+    fn modbus_settled_via_plug_movement_and_stability() {
+        let mut b = make_battery("a", -500.0, 2500.0, 800.0);
+        let now = Instant::now();
+        b.last_modbus_write_at = Some(now - Duration::from_secs(3));
+        b.last_plug_movement_at = Some(now - Duration::from_secs(2));
+        // Plug moved 1s after write, then stable for 2s ≥ 1.5s → settled.
+        assert!(b.modbus_settled(1.5, 5.0));
+    }
+
+    #[test]
+    fn modbus_settled_via_timeout_when_plug_didnt_move() {
+        let mut b = make_battery("a", 0.0, 2500.0, 800.0);
+        b.last_modbus_write_at = Some(Instant::now() - Duration::from_secs(10));
+        b.last_plug_movement_at = None;
+        // No plug response after settle_timeout_s = 5 → timeout-settled.
+        assert!(b.modbus_settled(1.5, 5.0));
     }
 
     fn single_battery_state(bs: BatteryState) -> std::sync::Arc<AppState> {

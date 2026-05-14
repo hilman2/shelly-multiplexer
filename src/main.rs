@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -8,7 +9,8 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use shelly_multiplexer::config::Config;
+use shelly_multiplexer::config::{Config, DispatchMode};
+use shelly_multiplexer::modbus::ModbusDispatch;
 use shelly_multiplexer::state::AppState;
 use shelly_multiplexer::{
     dispatcher, ha, http_admin, http_shelly, mdns, modbus, plug, real_shelly, virtual_shelly,
@@ -113,6 +115,30 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::from_config(&cfg);
+    let dispatch_mode = cfg.dispatcher.mode;
+    let modbus_watchdog_grace_s = cfg.dispatcher.modbus_watchdog_grace_s;
+
+    // ModbusDispatch (= per-battery writer task pool) only spins up in
+    // modbus mode. We hand a clone into the dispatcher AND keep one
+    // here so the panic_hook / signal handlers can trigger failsafe.
+    let modbus_dispatch = match dispatch_mode {
+        DispatchMode::Modbus => Some(ModbusDispatch::spawn(state.clone(), &cfg)),
+        DispatchMode::Pulse => None,
+    };
+
+    // panic_hook: if anything in this process panics, do our best to put
+    // the batteries into standby before unwinding. Doesn't help against
+    // SIGKILL / power-loss, but covers Rust-level crashes — the dominant
+    // class of "controller dies, battery keeps charging" failures.
+    if let Some(md) = modbus_dispatch.clone() {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            eprintln!("PANIC FAILSAFE triggered: {info}");
+            md.panic_failsafe();
+            prev_hook(info);
+        }));
+    }
+
     let cfg_swap = Arc::new(ArcSwap::from_pointee(cfg));
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -129,8 +155,9 @@ async fn main() -> Result<()> {
     {
         let s = state.clone();
         let c = cfg_swap.clone();
+        let md = modbus_dispatch.clone();
         tasks.spawn(async move {
-            dispatcher::run(s, c).await;
+            dispatcher::run(s, c, md).await;
             log_task_exit::<()>("dispatcher", Ok(()));
         });
     }
@@ -206,17 +233,30 @@ async fn main() -> Result<()> {
 
     info!("shelly-multiplexer ready");
 
-    tokio::select! {
+    // Graceful shutdown: drain the ModbusDispatch handle so each writer
+    // task gets a chance to fire its failsafe (force_mode=0,
+    // RS485 control off) before we drop the runtime.
+    let shutdown_grace = Duration::from_secs_f64(modbus_watchdog_grace_s.max(2.0));
+    let signal_md = modbus_dispatch.clone();
+    let signal_outcome: Result<()> = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, shutting down");
+            if let Some(md) = &signal_md {
+                info!("triggering modbus failsafe (force_mode=0 on every battery)");
+                md.shutdown(shutdown_grace).await;
+            }
             Ok(())
         }
         _ = wait_first(&mut tasks) => {
             error!("a critical task exited; shutting down");
             eprintln!("FATAL: a critical task exited prematurely");
-            anyhow::bail!("critical task exited prematurely")
+            if let Some(md) = &signal_md {
+                md.shutdown(shutdown_grace).await;
+            }
+            Err(anyhow::anyhow!("critical task exited prematurely"))
         }
-    }
+    };
+    signal_outcome
 }
 
 fn log_task_exit<T: std::fmt::Debug>(name: &str, result: Result<T>) {

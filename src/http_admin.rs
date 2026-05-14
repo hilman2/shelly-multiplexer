@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::Json;
 use rust_embed::Embed;
 use serde::Serialize;
@@ -51,6 +51,7 @@ pub async fn run(
         .route("/api/status", get(api_status))
         .route("/api/config", get(api_get_config).put(api_put_config))
         .route("/api/config/section/{name}", put(api_put_section))
+        .route("/api/cutoff/{battery_id}/reset", post(api_cutoff_reset))
         .route("/api/health", get(api_health))
         .route("/{*path}", get(serve_static))
         .with_state(ctx);
@@ -114,6 +115,9 @@ struct StatusResponse {
     grid_w: Option<f64>,
     grid_age_ms: Option<u128>,
     config_path: String,
+    /// "modbus" or "pulse" — surfaced so the UI can show "modbus dispatch
+    /// active" in the header and conditionally hide pulse-only columns.
+    dispatch_mode: &'static str,
     batteries: Vec<BatteryInfo>,
     circuits: Vec<CircuitInfo>,
 }
@@ -168,6 +172,25 @@ struct BatteryInfo {
     /// "locked (likely full / empty)" from the SoC-based gates.
     charge_locked_for_ms: Option<u128>,
     discharge_locked_for_ms: Option<u128>,
+    /// Most recent Modbus setpoint (signed W; + = discharge, − = charge,
+    /// 0 = standby). None until the first successful write.
+    last_modbus_setpoint_w: Option<f64>,
+    last_modbus_write_ago_ms: Option<u128>,
+    last_modbus_write_error: Option<String>,
+    /// Battery's own power reading via Modbus (W; sign convention same
+    /// as the plug). Useful sanity check against the plug PM Gen3.
+    last_battery_power_w: Option<f64>,
+    /// BMS-configured charging cutoff (% SoC) — read from Modbus reg
+    /// 44000 at init. None until the read succeeds.
+    bms_full_pct: Option<f64>,
+    bms_empty_pct: Option<f64>,
+    /// Current plug relay state (true = closed). None until first poll.
+    plug_relay_state: Option<bool>,
+    /// Remaining time (ms) before the emergency-cutoff recovery window
+    /// expires. None if the plug is currently NOT in cutoff.
+    plug_cut_for_ms: Option<u128>,
+    /// Reason the plug was cut. Surfaced in the UI tooltip.
+    plug_cut_reason: Option<String>,
     /// Circuit-level mute (plug or grid stale) — surfaced here too
     /// so the per-battery row can show "silent" without the user
     /// having to cross-reference the circuit table.
@@ -250,6 +273,20 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
                     .discharge_locked_until
                     .and_then(|t| t.checked_duration_since(now))
                     .map(|d| d.as_millis()),
+                last_modbus_setpoint_w: b.last_modbus_setpoint_w,
+                last_modbus_write_ago_ms: b
+                    .last_modbus_write_at
+                    .map(|t| now.duration_since(t).as_millis()),
+                last_modbus_write_error: b.last_modbus_write_error.clone(),
+                last_battery_power_w: b.last_battery_power_w,
+                bms_full_pct: b.bms_full_pct,
+                bms_empty_pct: b.bms_empty_pct,
+                plug_relay_state: b.plug_relay_state,
+                plug_cut_for_ms: b
+                    .plug_cut_until
+                    .and_then(|t| t.checked_duration_since(now))
+                    .map(|d| d.as_millis()),
+                plug_cut_reason: b.plug_cut_reason.clone(),
                 circuit_silent,
             }
         })
@@ -282,10 +319,16 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
         })
         .collect();
 
+    let dispatch_mode = match cfg.dispatcher.mode {
+        crate::config::DispatchMode::Modbus => "modbus",
+        crate::config::DispatchMode::Pulse => "pulse",
+    };
+
     Json(StatusResponse {
         grid_w,
         grid_age_ms,
         config_path: ctx.config_path.display().to_string(),
+        dispatch_mode,
         batteries,
         circuits: circuit_infos,
     })
@@ -293,6 +336,20 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
 
 async fn api_health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+/// Manual override for the emergency plug cutoff. Re-enables the plug
+/// relay immediately, regardless of the recovery window. Used from
+/// the UI's "reset" button once the operator has verified the
+/// underlying issue is resolved.
+async fn api_cutoff_reset(
+    State(ctx): State<AdminCtx>,
+    Path(battery_id): Path<String>,
+) -> Response {
+    match crate::dispatcher::manual_reset_cutoff(ctx.state.clone(), &battery_id).await {
+        Ok(()) => Json(json!({"status": "ok", "battery": battery_id})).into_response(),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
