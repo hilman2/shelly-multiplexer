@@ -118,6 +118,11 @@ async fn main() -> Result<()> {
     let dispatch_mode = cfg.dispatcher.mode;
     let modbus_watchdog_grace_s = cfg.dispatcher.modbus_watchdog_grace_s;
 
+    // Initialise the Modbus timeouts + retry budget from config. Has to
+    // happen BEFORE we spawn any writer task — the atomics it touches
+    // are read on every modbus operation.
+    modbus::init_timings(&cfg);
+
     // ModbusDispatch (= per-battery writer task pool) only spins up in
     // modbus mode. We hand a clone into the dispatcher AND keep one
     // here so the panic_hook / signal handlers can trigger failsafe.

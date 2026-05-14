@@ -28,6 +28,12 @@ use crate::rpc::EmStatusIncoming;
 pub struct EmSnapshot {
     pub status: EmStatusIncoming,
     pub age: Option<Instant>,
+    /// EMA-smoothed total grid power (W). Updated by `real_shelly` on
+    /// every successful poll using `dispatcher.grid_smoothing_s` as the
+    /// time constant. The dispatcher reads THIS field rather than the
+    /// raw `status.total_act_power` so sub-second PV-inverter PWM
+    /// ripple doesn't trigger setpoint changes.
+    pub smoothed_grid_w: Option<f64>,
 }
 
 /// Sign convention everywhere in this app:

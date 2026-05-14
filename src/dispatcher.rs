@@ -500,9 +500,13 @@ fn step_modbus(
         return Ok(());
     }
 
+    // Prefer the EMA-smoothed grid reading over the raw one. Falls
+    // back to raw if smoothing is disabled or no sample yet.
     let grid_w = {
         let snap = state.snapshot.load_full();
-        snap.status.total_act_power.unwrap_or(0.0)
+        snap.smoothed_grid_w
+            .or(snap.status.total_act_power)
+            .unwrap_or(0.0)
     };
     let targets = compute_targets(state, dcfg, grid_w, now);
 
@@ -590,7 +594,9 @@ fn step_pulse(state: &AppState, dcfg: &DispatcherConfig) -> anyhow::Result<()> {
     }
     let grid_w = {
         let snap = state.snapshot.load_full();
-        snap.status.total_act_power.unwrap_or(0.0)
+        snap.smoothed_grid_w
+            .or(snap.status.total_act_power)
+            .unwrap_or(0.0)
     };
     let deltas = compute_deltas(state, dcfg, grid_w, now);
     queue_pulses(state, dcfg, &deltas, now);
@@ -1485,6 +1491,7 @@ modbus_host = "192.168.1.93"
                 ..Default::default()
             },
             age: Some(Instant::now()),
+            smoothed_grid_w: Some(total_w),
         }));
     }
 
