@@ -264,17 +264,24 @@
         </form>
 
         <form id="form-dispatcher" class="cfg-form" data-section="dispatcher">
-          <h3>Dispatcher (pulse-mode)</h3>
+          <h3>Dispatcher</h3>
           <p class="hint">
-            The dispatcher emits <code>pulse_count</code> delta pulses
-            per change &gt; <code>deadband_w</code>; the next pulse only
-            queues once the plug has moved by
-            <code>hit_tolerance_w</code> or
-            <code>settle_timeout_s</code> has elapsed. If grid_w stays
-            silent for <code>grid_stale_s</code>, every circuit goes
-            silent until the real Shelly recovers.
+            <strong>modbus</strong> (v0.7+ default): direct power setpoints
+            via Modbus registers 42010/42020/42021 — sequential per
+            circuit, structurally cap-safe. Requires <code>modbus_host</code>
+            per battery.<br>
+            <strong>pulse</strong> (legacy): Shelly-Pro-3EM emulation with
+            CT delta pulses. For installs without per-battery Modbus.
+            <span class="restart-tag">restart required to switch</span>
           </p>
           <div class="form-grid">
+            <label>Mode
+              <select name="mode" required>
+                <option value="modbus">modbus (direct setpoints)</option>
+                <option value="pulse">pulse (legacy CT emulation)</option>
+              </select>
+              <span class="restart-tag">restart required</span>
+            </label>
             <label>Cycle (ms)
               <input name="cycle_ms" type="number" min="50" max="5000" required>
             </label>
@@ -316,7 +323,65 @@
             </label>
             <label>Settle timeout (s)
               <input name="settle_timeout_s" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">if plug doesn't move by hit_tolerance after this long, accept and move on</small>
+              <small style="color:var(--fg-faint);font-size:11px">accept the cycle as done after this long (modbus: write to next battery, pulse: queue next delta)</small>
+            </label>
+            <label>SoC-unknown lockout (s)
+              <input name="soc_unknown_lockout_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">pulse mode only: lockout duration after empirical refusal</small>
+            </label>
+            <label>Setpoint deadband (W)
+              <input name="setpoint_deadband_w" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">modbus: skip writes when new setpoint is within this many W of last</small>
+            </label>
+            <label>Modbus heartbeat (s)
+              <input name="modbus_heartbeat_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">re-write current setpoint at least this often (liveness signal)</small>
+            </label>
+            <label>Modbus watchdog grace (s)
+              <input name="modbus_watchdog_grace_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">if dispatcher loop hangs, force standby + exit. 0 = disabled</small>
+            </label>
+            <label>Emergency cutoff margin (W)
+              <input name="emergency_cutoff_margin_w" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap × headroom + this. 0 = disabled</small>
+            </label>
+            <label>Emergency cutoff grace (s)
+              <input name="emergency_cutoff_grace_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">how long the over-cap state must persist before tripping</small>
+            </label>
+            <label>Emergency cutoff recovery (s)
+              <input name="emergency_cutoff_recovery_s" type="number" min="0" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">auto-reset after this long; manual reset always available</small>
+            </label>
+            <label class="checkbox">
+              <input name="night_cutoff_enabled" type="checkbox">
+              <span>Night cutoff (cut empty batteries between sunset and sunrise)</span>
+            </label>
+            <label>Night cutoff SoC margin (%)
+              <input name="night_cutoff_soc_margin_pct" type="number" min="0" max="50" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">hysteresis above effective empty cutoff</small>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
+
+        <form id="form-location" class="cfg-form" data-section="location">
+          <h3>Location</h3>
+          <p class="hint">
+            Geographic coordinates. Used only by the night-cutoff feature
+            (above) to compute local sunrise / sunset.
+          </p>
+          <div class="form-grid">
+            <label>Latitude (°)
+              <input name="latitude" type="number" min="-90" max="90" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">decimal degrees, WGS-84. e.g. 48.137 (München)</small>
+            </label>
+            <label>Longitude (°)
+              <input name="longitude" type="number" min="-180" max="180" step="any">
+              <small style="color:var(--fg-faint);font-size:11px">decimal degrees, WGS-84. e.g. 11.575 (München)</small>
             </label>
           </div>
           <div class="form-actions">
@@ -327,6 +392,13 @@
 
         <form id="form-home_assistant" class="cfg-form" data-section="home_assistant">
           <h3>Home Assistant integration</h3>
+          <p id="ha-modbus-warning" class="hint" style="display:none;background:rgba(250,204,21,0.12);border-left:3px solid var(--warn);padding:8px 12px;border-radius:4px">
+            <strong>Note:</strong> dispatcher.mode = <code>modbus</code>
+            is active, so SoC is read directly from each Marstek via
+            Modbus (registers 34002 / 32104). The HA bridge below has
+            <strong>no effect</strong> in this mode — settings here only
+            apply when you switch back to <code>pulse</code> mode.
+          </p>
           <p class="hint">
             SoC source switch. When <strong>enabled</strong>, every
             battery's SoC is read from the configured HA entity

@@ -403,6 +403,7 @@ async fn api_put_section(
         "management",
         "dispatcher",
         "home_assistant",
+        "location",
         "circuits",
         "batteries",
     ];

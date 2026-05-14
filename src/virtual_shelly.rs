@@ -97,6 +97,28 @@ async fn handle_request(
     let now = Instant::now();
     let battery_id = state.by_addr.get(&peer.ip()).cloned();
 
+    // Modbus dispatch mode: the multiplexer commands batteries directly
+    // via Modbus setpoints, so the virtual Shelly Pro 3EM CT feed is
+    // not part of the control loop. We drop ALL incoming polls — leaves
+    // the Marstek's CT state stale, but force_mode bypasses CT anyway.
+    // Keeping the UDP port bound (rather than refusing to listen) means
+    // no one else accidentally takes 1010, and switching back to pulse
+    // mode via the admin UI just starts responding again.
+    if matches!(config.dispatcher.mode, crate::config::DispatchMode::Modbus) {
+        debug!(
+            peer = %peer,
+            method = %request.method,
+            "drop poll: modbus dispatch mode (virtual CTs silent)"
+        );
+        if let Some(ref bid) = battery_id {
+            let mut bats = state.batteries.write();
+            if let Some(b) = bats.get_mut(bid) {
+                b.last_marstek_poll_at = Some(now);
+            }
+        }
+        return;
+    }
+
     // Mute decision: if battery known and its circuit is silent, drop.
     if let Some(ref bid) = battery_id {
         let mute = {

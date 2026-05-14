@@ -342,6 +342,7 @@ async function loadConfig() {
     fillForm(document.getElementById("form-virtual_shelly"), "virtual_shelly", cachedConfig.virtual_shelly);
     fillForm(document.getElementById("form-management"), "management", cachedConfig.management);
     fillForm(document.getElementById("form-dispatcher"), "dispatcher", cachedConfig.dispatcher);
+    fillForm(document.getElementById("form-location"), "location", cachedConfig.location || {});
     fillForm(document.getElementById("form-home_assistant"), "home_assistant", cachedConfig.home_assistant);
     renderCircuitsEditor(cachedConfig.circuits || []);
     renderBatteriesEditor(cachedConfig.batteries || []);
@@ -535,20 +536,35 @@ function renderBatteriesEditor(batteries) {
   applyHaModeToBatteryEditor();
 }
 
-// Toggle visibility of Modbus-only / HA-only fields per the current
-// home_assistant.enabled flag. In HA mode the soc_entity_id input is the
-// only valid SoC source; in Modbus mode the inverse — entity_id is
-// ignored, Modbus port / unit / model drive the poll. Keeping the
-// inactive fields out of the editor avoids users juggling settings that
-// have no effect.
+// Toggle visibility of Modbus-only / HA-only per-battery fields based on
+// the CURRENT effective SoC source, which is decided by:
+//   - dispatcher.mode = "modbus"          → SoC via Modbus on the battery
+//   - dispatcher.mode = "pulse" + HA on   → SoC via HA entity
+//   - dispatcher.mode = "pulse" + HA off  → SoC via Modbus
+// The HA-only `soc_entity_id` field only appears in the second case.
+// Modbus fields are always visible (they're needed for setpoint writes
+// in modbus dispatch mode regardless of HA settings).
 function applyHaModeToBatteryEditor() {
+  const mode =
+    (cachedConfig && cachedConfig.dispatcher && cachedConfig.dispatcher.mode) || "modbus";
   const haEnabled = !!(cachedConfig && cachedConfig.home_assistant && cachedConfig.home_assistant.enabled);
+  const haActive = mode === "pulse" && haEnabled;
+  // Modbus fields always shown — modbus_host / marstek_model / port /
+  // unit_id are needed for setpoint writes in modbus dispatch AND for
+  // SoC poll in pulse-without-HA. The only case they're truly unused
+  // is pulse + HA, and even then we show them so users can switch
+  // back without losing config.
   els.batteriesList.querySelectorAll(".soc-modbus").forEach((el) => {
-    el.style.display = haEnabled ? "none" : "";
+    el.style.display = "";
   });
   els.batteriesList.querySelectorAll(".soc-ha").forEach((el) => {
-    el.style.display = haEnabled ? "" : "none";
+    el.style.display = haActive ? "" : "none";
   });
+  // Banner inside the HA form telling the user it's inert in modbus mode.
+  const haWarn = document.getElementById("ha-modbus-warning");
+  if (haWarn) {
+    haWarn.style.display = mode === "modbus" ? "" : "none";
+  }
 }
 
 function readBatteries() {

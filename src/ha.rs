@@ -25,6 +25,18 @@ struct StateResponse {
 
 pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<()> {
     let cfg = config.load_full();
+    // HA SoC bridge is only useful in PULSE mode. In modbus dispatch
+    // mode we're already talking Modbus to the battery for setpoint
+    // writes, so we read SoC over the same connection — no detour
+    // through HA needed (or wanted, because two SoC sources writing
+    // to the same field race each other).
+    if matches!(cfg.dispatcher.mode, crate::config::DispatchMode::Modbus) {
+        info!(
+            "dispatcher.mode = modbus → SoC sourced from Modbus directly, HA bridge task idle"
+        );
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
     if !cfg.home_assistant.enabled {
         info!("home-assistant integration disabled — task idle");
         std::future::pending::<()>().await;

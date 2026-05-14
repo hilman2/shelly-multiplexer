@@ -71,8 +71,13 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<()> {
     let cfg = config.load_full();
 
-    if cfg.home_assistant.enabled {
-        info!("home_assistant.enabled = true → SoC sourced from HA, modbus task idle");
+    // SoC-source routing:
+    //   - modbus dispatch mode → we ALWAYS read SoC via Modbus (we're
+    //     already on the bus for setpoint writes).
+    //   - pulse dispatch mode + HA enabled → HA bridge owns SoC, we idle.
+    //   - pulse dispatch mode + HA disabled → we own SoC via Modbus.
+    if matches!(cfg.dispatcher.mode, DispatchMode::Pulse) && cfg.home_assistant.enabled {
+        info!("pulse mode + HA enabled → SoC sourced from HA, modbus SoC poll idle");
         std::future::pending::<()>().await;
         return Ok(());
     }
@@ -284,14 +289,24 @@ impl Setpoint {
 }
 
 /// Push a single setpoint to a battery. Opens a fresh Modbus connection,
-/// writes the registers in safe order, closes. The caller is expected to
-/// have already run `init_dispatch` once during this process so RS485
-/// control mode is enabled — without that, the 42010/42020/42021 writes
-/// are silently ignored by the Marstek firmware.
+/// writes the registers in safe order, closes.
+///
+/// IMPORTANT: we re-enable RS485 control mode (`42000 = 21930`) on
+/// EVERY call, not just once at startup. The Marstek firmware can drop
+/// out of RS485 control mode for reasons we don't fully control —
+/// firmware reboot, user opening the Marstek app, internal watchdog,
+/// power flicker. If we skipped this re-enable and the inverter had
+/// silently fallen back to auto mode, our 42010/42020/42021 writes
+/// would be accepted but ignored, and we'd never know. One extra
+/// idempotent write per cycle is cheap insurance.
 pub async fn write_setpoint(battery: &BatteryConfig, sp: Setpoint) -> Result<()> {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
+
+    // Re-arm RS485 control mode FIRST. Idempotent — if it was already
+    // on, this is a no-op on the Marstek side.
+    write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
 
     // Sequence matters: when transitioning charge → discharge (or vice
     // versa) we must set force_mode FIRST. Writing the new power into
