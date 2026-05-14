@@ -274,24 +274,22 @@ impl Setpoint {
     /// (force_mode, register, power) triple, clamping to the battery's
     /// own max_charge_w / max_discharge_w and Marstek's hard 2500 W
     /// firmware cap.
+    ///
+    /// Power magnitudes below the firmware's `MIN_W` threshold (50 W,
+    /// per the hilman2/MarstekVenus reference impl) collapse to
+    /// `Standby` because the Marstek silently ignores tiny commands —
+    /// safer to explicitly stop than to issue a command that won't act.
     pub fn from_signed_watts(w: f64, max_charge: f64, max_discharge: f64) -> Self {
         const HARD_MAX_W: f64 = 2500.0;
-        if w.abs() < 0.5 {
+        const MIN_W: f64 = 50.0;
+        if w.abs() < MIN_W {
             Setpoint::Standby
         } else if w < 0.0 {
-            let watts = (-w).clamp(0.0, max_charge.min(HARD_MAX_W)) as u16;
-            if watts == 0 {
-                Setpoint::Standby
-            } else {
-                Setpoint::Charge { watts }
-            }
+            let watts = (-w).clamp(MIN_W, max_charge.min(HARD_MAX_W)) as u16;
+            Setpoint::Charge { watts }
         } else {
-            let watts = w.clamp(0.0, max_discharge.min(HARD_MAX_W)) as u16;
-            if watts == 0 {
-                Setpoint::Standby
-            } else {
-                Setpoint::Discharge { watts }
-            }
+            let watts = w.clamp(MIN_W, max_discharge.min(HARD_MAX_W)) as u16;
+            Setpoint::Discharge { watts }
         }
     }
 
@@ -306,39 +304,64 @@ impl Setpoint {
 }
 
 /// Push a single setpoint to a battery. Opens a fresh Modbus connection,
-/// writes the registers in safe order, closes.
+/// runs the proven write sequence from hilman2/MarstekVenus (Python
+/// implementation that's been tested on real hardware), closes.
 ///
-/// IMPORTANT: we re-enable RS485 control mode (`42000 = 21930`) on
-/// EVERY call, not just once at startup. The Marstek firmware can drop
-/// out of RS485 control mode for reasons we don't fully control —
-/// firmware reboot, user opening the Marstek app, internal watchdog,
-/// power flicker. If we skipped this re-enable and the inverter had
-/// silently fallen back to auto mode, our 42010/42020/42021 writes
-/// would be accepted but ignored, and we'd never know. One extra
-/// idempotent write per cycle is cheap insurance.
+/// The Marstek firmware quirks this sequence accounts for:
+///
+///   1. RS485 control mode (42000 = 21930) can silently drop on
+///      firmware reboot / app interaction / power flicker. We re-arm
+///      on every call, then wait 100 ms for the firmware to apply it.
+///   2. The firmware needs time between writes. Without the sleeps the
+///      writes ack but the inverter doesn't act on them. Empirically
+///      determined timings: 100 ms after RS485 enable, 200 ms after
+///      zeroing the opposite direction, 500 ms after force_mode.
+///   3. Switching direction without first zeroing the OTHER direction's
+///      power register leaves the inverter in an inconsistent state
+///      (it momentarily sees both charge and discharge setpoints
+///      non-zero). We zero out the opposite direction first.
+///   4. Setpoints below ~50 W are treated as no-op by the firmware.
+///      `Setpoint::from_signed_watts` already maps anything that small
+///      to `Standby`, so we don't have to clamp here.
+///   5. Going to standby: zero BOTH power registers before writing
+///      force_mode = 0, so the next direction switch starts from a
+///      clean slate.
+///
+/// Total write time per setpoint cycle is ~0.8-1 s. That's fine
+/// because the dispatcher's settle_timeout_s is 5 s and the writer
+/// task de-dups intermediate setpoints via its watch channel.
 pub async fn write_setpoint(battery: &BatteryConfig, sp: Setpoint) -> Result<()> {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
 
-    // Re-arm RS485 control mode FIRST. Idempotent — if it was already
-    // on, this is a no-op on the Marstek side.
+    // Step 1: re-arm RS485 control mode + give the firmware time.
     write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
+    time::sleep(Duration::from_millis(100)).await;
 
-    // Sequence matters: when transitioning charge → discharge (or vice
-    // versa) we must set force_mode FIRST. Writing the new power into
-    // 42020 while the battery is still in discharge mode (and vice
-    // versa) writes the wrong register for the active direction.
     match sp {
         Setpoint::Standby => {
+            // Park cleanly: zero both power setpoints, THEN force_mode=0.
+            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
             write_reg(&mut ctx, REG_FORCE_MODE, 0).await?;
         }
         Setpoint::Charge { watts } => {
+            // Zero the opposite (discharge) direction first, then switch
+            // mode, then write the new charge power. Sleeps between
+            // steps come from the Python reference impl — without them
+            // the Marstek silently drops the command.
+            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
+            time::sleep(Duration::from_millis(200)).await;
             write_reg(&mut ctx, REG_FORCE_MODE, 1).await?;
+            time::sleep(Duration::from_millis(500)).await;
             write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, watts).await?;
         }
         Setpoint::Discharge { watts } => {
+            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            time::sleep(Duration::from_millis(200)).await;
             write_reg(&mut ctx, REG_FORCE_MODE, 2).await?;
+            time::sleep(Duration::from_millis(500)).await;
             write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, watts).await?;
         }
     }
@@ -752,18 +775,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setpoint_standby_for_near_zero() {
+    fn setpoint_standby_below_marstek_minimum_50w() {
+        // Marstek firmware silently ignores commands below ~50 W —
+        // map all of those to Standby so we don't issue dead writes.
         assert_eq!(
             Setpoint::from_signed_watts(0.0, 2500.0, 800.0),
             Setpoint::Standby
         );
         assert_eq!(
-            Setpoint::from_signed_watts(0.4, 2500.0, 800.0),
+            Setpoint::from_signed_watts(30.0, 2500.0, 800.0),
             Setpoint::Standby
         );
         assert_eq!(
-            Setpoint::from_signed_watts(-0.4, 2500.0, 800.0),
+            Setpoint::from_signed_watts(-49.9, 2500.0, 800.0),
             Setpoint::Standby
+        );
+        // 50 W and above should pass through.
+        assert_eq!(
+            Setpoint::from_signed_watts(50.0, 2500.0, 800.0),
+            Setpoint::Discharge { watts: 50 }
+        );
+        assert_eq!(
+            Setpoint::from_signed_watts(-50.0, 2500.0, 800.0),
+            Setpoint::Charge { watts: 50 }
         );
     }
 
