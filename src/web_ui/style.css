@@ -163,6 +163,34 @@ main {
 /* Dispatch mode pill in the header. */
 .mode-pill-modbus { background: rgba(74, 158, 255, 0.18); color: var(--accent); }
 .mode-pill-pulse  { background: rgba(192, 132, 252, 0.18); color: var(--pulsing); }
+
+/* Collapsible "advanced" sections in the dispatcher config form.
+   Keep the visual weight low — these aren't where most users look. */
+details.advanced {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+details.advanced > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  padding: 6px 0;
+  user-select: none;
+}
+details.advanced > summary:hover { color: var(--fg); }
+details.advanced[open] > summary { color: var(--fg); margin-bottom: 8px; }
+details.advanced > .form-grid { margin-top: 4px; }
+
+/* Per-field hint text under a label. Same look as the inline <small>
+   we used to write everywhere, factored into a class. */
+.field-hint {
+  display: block;
+  color: var(--fg-faint);
+  font-size: 11px;
+  margin-top: 2px;
+}
 /* Pills wrap onto multiple lines if several flags are active. */
 td .state + .state { margin-left: 4px; }
 

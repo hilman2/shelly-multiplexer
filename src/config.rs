@@ -431,7 +431,16 @@ fn default_circuit_headroom() -> f64 {
     0.95
 }
 fn default_grid_bias_w() -> f64 {
-    30.0
+    // 100 W. Enforces the asymmetric rule "no import while charging,
+    // no export while discharging" with comfortable headroom against
+    // inverter ramp lag (1-3 s) and noisy load profiles. Smaller
+    // values leave less grid headroom — the dispatcher commands a
+    // setpoint that nominally hits grid = ±bias, so a smaller bias
+    // means the actual grid can cross zero more easily when the
+    // inverter is mid-ramp. Larger values forfeit some capture
+    // efficiency in exchange for a stronger never-cross-zero
+    // guarantee.
+    100.0
 }
 fn default_settle_timeout_s() -> f64 {
     // 10 s. Marstek ramp time + a safety margin. Lower values lead to

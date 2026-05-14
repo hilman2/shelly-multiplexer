@@ -69,10 +69,14 @@ grid_stale_s = 5.0
 group_silent_after_stale_s = 60.0
 # Use only this fraction of the circuit fuse cap (jitter buffer)
 circuit_headroom = 0.95
-# Asymmetric grid bias: leave this many W on the import side when
-# discharging (avoid accidental export) and on the export side when
-# charging (avoid paying for grid). 0 = dispatch to exact 0.
-grid_bias_w = 30
+# Asymmetric grid bias — the hard "never cross zero" margin.
+#   When discharging: leave this many W of grid IMPORT unaddressed
+#     (so battery output can't accidentally push the meter into export).
+#   When charging:    leave this many W of grid EXPORT unaddressed
+#     (so battery consumption can't accidentally pull grid into import).
+# 100 W is comfortable against inverter ramp lag and load swings.
+# Set to 0 only if you accept occasional zero-crossings during transients.
+grid_bias_w = 100
 # Time-based pulse-settle fallback: if the plug hasn't moved by
 # hit_tolerance_w within this many seconds, accept and move on.
 settle_timeout_s = 10.0

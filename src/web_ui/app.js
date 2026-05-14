@@ -372,6 +372,7 @@ async function loadConfig() {
     fillForm(document.getElementById("form-dispatcher"), "dispatcher", cachedConfig.dispatcher);
     fillForm(document.getElementById("form-location"), "location", cachedConfig.location || {});
     fillForm(document.getElementById("form-home_assistant"), "home_assistant", cachedConfig.home_assistant);
+    applyDispatchModeVisibility();
     renderCircuitsEditor(cachedConfig.circuits || []);
     renderBatteriesEditor(cachedConfig.batteries || []);
   } catch (err) {
@@ -565,6 +566,36 @@ function renderBatteriesEditor(batteries) {
   for (const b of batteries) addBatteryCard(b);
   applyHaModeToBatteryEditor();
 }
+
+// Hide Modbus-only / Pulse-only sections of the dispatcher form based
+// on the currently selected mode. Saves the user from scrolling through
+// 20+ knobs that don't apply to their setup. Re-evaluated on:
+//   - initial load (via loadConfig)
+//   - the user changing the Mode dropdown
+function applyDispatchModeVisibility() {
+  const form = document.getElementById("form-dispatcher");
+  if (!form) return;
+  const modeEl = form.querySelector('[name="mode"]');
+  const mode =
+    (modeEl && modeEl.value) ||
+    (cachedConfig && cachedConfig.dispatcher && cachedConfig.dispatcher.mode) ||
+    "modbus";
+  form.querySelectorAll(".mode-only-modbus").forEach((el) => {
+    el.style.display = mode === "modbus" ? "" : "none";
+  });
+  form.querySelectorAll(".mode-only-pulse").forEach((el) => {
+    el.style.display = mode === "pulse" ? "" : "none";
+  });
+}
+
+// Wire up the mode dropdown to re-apply visibility on change WITHOUT
+// saving — saves are still explicit via the Save button.
+document.addEventListener("DOMContentLoaded", () => {
+  const modeEl = document.querySelector('#form-dispatcher [name="mode"]');
+  if (modeEl) {
+    modeEl.addEventListener("change", applyDispatchModeVisibility);
+  }
+});
 
 // Toggle visibility of Modbus-only / HA-only per-battery fields based on
 // the CURRENT effective SoC source, which is decided by:

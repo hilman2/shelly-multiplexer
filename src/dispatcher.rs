@@ -1802,10 +1802,10 @@ modbus_host = "192.168.1.93"
         let targets = compute_targets(&state, &dcfg, 1500.0, now);
 
         let sum: f64 = targets.values().sum();
-        // Grid bias of 30 W: corrected import is 1470 W; expect ~1470 W
+        // Grid bias of 100 W: corrected import is 1400 W; expect ~1400 W
         // total discharge spread across 3 batteries.
         assert!(
-            (sum - 1470.0).abs() < 1.0,
+            (sum - 1400.0).abs() < 1.0,
             "sum of targets should equal grid - bias, got {sum}"
         );
         // Each battery gets roughly a third — positive (discharge).
