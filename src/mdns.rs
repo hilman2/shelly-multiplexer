@@ -36,6 +36,14 @@ pub async fn run(config: Arc<ArcSwap<Config>>) -> Result<()> {
     // mDNS records are registered once. Hostname/MAC/firmware edits
     // require a restart to re-advertise.
     let config = config.load_full();
+    // In modbus dispatch mode the virtual Shelly is fully disabled, so
+    // there's no Pro 3EM behaviour to advertise. Advertising it anyway
+    // would mislead other LAN devices (HA discovery, other tools).
+    if matches!(config.dispatcher.mode, crate::config::DispatchMode::Modbus) {
+        info!("dispatcher.mode = modbus → mDNS advertisement disabled");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
     let daemon = ServiceDaemon::new().context("starting mdns-sd daemon")?;
 
     let device_mac = derive_mac(&config);
