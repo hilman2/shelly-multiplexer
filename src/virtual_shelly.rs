@@ -41,6 +41,15 @@ const MAX_RESPONSE_COUNTERS: usize = 1024;
 
 pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<()> {
     let initial = config.load_full();
+    // In modbus dispatch mode the virtual Shelly Pro 3EM CT feed is
+    // entirely unused — the Marstek operates on Modbus setpoints, not
+    // CT. We don't bind the UDP port at all (leaves 1010 free for
+    // anything else on the host) and never process any inbound polls.
+    if matches!(initial.dispatcher.mode, crate::config::DispatchMode::Modbus) {
+        info!("dispatcher.mode = modbus → virtual Shelly disabled");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
     let bind = format!(
         "{}:{}",
         initial.virtual_shelly.bind_interface, initial.virtual_shelly.udp_port

@@ -71,8 +71,13 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<()> {
     let cfg = config.load_full();
 
-    if cfg.home_assistant.enabled {
-        info!("home_assistant.enabled = true → SoC sourced from HA, modbus task idle");
+    // SoC-source routing:
+    //   - modbus dispatch mode → we ALWAYS read SoC via Modbus (we're
+    //     already on the bus for setpoint writes).
+    //   - pulse dispatch mode + HA enabled → HA bridge owns SoC, we idle.
+    //   - pulse dispatch mode + HA disabled → we own SoC via Modbus.
+    if matches!(cfg.dispatcher.mode, DispatchMode::Pulse) && cfg.home_assistant.enabled {
+        info!("pulse mode + HA enabled → SoC sourced from HA, modbus SoC poll idle");
         std::future::pending::<()>().await;
         return Ok(());
     }
@@ -125,24 +130,30 @@ pub async fn run(state: Arc<AppState>, config: Arc<ArcSwap<Config>>) -> Result<(
 async fn poll_battery_loop(state: Arc<AppState>, battery: BatteryConfig, read_power_too: bool) {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
-    let soc_register = battery.marstek_model.soc_register();
-    let power_register = battery.marstek_model.battery_power_register();
+    let model = battery.marstek_model;
+    let soc_register = model.soc_register();
+    let soc_scale = model.soc_scale();
+    let power_register = model.battery_power_register();
+    let power_is_int32 = model.battery_power_is_int32();
     let interval = Duration::from_millis(battery.soc_interval_ms.max(1000));
 
     info!(
         battery = %battery.id,
         target = %target,
         unit = battery.modbus_unit_id,
+        ?model,
         soc_register,
+        soc_scale,
         power_register,
+        power_is_int32,
         read_power_too,
         "modbus poller starting"
     );
 
     loop {
-        let soc_result = read_soc(target, unit, soc_register).await;
+        let soc_result = read_soc(target, unit, soc_register, soc_scale).await;
         let power_result = if read_power_too {
-            Some(read_battery_power(target, unit, power_register).await)
+            Some(read_battery_power(target, unit, power_register, power_is_int32).await)
         } else {
             None
         };
@@ -179,18 +190,18 @@ async fn poll_battery_loop(state: Arc<AppState>, battery: BatteryConfig, read_po
     }
 }
 
-async fn read_soc(target: std::net::SocketAddr, unit: Slave, register: u16) -> Result<f64> {
+async fn read_soc(
+    target: std::net::SocketAddr,
+    unit: Slave,
+    register: u16,
+    scale: f64,
+) -> Result<f64> {
     let regs = read_holding(target, unit, register, 1).await?;
     let raw = regs
         .first()
         .copied()
         .ok_or_else(|| anyhow!("modbus reg {register}: empty response"))?;
-    // Some firmware variants report decipercent (0..=1000); accept either.
-    let soc = if raw > 100 {
-        f64::from(raw) / 10.0
-    } else {
-        f64::from(raw)
-    };
+    let soc = f64::from(raw) * scale;
     if !(0.0..=100.0).contains(&soc) {
         anyhow::bail!("modbus reg {register}: SoC {soc} out of range");
     }
@@ -201,15 +212,26 @@ async fn read_battery_power(
     target: std::net::SocketAddr,
     unit: Slave,
     register: u16,
+    is_int32: bool,
 ) -> Result<f64> {
-    let regs = read_holding(target, unit, register, 1).await?;
-    let raw = regs
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("modbus reg {register}: empty response"))?;
-    // int16 — Marstek encodes signed power as two's complement uint16.
-    let signed = raw as i16;
-    Ok(f64::from(signed))
+    if is_int32 {
+        // Venus E v1/v2: signed 32-bit power split across TWO registers
+        // (big-endian word order — high word first).
+        let regs = read_holding(target, unit, register, 2).await?;
+        if regs.len() < 2 {
+            anyhow::bail!("modbus reg {register}: expected 2 registers, got {}", regs.len());
+        }
+        let combined = ((regs[0] as u32) << 16) | (regs[1] as u32);
+        Ok(f64::from(combined as i32))
+    } else {
+        // Single int16 register (A, D, E v3).
+        let regs = read_holding(target, unit, register, 1).await?;
+        let raw = regs
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("modbus reg {register}: empty response"))?;
+        Ok(f64::from(raw as i16))
+    }
 }
 
 async fn read_holding(
@@ -252,24 +274,22 @@ impl Setpoint {
     /// (force_mode, register, power) triple, clamping to the battery's
     /// own max_charge_w / max_discharge_w and Marstek's hard 2500 W
     /// firmware cap.
+    ///
+    /// Power magnitudes below the firmware's `MIN_W` threshold (50 W,
+    /// per the hilman2/MarstekVenus reference impl) collapse to
+    /// `Standby` because the Marstek silently ignores tiny commands —
+    /// safer to explicitly stop than to issue a command that won't act.
     pub fn from_signed_watts(w: f64, max_charge: f64, max_discharge: f64) -> Self {
         const HARD_MAX_W: f64 = 2500.0;
-        if w.abs() < 0.5 {
+        const MIN_W: f64 = 50.0;
+        if w.abs() < MIN_W {
             Setpoint::Standby
         } else if w < 0.0 {
-            let watts = (-w).clamp(0.0, max_charge.min(HARD_MAX_W)) as u16;
-            if watts == 0 {
-                Setpoint::Standby
-            } else {
-                Setpoint::Charge { watts }
-            }
+            let watts = (-w).clamp(MIN_W, max_charge.min(HARD_MAX_W)) as u16;
+            Setpoint::Charge { watts }
         } else {
-            let watts = w.clamp(0.0, max_discharge.min(HARD_MAX_W)) as u16;
-            if watts == 0 {
-                Setpoint::Standby
-            } else {
-                Setpoint::Discharge { watts }
-            }
+            let watts = w.clamp(MIN_W, max_discharge.min(HARD_MAX_W)) as u16;
+            Setpoint::Discharge { watts }
         }
     }
 
@@ -284,29 +304,64 @@ impl Setpoint {
 }
 
 /// Push a single setpoint to a battery. Opens a fresh Modbus connection,
-/// writes the registers in safe order, closes. The caller is expected to
-/// have already run `init_dispatch` once during this process so RS485
-/// control mode is enabled — without that, the 42010/42020/42021 writes
-/// are silently ignored by the Marstek firmware.
+/// runs the proven write sequence from hilman2/MarstekVenus (Python
+/// implementation that's been tested on real hardware), closes.
+///
+/// The Marstek firmware quirks this sequence accounts for:
+///
+///   1. RS485 control mode (42000 = 21930) can silently drop on
+///      firmware reboot / app interaction / power flicker. We re-arm
+///      on every call, then wait 100 ms for the firmware to apply it.
+///   2. The firmware needs time between writes. Without the sleeps the
+///      writes ack but the inverter doesn't act on them. Empirically
+///      determined timings: 100 ms after RS485 enable, 200 ms after
+///      zeroing the opposite direction, 500 ms after force_mode.
+///   3. Switching direction without first zeroing the OTHER direction's
+///      power register leaves the inverter in an inconsistent state
+///      (it momentarily sees both charge and discharge setpoints
+///      non-zero). We zero out the opposite direction first.
+///   4. Setpoints below ~50 W are treated as no-op by the firmware.
+///      `Setpoint::from_signed_watts` already maps anything that small
+///      to `Standby`, so we don't have to clamp here.
+///   5. Going to standby: zero BOTH power registers before writing
+///      force_mode = 0, so the next direction switch starts from a
+///      clean slate.
+///
+/// Total write time per setpoint cycle is ~0.8-1 s. That's fine
+/// because the dispatcher's settle_timeout_s is 5 s and the writer
+/// task de-dups intermediate setpoints via its watch channel.
 pub async fn write_setpoint(battery: &BatteryConfig, sp: Setpoint) -> Result<()> {
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
 
-    // Sequence matters: when transitioning charge → discharge (or vice
-    // versa) we must set force_mode FIRST. Writing the new power into
-    // 42020 while the battery is still in discharge mode (and vice
-    // versa) writes the wrong register for the active direction.
+    // Step 1: re-arm RS485 control mode + give the firmware time.
+    write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
+    time::sleep(Duration::from_millis(100)).await;
+
     match sp {
         Setpoint::Standby => {
+            // Park cleanly: zero both power setpoints, THEN force_mode=0.
+            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
             write_reg(&mut ctx, REG_FORCE_MODE, 0).await?;
         }
         Setpoint::Charge { watts } => {
+            // Zero the opposite (discharge) direction first, then switch
+            // mode, then write the new charge power. Sleeps between
+            // steps come from the Python reference impl — without them
+            // the Marstek silently drops the command.
+            write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
+            time::sleep(Duration::from_millis(200)).await;
             write_reg(&mut ctx, REG_FORCE_MODE, 1).await?;
+            time::sleep(Duration::from_millis(500)).await;
             write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, watts).await?;
         }
         Setpoint::Discharge { watts } => {
+            write_reg(&mut ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            time::sleep(Duration::from_millis(200)).await;
             write_reg(&mut ctx, REG_FORCE_MODE, 2).await?;
+            time::sleep(Duration::from_millis(500)).await;
             write_reg(&mut ctx, REG_DISCHARGE_POWER_SETPOINT, watts).await?;
         }
     }
@@ -342,16 +397,22 @@ pub async fn init_dispatch(battery: &BatteryConfig) -> Result<BmsCutoffs> {
     write_reg(&mut ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
     write_reg(&mut ctx, REG_FORCE_MODE, 0).await?;
 
-    // Read BMS cutoffs. These are 0..=1000 raw (scale 0.1), so the
-    // upper-bound check on percentage applies after scaling.
-    let cutoffs = read_bms_cutoffs(&mut ctx).await.unwrap_or_else(|e| {
-        warn!(
-            battery = %battery.id,
-            error = %e,
-            "could not read BMS cutoffs (44000/44001) — falling back to dispatcher defaults"
-        );
+    // Read BMS cutoffs ONLY when the variant exposes them. The upstream
+    // YAMLs list 44000/44001 for Venus E v1/v2 only; A, D, and E v3
+    // don't have them, and reading the wrong register on those would
+    // either return garbage or a Modbus exception.
+    let cutoffs = if battery.marstek_model.supports_bms_cutoffs() {
+        read_bms_cutoffs(&mut ctx).await.unwrap_or_else(|e| {
+            warn!(
+                battery = %battery.id,
+                error = %e,
+                "could not read BMS cutoffs (44000/44001) — falling back to dispatcher defaults"
+            );
+            BmsCutoffs::default()
+        })
+    } else {
         BmsCutoffs::default()
-    });
+    };
 
     let _ = ctx.disconnect().await;
     info!(
@@ -714,18 +775,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setpoint_standby_for_near_zero() {
+    fn setpoint_standby_below_marstek_minimum_50w() {
+        // Marstek firmware silently ignores commands below ~50 W —
+        // map all of those to Standby so we don't issue dead writes.
         assert_eq!(
             Setpoint::from_signed_watts(0.0, 2500.0, 800.0),
             Setpoint::Standby
         );
         assert_eq!(
-            Setpoint::from_signed_watts(0.4, 2500.0, 800.0),
+            Setpoint::from_signed_watts(30.0, 2500.0, 800.0),
             Setpoint::Standby
         );
         assert_eq!(
-            Setpoint::from_signed_watts(-0.4, 2500.0, 800.0),
+            Setpoint::from_signed_watts(-49.9, 2500.0, 800.0),
             Setpoint::Standby
+        );
+        // 50 W and above should pass through.
+        assert_eq!(
+            Setpoint::from_signed_watts(50.0, 2500.0, 800.0),
+            Setpoint::Discharge { watts: 50 }
+        );
+        assert_eq!(
+            Setpoint::from_signed_watts(-50.0, 2500.0, 800.0),
+            Setpoint::Charge { watts: 50 }
         );
     }
 

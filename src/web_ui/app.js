@@ -209,12 +209,40 @@ function renderBatteriesStatus(batteries) {
       }
       const stateCell = pills.join(" ");
 
-      const plug = b.plug_w == null ? 0 : b.plug_w;
+      // Direction shown next to the battery name should reflect the
+      // ACTUAL operating state, not just plug power. The Marstek
+      // inverter pulls ~5-10 W in standby and the plug PM Gen3 sees
+      // that — without filtering we'd read "Charge" for a battery
+      // that's doing nothing.
+      //
+      // Source priority:
+      //  1. Modbus commanded setpoint (we KNOW what we asked for)
+      //  2. Battery's own reported power (via Modbus reg 30001/32102)
+      //  3. Plug reading, but only above a standby-loss threshold
+      const STANDBY_DEADBAND_W = 20;
+      let dirState;
+      if (b.last_modbus_setpoint_w != null) {
+        if (Math.abs(b.last_modbus_setpoint_w) < 1) dirState = "standby";
+        else if (b.last_modbus_setpoint_w > 0) dirState = "discharge";
+        else dirState = "charge";
+      } else if (b.last_battery_power_w != null) {
+        if (Math.abs(b.last_battery_power_w) < STANDBY_DEADBAND_W) dirState = "standby";
+        else if (b.last_battery_power_w > 0) dirState = "discharge";
+        else dirState = "charge";
+      } else if (b.plug_w != null) {
+        if (Math.abs(b.plug_w) < STANDBY_DEADBAND_W) dirState = "standby";
+        else if (b.plug_w > 0) dirState = "discharge";
+        else dirState = "charge";
+      } else {
+        dirState = null;
+      }
       const dir =
-        plug > 5
+        dirState === "discharge"
           ? '<span class="dir-tag dir-discharge">discharge</span>'
-          : plug < -5
+          : dirState === "charge"
           ? '<span class="dir-tag dir-charge">charge</span>'
+          : dirState === "standby"
+          ? '<span class="dir-tag dir-standby">standby</span>'
           : "";
       const pulseCell =
         b.pulse_remaining > 0
@@ -342,6 +370,7 @@ async function loadConfig() {
     fillForm(document.getElementById("form-virtual_shelly"), "virtual_shelly", cachedConfig.virtual_shelly);
     fillForm(document.getElementById("form-management"), "management", cachedConfig.management);
     fillForm(document.getElementById("form-dispatcher"), "dispatcher", cachedConfig.dispatcher);
+    fillForm(document.getElementById("form-location"), "location", cachedConfig.location || {});
     fillForm(document.getElementById("form-home_assistant"), "home_assistant", cachedConfig.home_assistant);
     renderCircuitsEditor(cachedConfig.circuits || []);
     renderBatteriesEditor(cachedConfig.batteries || []);
@@ -505,8 +534,10 @@ function addBatteryCard(b = {}) {
       <label>priority_weight<input data-f="priority_weight" type="number" min="0.01" step="any" value="${b.priority_weight ?? 1.0}" required></label>
       <label class="soc-modbus">marstek_model
         <select data-f="marstek_model">
-          <option value="venus_e"${(b.marstek_model || "venus_e") === "venus_e" ? " selected" : ""}>Venus E (v1 / v2 / v3) — reg 34002</option>
-          <option value="venus_e_v12"${b.marstek_model === "venus_e_v12" ? " selected" : ""}>Venus E v1.2 — reg 32104</option>
+          <option value="venus_e_v1_v2"${(["venus_e_v1_v2", "venus_e_v12", "venus_e_v1v2", undefined, null, ""].includes(b.marstek_model) || !b.marstek_model) ? " selected" : ""}>Venus E v1 / v2 (most common — SoC reg 32104)</option>
+          <option value="venus_e_v3"${(b.marstek_model === "venus_e_v3" || b.marstek_model === "venus_e") ? " selected" : ""}>Venus E v3 (SoC reg 34002)</option>
+          <option value="venus_d"${b.marstek_model === "venus_d" ? " selected" : ""}>Venus D</option>
+          <option value="venus_a"${b.marstek_model === "venus_a" ? " selected" : ""}>Venus A</option>
         </select>
       </label>
       <label class="soc-modbus">modbus_host — IP of the RS485-to-LAN bridge (Waveshare / EW11 / DR134 / M5Stack). On Venus E V3 with Ethernet cable, use the same value as "address". Leave blank to keep the battery inactive.<input data-f="modbus_host" type="text" placeholder="e.g. 192.168.1.91" value="${escapeAttr(b.modbus_host || "")}"></label>
@@ -535,20 +566,35 @@ function renderBatteriesEditor(batteries) {
   applyHaModeToBatteryEditor();
 }
 
-// Toggle visibility of Modbus-only / HA-only fields per the current
-// home_assistant.enabled flag. In HA mode the soc_entity_id input is the
-// only valid SoC source; in Modbus mode the inverse — entity_id is
-// ignored, Modbus port / unit / model drive the poll. Keeping the
-// inactive fields out of the editor avoids users juggling settings that
-// have no effect.
+// Toggle visibility of Modbus-only / HA-only per-battery fields based on
+// the CURRENT effective SoC source, which is decided by:
+//   - dispatcher.mode = "modbus"          → SoC via Modbus on the battery
+//   - dispatcher.mode = "pulse" + HA on   → SoC via HA entity
+//   - dispatcher.mode = "pulse" + HA off  → SoC via Modbus
+// The HA-only `soc_entity_id` field only appears in the second case.
+// Modbus fields are always visible (they're needed for setpoint writes
+// in modbus dispatch mode regardless of HA settings).
 function applyHaModeToBatteryEditor() {
+  const mode =
+    (cachedConfig && cachedConfig.dispatcher && cachedConfig.dispatcher.mode) || "modbus";
   const haEnabled = !!(cachedConfig && cachedConfig.home_assistant && cachedConfig.home_assistant.enabled);
+  const haActive = mode === "pulse" && haEnabled;
+  // Modbus fields always shown — modbus_host / marstek_model / port /
+  // unit_id are needed for setpoint writes in modbus dispatch AND for
+  // SoC poll in pulse-without-HA. The only case they're truly unused
+  // is pulse + HA, and even then we show them so users can switch
+  // back without losing config.
   els.batteriesList.querySelectorAll(".soc-modbus").forEach((el) => {
-    el.style.display = haEnabled ? "none" : "";
+    el.style.display = "";
   });
   els.batteriesList.querySelectorAll(".soc-ha").forEach((el) => {
-    el.style.display = haEnabled ? "" : "none";
+    el.style.display = haActive ? "" : "none";
   });
+  // Banner inside the HA form telling the user it's inert in modbus mode.
+  const haWarn = document.getElementById("ha-modbus-warning");
+  if (haWarn) {
+    haWarn.style.display = mode === "modbus" ? "" : "none";
+  }
 }
 
 function readBatteries() {
@@ -568,7 +614,7 @@ function readBatteries() {
       max_discharge_w: num("max_discharge_w"),
       capacity_wh: num("capacity_wh") ?? 0,
       priority_weight: num("priority_weight") ?? 1.0,
-      marstek_model: get("marstek_model") || "venus_e",
+      marstek_model: get("marstek_model") || "venus_e_v1_v2",
       modbus_port: num("modbus_port") ?? 502,
       modbus_unit_id: num("modbus_unit_id") ?? 1,
       soc_interval_ms: num("soc_interval_ms") ?? 30000,
