@@ -950,7 +950,10 @@ impl BatteryWriter {
     }
 
     /// Open the persistent connection if missing, return a mutable
-    /// reference for use by the caller.
+    /// reference for use by the caller. Logs the open under the
+    /// `modbus_traffic` target so the operator can see reconnection
+    /// events in the field (= side-effect of the dropped-on-error
+    /// path in `tier_refresh` / `do_write`).
     async fn ensure_conn<'a>(
         &self,
         ctx: &'a mut Option<tokio_modbus::client::Context>,
@@ -958,8 +961,24 @@ impl BatteryWriter {
         if ctx.is_none() {
             let target = self.battery.modbus_target();
             let unit = Slave(self.battery.modbus_unit_id);
-            *ctx = Some(open(target, unit).await?);
-            debug!(battery = %self.battery.id, "modbus connection opened");
+            match open(target, unit).await {
+                Ok(c) => {
+                    *ctx = Some(c);
+                    crate::modbus_server::log_traffic(
+                        self.debug_modbus,
+                        "out/connect",
+                        format_args!("battery={} → {target}", self.battery.id),
+                    );
+                }
+                Err(e) => {
+                    crate::modbus_server::log_traffic(
+                        self.debug_modbus,
+                        "out/connect-fail",
+                        format_args!("battery={} → {target} failed: {e}", self.battery.id),
+                    );
+                    return Err(e);
+                }
+            }
         }
         Ok(ctx.as_mut().unwrap())
     }
@@ -1178,14 +1197,47 @@ impl BatteryWriter {
                         .outbound_reads_failed
                         .fetch_add(1, Relaxed);
                     failed.push(*reg);
+                    let s = e.to_string();
+                    // Distinguish "firmware says this register doesn't
+                    // exist" (= IllegalDataAddress, connection is fine,
+                    // keep going) from "wire/TCP failure" (everything
+                    // else, treat the connection as broken).
+                    //
+                    // Without this split, a transient socket failure
+                    // mid-refresh leaves `ctx` Some-but-dead — every
+                    // subsequent read fails the same way and we never
+                    // reconnect because `ensure_conn` only opens a new
+                    // session when `ctx` is None. Field traces with V3
+                    // had three reads succeed and then everything fail
+                    // for 30+ seconds with the cache stuck at three
+                    // entries. Dropping ctx the moment a non-firmware
+                    // error appears triggers a fresh `tcp::connect`
+                    // on the next iteration.
+                    let is_firmware_exception = s.contains("IllegalDataAddress")
+                        || s.contains("IllegalFunction")
+                        || s.contains("IllegalDataValue")
+                        || s.contains("ServerDeviceFailure");
                     crate::modbus_server::log_traffic(
                         debug_enabled,
                         "out/read-fail",
                         format_args!(
-                            "battery={} {:?} reg={} → {}",
+                            "battery={} {:?} reg={} → {} (firmware-exception={is_firmware_exception})",
                             self.battery.id, tier, *reg, e
                         ),
                     );
+                    if !is_firmware_exception {
+                        crate::modbus_server::log_traffic(
+                            debug_enabled,
+                            "out/conn-suspect",
+                            format_args!(
+                                "battery={} non-firmware error mid-refresh — dropping ctx so next tick reconnects",
+                                self.battery.id
+                            ),
+                        );
+                        drop_ctx(ctx_slot).await;
+                        connection_dead = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1193,12 +1245,11 @@ impl BatteryWriter {
             debug_enabled,
             "out/refresh-summary",
             format_args!(
-                "battery={} {:?} refresh: {} ok / {} fail ({} regs in cache after merge)",
+                "battery={} {:?} refresh: {} ok / {} fail / conn_dead={connection_dead}",
                 self.battery.id,
                 tier,
                 collected.len(),
                 failed.len(),
-                collected.len()
             ),
         );
         if collected.is_empty() {
