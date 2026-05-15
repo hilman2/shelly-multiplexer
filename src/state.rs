@@ -45,6 +45,12 @@ pub struct BatteryState {
     pub id: String,
     pub circuit: String,
     pub address: IpAddr,
+    /// Marstek model — drives per-variant register lookup in the
+    /// virtual Modbus server (e.g. ViperRNMC's HA integration probes
+    /// register 32104 regardless of variant; on V3 that's not a real
+    /// register and we alias it to 34002 so the connection test
+    /// succeeds and the integration can load V3 entities).
+    pub marstek_model: crate::config::MarstekModel,
     /// HTTP base URL of this battery's Shelly Plug PM Gen3. Copied
     /// from BatteryConfig at startup so the emergency cutoff path
     /// can reach the plug without re-walking the config.
@@ -194,6 +200,7 @@ impl BatteryState {
             id: cfg.id.clone(),
             circuit: cfg.circuit.clone(),
             address: cfg.address,
+            marstek_model: cfg.marstek_model,
             plug_url: cfg.plug_url.trim_end_matches('/').to_string(),
             active: cfg.has_soc_source(ha_enabled),
             max_charge_w: cfg.max_charge_w,
@@ -598,6 +605,7 @@ mod tests {
             id: "test".into(),
             circuit: "c1".into(),
             address: "127.0.0.1".parse().unwrap(),
+            marstek_model: crate::config::MarstekModel::VenusEV1V2,
             plug_url: "http://127.0.0.2".into(),
             active: true,
             max_charge_w: 2500.0,
