@@ -498,6 +498,7 @@ async fn api_put_section(
     const SECTIONS: &[&str] = &[
         "real_shelly",
         "virtual_shelly",
+        "virtual_modbus",
         "management",
         "dispatcher",
         "home_assistant",
