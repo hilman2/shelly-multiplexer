@@ -1683,6 +1683,9 @@ mod tests {
             plug_cut_until: None,
             plug_cut_reason: None,
             last_error: None,
+            virtual_unit_id: 1,
+            cached_holding_regs: std::collections::HashMap::new(),
+            cached_regs_refreshed_at: None,
         }
     }
 

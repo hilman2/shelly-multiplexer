@@ -356,6 +356,39 @@
           </div>
         </form>
 
+        <form id="form-virtual_modbus" class="cfg-form" data-section="virtual_modbus">
+          <h3>Virtual Modbus server</h3>
+          <p class="hint">
+            We hold the Marstek's single Modbus slot for setpoint control,
+            so HA's existing Marstek-Modbus integration can't reach the
+            inverter directly any more. This server re-publishes each
+            battery's holding registers on a multiplexed endpoint — point
+            HA at <code>this_addon_host:&lt;port&gt;</code>, unit ID per
+            battery (see <em>Circuits &amp; Batteries</em> tab). Read-only;
+            we reject writes.
+            <span class="restart-tag">restart required</span>
+          </p>
+          <div class="form-grid">
+            <label class="checkbox">
+              <input name="enabled" type="checkbox">
+              <span>enabled <span class="restart-tag">restart required</span></span>
+            </label>
+            <label>Bind address (host:port)
+              <input name="bind_address" type="text" placeholder="0.0.0.0:1502">
+              <span class="restart-tag">restart required</span>
+              <small style="color:var(--fg-faint);font-size:11px">1502 = no privileged-port capability needed; 502 if your HA integration insists</small>
+            </label>
+            <label>Bulk refresh (ms)
+              <input name="bulk_refresh_ms" type="number" min="500" max="60000" step="100">
+              <small style="color:var(--fg-faint);font-size:11px">how often we read the full register block. 5000 = telemetry refreshes every 5 s</small>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary">Save</button>
+            <span class="form-status"></span>
+          </div>
+        </form>
+
         <form id="form-home_assistant" class="cfg-form" data-section="home_assistant">
           <h3>Home Assistant integration</h3>
           <p id="ha-modbus-warning" class="hint" style="display:none;background:rgba(250,204,21,0.12);border-left:3px solid var(--warn);padding:8px 12px;border-radius:4px">

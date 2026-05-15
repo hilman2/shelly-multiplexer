@@ -170,10 +170,25 @@ pub struct BatteryState {
 
     /// Last error from any subsystem, surfaced in the UI.
     pub last_error: Option<String>,
+
+    /// Unit ID this battery is exposed under on our virtual Modbus
+    /// server. Resolved at startup from `BatteryConfig::virtual_unit_id`
+    /// (explicit) or its config index + 1 (fallback).
+    pub virtual_unit_id: u8,
+    /// Cached raw holding-register values, populated by the
+    /// BatteryWriter's periodic bulk-reads. Served verbatim by the
+    /// virtual Modbus server when HA reads holding registers for this
+    /// battery's unit ID. Keys are register addresses; missing keys
+    /// mean either we haven't refreshed yet or the register is outside
+    /// our bulk-read ranges (the server returns ILLEGAL_DATA_ADDRESS).
+    pub cached_holding_regs: HashMap<u16, u16>,
+    /// Wall-clock of the most recent successful bulk refresh. Surfaced
+    /// in /api/status so the UI can show "Modbus telemetry age".
+    pub cached_regs_refreshed_at: Option<Instant>,
 }
 
 impl BatteryState {
-    pub fn from_config(cfg: &BatteryConfig, ha_enabled: bool) -> Self {
+    pub fn from_config(cfg: &BatteryConfig, ha_enabled: bool, index: usize) -> Self {
         Self {
             id: cfg.id.clone(),
             circuit: cfg.circuit.clone(),
@@ -218,6 +233,9 @@ impl BatteryState {
             plug_cut_until: None,
             plug_cut_reason: None,
             last_error: None,
+            virtual_unit_id: cfg.effective_virtual_unit_id(index),
+            cached_holding_regs: HashMap::new(),
+            cached_regs_refreshed_at: None,
         }
     }
 
@@ -432,6 +450,10 @@ pub struct AppState {
     /// Marstek IP -> battery_id, derived from config at startup so the UDP
     /// responder can route polls to their pulse queues in O(1).
     pub by_addr: HashMap<IpAddr, String>,
+    /// Virtual Modbus unit ID -> battery_id, used by the virtual Modbus
+    /// server to route incoming reads to the right battery's cached
+    /// holding registers. Built at startup; topology is fixed.
+    pub by_unit_id: HashMap<u8, String>,
     pub energy: RwLock<EnergyCounters>,
     pub started_at: Instant,
     /// Throttle for the grid-stale warning so a long real-Shelly outage
@@ -443,10 +465,12 @@ impl AppState {
     pub fn from_config(cfg: &Config) -> Arc<Self> {
         let mut batteries = HashMap::new();
         let mut by_addr = HashMap::new();
+        let mut by_unit_id = HashMap::new();
         let ha_enabled = cfg.home_assistant.enabled;
-        for b in &cfg.batteries {
-            let st = BatteryState::from_config(b, ha_enabled);
+        for (idx, b) in cfg.batteries.iter().enumerate() {
+            let st = BatteryState::from_config(b, ha_enabled, idx);
             by_addr.insert(st.address, st.id.clone());
+            by_unit_id.insert(st.virtual_unit_id, st.id.clone());
             batteries.insert(st.id.clone(), st);
         }
         let mut circuits = HashMap::new();
@@ -472,6 +496,7 @@ impl AppState {
             batteries: RwLock::new(batteries),
             circuits: RwLock::new(circuits),
             by_addr,
+            by_unit_id,
             energy: RwLock::new(EnergyCounters::default()),
             started_at: Instant::now(),
             last_grid_stale_warn: Mutex::new(None),
@@ -582,6 +607,9 @@ mod tests {
             plug_cut_until: None,
             plug_cut_reason: None,
             last_error: None,
+            virtual_unit_id: 1,
+            cached_holding_regs: HashMap::new(),
+            cached_regs_refreshed_at: None,
         }
     }
 
