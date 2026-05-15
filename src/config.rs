@@ -74,11 +74,19 @@ pub struct VirtualModbusConfig {
     /// capability granted.
     #[serde(default = "default_virtual_modbus_bind")]
     pub bind_address: String,
-    /// How often we refresh the cached register block (ms). Bulk-read
-    /// happens on the BatteryWriter's existing connection, so this is
-    /// effectively the freshness ceiling for HA telemetry.
-    #[serde(default = "default_virtual_modbus_refresh")]
+    /// How often we re-read the FAST register list (live telemetry —
+    /// SoC, power, voltage, current, AC, state, control). 5 s is plenty
+    /// fresh for HA dashboards while costing only ~25 Modbus reads per
+    /// battery per refresh. Bulk reads happen on the BatteryWriter's
+    /// persistent connection, no extra TCP socket.
+    #[serde(default = "default_virtual_modbus_fast_refresh")]
     pub bulk_refresh_ms: u64,
+    /// How often we re-read the SLOW register list (metadata, schedules,
+    /// energy counters, BMS limits, per-cell voltages). 60 s is fine
+    /// since most of these only change when the user edits config in
+    /// the Marstek app. Bigger payload (~30-80 reads) but spreads out.
+    #[serde(default = "default_virtual_modbus_slow_refresh")]
+    pub slow_refresh_ms: u64,
 }
 
 impl Default for VirtualModbusConfig {
@@ -86,7 +94,8 @@ impl Default for VirtualModbusConfig {
         Self {
             enabled: default_virtual_modbus_enabled(),
             bind_address: default_virtual_modbus_bind(),
-            bulk_refresh_ms: default_virtual_modbus_refresh(),
+            bulk_refresh_ms: default_virtual_modbus_fast_refresh(),
+            slow_refresh_ms: default_virtual_modbus_slow_refresh(),
         }
     }
 }
@@ -97,34 +106,12 @@ fn default_virtual_modbus_enabled() -> bool {
 fn default_virtual_modbus_bind() -> String {
     "0.0.0.0:1502".into()
 }
-fn default_virtual_modbus_refresh() -> u64 {
-    // Marstek inverters publish slow-moving signals (SoC, voltage,
-    // energy counters) so 5 s is plenty fresh for HA dashboards while
-    // costing us only ~2 Modbus round-trips per battery per refresh.
+fn default_virtual_modbus_fast_refresh() -> u64 {
     5_000
 }
-
-/// Register ranges we bulk-read on every refresh. Aims to cover every
-/// holding-register address the ViperRNMC integration's variant YAMLs
-/// (`e_v12.yaml`, `e_v3.yaml`, `d.yaml`, `a.yaml`) might reference —
-/// inverter status, AC/DC, energy counters, SoC, BMS state, control
-/// registers. 125-register chunk size is the Modbus protocol maximum
-/// per request, and we issue these sequentially against the existing
-/// persistent connection so the bridge sees the same pace as before.
-pub const BULK_READ_RANGES: &[(u16, u16)] = &[
-    (30000, 125), // 30000..30124 — status block (every variant)
-    (30125, 125), // 30125..30249 — continuation
-    (31000, 125), // 31000..31124 — AC / inverter telemetry on some variants
-    (32000, 100), // 32000..32099 — gap-filler before 32100
-    (32100, 125), // 32100..32224 — V1/V2 SoC + power + energy
-    (32225, 75),  // 32225..32299 — V1/V2 tail
-    (33000, 125), // 33000..33124 — energy counters / daily stats
-    (34000, 125), // 34000..34124 — V3 SoC + status
-    (34125, 75),  // 34125..34199 — V3 tail
-    (42000, 30),  // 42000..42029 — RS485 control + force_mode + setpoints
-    (43000, 10),  // 43000..43009 — user_work_mode + related
-    (44000, 10),  // 44000..44009 — BMS charging/discharging cutoffs
-];
+fn default_virtual_modbus_slow_refresh() -> u64 {
+    60_000
+}
 
 // ---------------------------------------------------------------------------
 // Real Shelly (grid measurement source)
@@ -248,21 +235,6 @@ pub struct DispatcherConfig {
     #[serde(default = "default_cycle_ms")]
     pub cycle_ms: u64,
 
-    /// Grid-imbalance noise floor (W). Imbalances smaller than this
-    /// are ignored — Marstek quantisation + plug measurement noise.
-    /// Default 50 W.
-    #[serde(default = "default_deadband_w")]
-    pub deadband_w: f64,
-
-    /// Asymmetric "never cross zero" margin (W). The dispatcher always
-    /// aims for grid_w = ±bias depending on direction — never zero.
-    /// Charging: leaves this much grid EXPORT unaddressed (never pulls
-    /// import). Discharging: leaves this much grid IMPORT unaddressed
-    /// (never pushes into export). 100 W is comfortable against
-    /// inverter ramp lag and noisy load profiles.
-    #[serde(default = "default_grid_bias_w")]
-    pub grid_bias_w: f64,
-
     /// Max change of a battery's setpoint per dispatcher cycle (W).
     /// Smooths big steps into a ramp — going from 0 W to 2 kW takes
     /// (2000 / rate_limit) cycles. Replaces the EMA grid smoother
@@ -321,11 +293,14 @@ pub struct DispatcherConfig {
 // modbus_heartbeat_s, modbus_watchdog_grace_s, modbus_connect_timeout_ms,
 // modbus_request_timeout_ms, modbus_write_retries, grid_smoothing_s,
 // modbus_min_write_interval_s, emergency_cutoff_grace_s,
-// emergency_cutoff_recovery_s, night_cutoff_soc_margin_pct
+// emergency_cutoff_recovery_s, night_cutoff_soc_margin_pct,
+// deadband_w, grid_bias_w
 //
 // These are now compile-time constants. See `dispatcher.rs` and
-// `modbus.rs` for the values. v0.8 simplification — was 25+ knobs
-// in v0.7, now 13.
+// `modbus.rs` for the values. v0.10 dropped `deadband_w` + `grid_bias_w`
+// in favour of the absolute rule: "charging → never import (always ≥
+// SAFETY_MARGIN_W export); discharging → never export (always ≥
+// SAFETY_MARGIN_W import); any violation = abort". No knobs to tune.
 
 
 impl Default for DispatcherConfig {
@@ -333,8 +308,6 @@ impl Default for DispatcherConfig {
         Self {
             mode: DispatchMode::default(),
             cycle_ms: default_cycle_ms(),
-            deadband_w: default_deadband_w(),
-            grid_bias_w: default_grid_bias_w(),
             rate_limit_w_per_cycle: default_rate_limit_w(),
             soc_full_pct: default_soc_full(),
             soc_empty_pct: default_soc_empty(),
@@ -350,12 +323,6 @@ impl Default for DispatcherConfig {
 
 fn default_cycle_ms() -> u64 {
     2000
-}
-fn default_deadband_w() -> f64 {
-    50.0
-}
-fn default_grid_bias_w() -> f64 {
-    100.0
 }
 fn default_rate_limit_w() -> f64 {
     // 500 W per cycle. With cycle_ms = 2 s, that's 250 W/s ramp —
@@ -386,10 +353,39 @@ fn default_emergency_cutoff_margin_w() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Hardcoded constants that used to be config knobs (v0.7 had ~25, v0.8 → 13).
-// Exposed as `pub const` so dispatcher / modbus / writers can reference them
-// without each module copy-pasting the value.
+// Hardcoded constants that used to be config knobs (v0.7 had ~25, v0.8 → 13,
+// v0.10 → 11). Exposed as `pub const` so dispatcher / modbus / writers can
+// reference them without each module copy-pasting the value.
 // ---------------------------------------------------------------------------
+
+/// Grid target margin (W). The single hard rule we enforce on grid_w:
+///   * while CHARGING → target grid = -SAFETY_MARGIN_W (always 10 W
+///     export, never import while charging)
+///   * while DISCHARGING → target grid = +SAFETY_MARGIN_W (always
+///     10 W import, never export while discharging)
+///   * idle → grid in [-SAFETY_MARGIN_W, +SAFETY_MARGIN_W] is "hold",
+///     outside triggers the appropriate direction
+///
+/// The dispatcher reduces charge / discharge magnitude every cycle to
+/// pull grid_w toward this target. If a reduction crosses zero into the
+/// opposite direction, that just means flipping — the math handles it
+/// naturally: e.g. heavy import while charging 200 W reduces charging
+/// below standby and flips to discharging.
+///
+/// 10 W is plenty because the loop runs every ~200 ms and updates ALL
+/// batteries in parallel — by the time we'd cross zero by accident, the
+/// next dispatcher tick has already corrected. No reason for a bigger
+/// buffer. v0.10 made this a hardcoded const, removing `grid_bias_w`
+/// from the config schema entirely.
+pub const SAFETY_MARGIN_W: f64 = 10.0;
+
+/// Minimum change (W) between successive Modbus writes per battery to
+/// be worth a round-trip. Below this, BatteryWriter holds the previous
+/// setpoint. v0.10 made this a hardcoded const, removing `deadband_w`
+/// from the config schema. 25 W ≈ MARSTEK_MIN_W/2: small enough that we
+/// react to real grid changes promptly, big enough that micro-jitter
+/// doesn't spam writes.
+pub const WRITE_DEADBAND_W: f64 = 25.0;
 
 /// Identical CT samples per delta in pulse mode. Marstek commits after
 /// 2 polls; 3 is a safety margin.
@@ -710,7 +706,249 @@ impl MarstekModel {
     pub fn supports_bms_cutoffs(self) -> bool {
         matches!(self, MarstekModel::VenusEV1V2)
     }
+
+    /// Live-telemetry registers — values that change second-by-second
+    /// while the inverter operates. Refreshed on every fast tick
+    /// (default 5 s). Sourced from the ViperRNMC YAMLs.
+    ///
+    /// Reads happen one register at a time (count=1): Marstek bridges
+    /// return `IllegalDataAddress` on contiguous-range reads if ANY
+    /// register inside the range is undefined, and the address space is
+    /// sparse, so a single big range never works. Multi-register fields
+    /// (int32 power, uint32 energy counters, char strings) are listed
+    /// register-by-register — when HA asks for `count=N` our server
+    /// reassembles from the per-register cache.
+    pub fn fast_registers(self) -> &'static [u16] {
+        match self {
+            MarstekModel::VenusEV1V2 => VENUS_E_V1V2_FAST,
+            MarstekModel::VenusEV3 => VENUS_E_V3_FAST,
+            MarstekModel::VenusD => VENUS_D_FAST,
+            MarstekModel::VenusA => VENUS_A_FAST,
+        }
+    }
+
+    /// Slow / static registers — metadata (serial number, MAC, firmware
+    /// version), schedule config, BMS limits, energy counters, per-cell
+    /// voltages. Refreshed every `slow_refresh_ms` (default 60 s) to
+    /// keep total bridge traffic low. Many of these never change after
+    /// startup; we still re-poll periodically so HA picks up edits made
+    /// in the Marstek app without an addon restart.
+    pub fn slow_registers(self) -> &'static [u16] {
+        match self {
+            MarstekModel::VenusEV1V2 => VENUS_E_V1V2_SLOW,
+            MarstekModel::VenusEV3 => VENUS_E_V3_SLOW,
+            MarstekModel::VenusD => VENUS_D_SLOW,
+            MarstekModel::VenusA => VENUS_A_SLOW,
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Per-variant register tables. Addresses copied verbatim from the
+// `ViperRNMC/marstek_venus_modbus` YAMLs so HA's existing integration
+// sees exactly what it would see talking to the inverter directly.
+//
+// Each variant has two tables: FAST (live values, every ~5 s) + SLOW
+// (metadata + slow-changing stuff, every ~60 s). Splitting them keeps
+// the per-cycle Modbus traffic low while ensuring HA dashboards stay
+// snappy on the values users actually watch.
+// ---------------------------------------------------------------------------
+
+// ----- Venus E V1/V2 -----
+
+const VENUS_E_V1V2_FAST: &[u16] = &[
+    // battery DC (voltage, current, power int32, soc)
+    32100, 32101, 32102, 32103, 32104,
+    // AC grid (V, A, P int32, Hz)
+    32200, 32201, 32202, 32203, 32204,
+    // AC off-grid (V, A, P int32)
+    32300, 32301, 32302, 32303,
+    // temperatures
+    35000, 35001, 35002,
+    // inverter state, alarm, fault
+    35100, 36000, 36001, 36100, 36101, 36102, 36103,
+    // control registers (also written by the dispatcher)
+    42000, 42010, 42011, 42020, 42021,
+];
+
+const VENUS_E_V1V2_SLOW: &[u16] = &[
+    // version / metadata
+    31100, 31101, 31102,
+    31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009, // device_name
+    31200, 31201, 31202, 31203, 31204, 31205, 31206, 31207, 31208, 31209, // sn_code
+    30800, 30801, 30802, 30803, 30804, 30805, // comm_module_firmware
+    30402, 30403, 30404, 30405, 30406, 30407, // mac_address
+    // connectivity
+    30300, 30301, 30302, 30303,
+    // total energy + energy counters (uint32/int32 pairs)
+    32105,
+    33000, 33001, 33002, 33003, 33004, 33005,
+    33006, 33007, 33008, 33009, 33010, 33011,
+    // cell extremes
+    35010, 35011, 37007, 37008,
+    // modbus + backup config
+    41010, 41100, 41200,
+    // work mode + schedules
+    43000,
+    43100, 43101, 43102, 43103, 43104,
+    43105, 43106, 43107, 43108, 43109,
+    43110, 43111, 43112, 43113, 43114,
+    43115, 43116, 43117, 43118, 43119,
+    43120, 43121, 43122, 43123, 43124,
+    43125, 43126, 43127, 43128, 43129,
+    // BMS limits + grid standard
+    44000, 44001, 44002, 44003, 44100,
+];
+
+// ----- Venus E V3 -----
+
+const VENUS_E_V3_FAST: &[u16] = &[
+    // battery + power (16-bit on V3)
+    30001, 30006,
+    30100, 30101,
+    34002, // soc (scale 0.1)
+    // AC
+    32200, 32204, 37004,
+    32300, 32301, 32302,
+    // temperature
+    35000, 35001, 35002,
+    // state + control
+    35100, 42000, 42010, 42011, 42020, 42021,
+];
+
+const VENUS_E_V3_SLOW: &[u16] = &[
+    // metadata
+    30200, 30202, 30204,
+    31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009,
+    30350, 30351, 30352, 30353, 30354, 30355,
+    30304, 30305, 30306, 30307, 30308, 30309,
+    30300, 30301, 30302, 30303,
+    // total energy + cycle count
+    32105, 34003,
+    // energy counters
+    33000, 33001, 33002, 33003, 33004, 33005,
+    33006, 33007, 33008, 33009, 33010, 33011,
+    // cell extremes + per-cell voltages (16 cells)
+    35010, 35011, 37007, 37008,
+    34018, 34019, 34020, 34021, 34022, 34023, 34024, 34025,
+    34026, 34027, 34028, 34029, 34030, 34031, 34032, 34033,
+    // config
+    41100, 41200, 44002, 44003,
+    43000,
+    43100, 43101, 43102, 43103, 43104,
+    43105, 43106, 43107, 43108, 43109,
+    43110, 43111, 43112, 43113, 43114,
+    43115, 43116, 43117, 43118, 43119,
+    43120, 43121, 43122, 43123, 43124,
+    43125, 43126, 43127, 43128, 43129,
+];
+
+// ----- Venus D -----
+
+const VENUS_D_FAST: &[u16] = &[
+    // battery + power (16-bit on D)
+    30001, 30006,
+    30100, 30101,
+    32104, // soc (scale 1)
+    // AC
+    32200, 32204, 37004,
+    32300, 32301, 32302,
+    // MPPT (D + A have PV inputs)
+    30020, 30021, 30022, 30023,
+    30024, 30025, 30026, 30027,
+    30037, 30038, 30039, 30040,
+    // temperature
+    35000, 35001, 35002,
+    // state + control
+    35100, 42000, 42010, 42011, 42020, 42021,
+];
+
+const VENUS_D_SLOW: &[u16] = &[
+    // metadata
+    30200, 30202, 30204,
+    31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009,
+    30350, 30351, 30352, 30353, 30354, 30355,
+    30304, 30305, 30306, 30307, 30308, 30309,
+    30300, 30301, 30302, 30303,
+    // total energy + cycle count
+    32105, 34003,
+    // energy counters
+    33000, 33001, 33002, 33003, 33004, 33005,
+    33006, 33007, 33008, 33009, 33010, 33011,
+    // cell extremes + per-cell voltages (13 cells)
+    35010, 35011, 37007, 37008,
+    34018, 34019, 34020, 34021, 34022, 34023, 34024,
+    34025, 34026, 34027, 34028, 34029, 34030,
+    // config
+    41100, 41200, 44002, 44003,
+    43000,
+    43100, 43101, 43102, 43103, 43104,
+    43105, 43106, 43107, 43108, 43109,
+    43110, 43111, 43112, 43113, 43114,
+    43115, 43116, 43117, 43118, 43119,
+    43120, 43121, 43122, 43123, 43124,
+    43125, 43126, 43127, 43128, 43129,
+];
+
+// ----- Venus A -----
+
+const VENUS_A_FAST: &[u16] = &[
+    // power
+    30001, 30006,
+    30100, 30101,
+    // SoC: whole-system + per-unit (6 batteries possible)
+    32104,
+    34002, 34102, 34202, 34302, 34402, 34502,
+    // AC
+    32200, 32204, 37004,
+    32300, 32301, 32302,
+    // MPPT
+    30020, 30021, 30022, 30023,
+    30024, 30025, 30026, 30027,
+    30037, 30038, 30039, 30040,
+    // temperature
+    35000, 35001, 35002,
+    // state + control
+    35100, 42000, 42010, 42011, 42020, 42021,
+];
+
+const VENUS_A_SLOW: &[u16] = &[
+    // metadata
+    30200, 30202, 30204,
+    31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009,
+    30350, 30351, 30352, 30353, 30354, 30355,
+    30304, 30305, 30306, 30307, 30308, 30309,
+    30300, 30301, 30302, 30303,
+    // total energy + cycle count
+    32105, 34003,
+    // energy counters
+    33000, 33001, 33002, 33003, 33004, 33005,
+    33006, 33007, 33008, 33009, 33010, 33011,
+    // cell extremes
+    35010, 35011, 37007, 37008,
+    // per-cell voltages — 6 batteries × 13 cells = 78 regs
+    34018, 34019, 34020, 34021, 34022, 34023, 34024,
+    34025, 34026, 34027, 34028, 34029, 34030,
+    34118, 34119, 34120, 34121, 34122, 34123, 34124,
+    34125, 34126, 34127, 34128, 34129, 34130,
+    34218, 34219, 34220, 34221, 34222, 34223, 34224,
+    34225, 34226, 34227, 34228, 34229, 34230,
+    34318, 34319, 34320, 34321, 34322, 34323, 34324,
+    34325, 34326, 34327, 34328, 34329, 34330,
+    34418, 34419, 34420, 34421, 34422, 34423, 34424,
+    34425, 34426, 34427, 34428, 34429, 34430,
+    34518, 34519, 34520, 34521, 34522, 34523, 34524,
+    34525, 34526, 34527, 34528, 34529, 34530,
+    // config
+    41100, 41200, 44002, 44003,
+    43000,
+    43100, 43101, 43102, 43103, 43104,
+    43105, 43106, 43107, 43108, 43109,
+    43110, 43111, 43112, 43113, 43114,
+    43115, 43116, 43117, 43118, 43119,
+    43120, 43121, 43122, 43123, 43124,
+    43125, 43126, 43127, 43128, 43129,
+];
 
 impl BatteryConfig {
     /// Effective Modbus endpoint. `modbus_host` is checked by callers via
@@ -937,14 +1175,8 @@ impl Config {
         if self.dispatcher.cycle_ms == 0 {
             anyhow::bail!("dispatcher.cycle_ms must be > 0");
         }
-        if self.dispatcher.deadband_w < 0.0 {
-            anyhow::bail!("dispatcher.deadband_w must not be negative");
-        }
         if !(0.0..=1.0).contains(&self.dispatcher.circuit_headroom) {
             anyhow::bail!("dispatcher.circuit_headroom must be in [0, 1]");
-        }
-        if self.dispatcher.grid_bias_w < 0.0 {
-            anyhow::bail!("dispatcher.grid_bias_w must not be negative");
         }
         if self.dispatcher.rate_limit_w_per_cycle <= 0.0 {
             anyhow::bail!("dispatcher.rate_limit_w_per_cycle must be > 0");
@@ -997,6 +1229,9 @@ impl Config {
         if self.virtual_modbus.enabled {
             if self.virtual_modbus.bulk_refresh_ms == 0 {
                 anyhow::bail!("virtual_modbus.bulk_refresh_ms must be > 0");
+            }
+            if self.virtual_modbus.slow_refresh_ms == 0 {
+                anyhow::bail!("virtual_modbus.slow_refresh_ms must be > 0");
             }
             self.virtual_modbus
                 .bind_address

@@ -283,14 +283,6 @@
               <input name="cycle_ms" type="number" min="50" max="5000" required>
               <small style="color:var(--fg-faint);font-size:11px">how often the dispatcher recomputes targets. 2000 ms matches Marstek ramp speed</small>
             </label>
-            <label>Deadband (W)
-              <input name="deadband_w" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">noise floor — ignore grid imbalances below this</small>
-            </label>
-            <label>Grid bias (W)
-              <input name="grid_bias_w" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">never cross 0: import side when discharging, export side when charging</small>
-            </label>
             <label>Rate limit (W / cycle)
               <input name="rate_limit_w_per_cycle" type="number" min="1" step="any" required>
               <small style="color:var(--fg-faint);font-size:11px">max change of a battery's setpoint per cycle. Smooths big steps into a ramp</small>
@@ -378,9 +370,13 @@
               <span class="restart-tag">restart required</span>
               <small style="color:var(--fg-faint);font-size:11px">1502 = no privileged-port capability needed; 502 if your HA integration insists</small>
             </label>
-            <label>Bulk refresh (ms)
+            <label>Fast refresh (ms)
               <input name="bulk_refresh_ms" type="number" min="500" max="60000" step="100">
-              <small style="color:var(--fg-faint);font-size:11px">how often we read the full register block. 5000 = telemetry refreshes every 5 s</small>
+              <small style="color:var(--fg-faint);font-size:11px">live telemetry (SoC, power, voltage, AC, state). 5000 = every 5 s</small>
+            </label>
+            <label>Slow refresh (ms)
+              <input name="slow_refresh_ms" type="number" min="1000" max="600000" step="100">
+              <small style="color:var(--fg-faint);font-size:11px">metadata, schedules, energy counters, BMS limits, per-cell voltages. 60000 = every 60 s</small>
             </label>
           </div>
           <div class="form-actions">

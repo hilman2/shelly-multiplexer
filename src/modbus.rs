@@ -620,11 +620,13 @@ async fn write_reg(
 //
 //   - receives the latest desired Setpoint on every change,
 //   - skips writes inside `dispatcher.deadband_w`,
-//   - piggybacks SoC reads onto the same persistent connection on a
-//     `soc_interval_ms` cadence (the only periodic action — there is
-//     no heartbeat: the dispatcher itself re-issues setpoints on every
-//     cycle when the rate-limit pulls the target toward the new
-//     plug-measured power),
+//   - refreshes the virtual-Modbus cache on two timers — FAST (live
+//     telemetry, default 5 s) + SLOW (metadata + schedules + energy
+//     counters, default 60 s) — both on the SAME persistent connection
+//     so no extra TCP socket is opened against the inverter,
+//   - falls back to a legacy SoC-only poll when `virtual_modbus.enabled
+//     = false` (still only opens one connection per battery, just reads
+//     fewer registers),
 //   - on receiving a `Shutdown` command, attempts a failsafe write
 //     (force_mode = 0, RS485 control off) and exits.
 
@@ -650,13 +652,17 @@ impl ModbusDispatch {
     /// Returns the handle the dispatcher uses to push setpoints.
     pub fn spawn(state: Arc<AppState>, cfg: &Config) -> Self {
         let mut batteries = HashMap::new();
-        let deadband_w = cfg.dispatcher.deadband_w;
-        let bulk_refresh_interval = if cfg.virtual_modbus.enabled {
-            Some(Duration::from_millis(
-                cfg.virtual_modbus.bulk_refresh_ms.max(500),
-            ))
+        let (fast_refresh_interval, slow_refresh_interval) = if cfg.virtual_modbus.enabled {
+            (
+                Some(Duration::from_millis(
+                    cfg.virtual_modbus.bulk_refresh_ms.max(500),
+                )),
+                Some(Duration::from_millis(
+                    cfg.virtual_modbus.slow_refresh_ms.max(1_000),
+                )),
+            )
         } else {
-            None
+            (None, None)
         };
         for b in &cfg.batteries {
             if b.modbus_host.is_none() {
@@ -673,13 +679,14 @@ impl ModbusDispatch {
                 rx: sp_rx,
                 shutdown: shutdown_rx,
                 state: state.clone(),
-                deadband_w,
                 last_written: None,
                 last_write_at: None,
                 soc_interval: Duration::from_millis(b.soc_interval_ms.max(1_000)),
                 last_soc_read_at: None,
-                bulk_refresh_interval,
-                last_bulk_refresh_at: None,
+                fast_refresh_interval,
+                last_fast_refresh_at: None,
+                slow_refresh_interval,
+                last_slow_refresh_at: None,
             };
             tokio::spawn(task.run());
             batteries.insert(
@@ -763,6 +770,16 @@ impl ModbusDispatch {
     }
 }
 
+/// Which set of holding registers a refresh tick is targeting.
+/// FAST = live telemetry (~25 regs, every `bulk_refresh_ms`).
+/// SLOW = metadata, energy counters, schedules, per-cell voltages
+/// (~30-80 regs, every `slow_refresh_ms`).
+#[derive(Debug, Clone, Copy)]
+enum Tier {
+    Fast,
+    Slow,
+}
+
 /// Close a persistent Modbus context cleanly. Used after errors so
 /// the next operation forces a fresh `tcp::connect_slave`. Best-effort
 /// — if disconnect itself errors, we swallow it (the socket is going
@@ -778,7 +795,6 @@ struct BatteryWriter {
     rx: watch::Receiver<Setpoint>,
     shutdown: mpsc::Receiver<()>,
     state: Arc<AppState>,
-    deadband_w: f64,
     last_written: Option<Setpoint>,
     last_write_at: Option<Instant>,
     /// Upper bound on how often we re-read SoC (and battery_power).
@@ -787,10 +803,19 @@ struct BatteryWriter {
     /// `run()` fires when no write happened in this window.
     soc_interval: Duration,
     last_soc_read_at: Option<Instant>,
-    /// Interval for the bulk register refresh that feeds the virtual
-    /// Modbus server. `None` disables the refresh (no server enabled).
-    bulk_refresh_interval: Option<Duration>,
-    last_bulk_refresh_at: Option<Instant>,
+    /// Interval for the FAST register refresh (live telemetry). `None`
+    /// disables (= virtual_modbus disabled). Each refresh reads every
+    /// address in `marstek_model.fast_registers()` one register at a
+    /// time — Marstek bridges reject contiguous-range reads when the
+    /// range crosses an undefined register.
+    fast_refresh_interval: Option<Duration>,
+    last_fast_refresh_at: Option<Instant>,
+    /// Interval for the SLOW register refresh (metadata, energy
+    /// counters, BMS limits, schedules, per-cell voltages). `None`
+    /// disables. Lower-frequency than the fast tier so the per-cycle
+    /// Modbus traffic stays bounded.
+    slow_refresh_interval: Option<Duration>,
+    last_slow_refresh_at: Option<Instant>,
 }
 
 impl BatteryWriter {
@@ -841,36 +866,42 @@ impl BatteryWriter {
             time::sleep(Duration::from_secs(5)).await;
         }
 
+        // Sentinel for "never fire" — used when a tier is disabled so
+        // the corresponding select branch effectively sleeps forever.
+        let never = Duration::from_secs(3600 * 24);
         loop {
-            // SoC timer: only used when bulk-refresh is disabled. With
-            // bulk-refresh on, the wider read implicitly covers SoC +
-            // battery_power on a faster cadence, so the dedicated SoC
-            // poll becomes redundant.
-            let soc_due_in = if self.bulk_refresh_interval.is_some() {
-                Duration::from_secs(3600 * 24)
+            // SoC timer: only used when virtual_modbus is OFF (no FAST
+            // refresh covering SoC). When FAST is enabled it always
+            // reads SoC, so this timer goes dormant.
+            let soc_due_in = if self.fast_refresh_interval.is_some() {
+                never
             } else {
                 self.last_soc_read_at
                     .map(|t| (t + self.soc_interval).saturating_duration_since(Instant::now()))
                     .unwrap_or(self.soc_interval)
             };
-            // Bulk-refresh timer: drives the cache that feeds the
-            // virtual Modbus server. `None` disables (effectively
-            // 24-hour sleep so the branch never wins the select).
-            let bulk_due_in = self
-                .bulk_refresh_interval
+            // FAST timer: live telemetry for HA dashboards (~25 regs).
+            let fast_due_in = self
+                .fast_refresh_interval
                 .map(|iv| {
-                    self.last_bulk_refresh_at
+                    self.last_fast_refresh_at
                         .map(|t| (t + iv).saturating_duration_since(Instant::now()))
                         .unwrap_or(Duration::ZERO)
                 })
-                .unwrap_or(Duration::from_secs(3600 * 24));
+                .unwrap_or(never);
+            // SLOW timer: metadata + energy counters + schedules
+            // + per-cell voltages (~30-80 regs depending on variant).
+            let slow_due_in = self
+                .slow_refresh_interval
+                .map(|iv| {
+                    self.last_slow_refresh_at
+                        .map(|t| (t + iv).saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::ZERO)
+                })
+                .unwrap_or(never);
             tokio::select! {
                 biased;
                 _ = self.shutdown.recv() => {
-                    // Best-effort park to standby on the existing
-                    // connection, then close it cleanly and write the
-                    // RS485-control-off via a fresh connection (the
-                    // failsafe_shutdown free function opens its own).
                     if let Ok(c) = self.ensure_conn(&mut ctx).await {
                         let _ = write_setpoint_on(c, Setpoint::Standby).await;
                     }
@@ -884,24 +915,29 @@ impl BatteryWriter {
                     let desired = *self.rx.borrow();
                     if self.should_write(desired) {
                         let _ = self.do_write(&mut ctx, desired).await;
-                    } else if self.soc_poll_due() && self.bulk_refresh_interval.is_none() {
-                        // Bulk-refresh is off → fall back to legacy SoC poll.
+                    } else if self.soc_poll_due() && self.fast_refresh_interval.is_none() {
+                        // Virtual-modbus off → fall back to legacy SoC poll.
                         let _ = self.poll_soc_only(&mut ctx).await;
                     }
                 }
                 _ = time::sleep(soc_due_in) => {
-                    // No setpoint changes in the SoC window — refresh
-                    // SoC + battery_power on the open connection.
                     let _ = self.poll_soc_only(&mut ctx).await;
                 }
-                _ = time::sleep(bulk_due_in) => {
-                    // Bulk-refresh fires on its own cadence. Failure is
-                    // logged but non-fatal — next tick retries.
-                    if let Err(e) = self.bulk_refresh(&mut ctx).await {
+                _ = time::sleep(fast_due_in) => {
+                    if let Err(e) = self.tier_refresh(&mut ctx, Tier::Fast).await {
                         debug!(
                             battery = %self.battery.id,
                             error = %e,
-                            "bulk refresh failed"
+                            "fast refresh failed"
+                        );
+                    }
+                }
+                _ = time::sleep(slow_due_in) => {
+                    if let Err(e) = self.tier_refresh(&mut ctx, Tier::Slow).await {
+                        debug!(
+                            battery = %self.battery.id,
+                            error = %e,
+                            "slow refresh failed"
                         );
                     }
                 }
@@ -935,7 +971,7 @@ impl BatteryWriter {
             return true;
         }
         let diff = (desired.to_signed_watts() - last.to_signed_watts()).abs();
-        diff >= self.deadband_w
+        diff >= crate::config::WRITE_DEADBAND_W
     }
 
     /// True iff it's time to refresh SoC. Drives the piggyback decision
@@ -1048,98 +1084,139 @@ impl BatteryWriter {
         Ok(())
     }
 
-    /// Bulk-read every register range listed in `BULK_READ_RANGES` and
-    /// stash the raw u16 values into `BatteryState.cached_holding_regs`.
-    /// Also derives SoC + battery_power from the cache so the dispatcher
-    /// stays current without needing the separate SoC poll path.
+    /// Read every register in the requested tier (fast or slow) ONE
+    /// at a time and merge the values into
+    /// `BatteryState.cached_holding_regs`. Also derives SoC +
+    /// battery_power from the FAST tier's cache so the dispatcher stays
+    /// current without needing the separate SoC poll path.
     ///
-    /// Range-level errors are tolerated: variants vary (e.g. 44000/44001
-    /// only exist on Venus E V1/V2), so a Modbus exception on one range
-    /// shouldn't kill the whole refresh. We only error overall if NO
-    /// range came back — that indicates a connection problem and the
-    /// caller will drop+reconnect on the next iteration.
-    async fn bulk_refresh(
+    /// Why one-register-at-a-time: the Marstek RS485 bridges return
+    /// `IllegalDataAddress` on contiguous-range reads if ANY register
+    /// inside the requested range is undefined for this variant, and
+    /// the address space is sparse (32100, 32101, 32102, 32103, 32104,
+    /// 32105 defined; 32106-32199 not; 32200 defined again, etc.).
+    /// Reading individual addresses sidesteps that entirely — each
+    /// request asks only for registers we know exist on this variant.
+    ///
+    /// Per-register errors are tolerated: variant tables are based on
+    /// the ViperRNMC YAMLs which are explicitly marked "untested" for
+    /// A/D/V3, so a stray IllegalDataAddress on one address just means
+    /// we drop it from the cache. The refresh as a whole only errors
+    /// when NO register came back — that's the connection-broken case
+    /// where the caller drops + reconnects on the next iteration.
+    async fn tier_refresh(
         &mut self,
         ctx_slot: &mut Option<tokio_modbus::client::Context>,
+        tier: Tier,
     ) -> Result<()> {
         let model = self.battery.marstek_model;
+        let regs = match tier {
+            Tier::Fast => model.fast_registers(),
+            Tier::Slow => model.slow_registers(),
+        };
         let mut collected: HashMap<u16, u16> = HashMap::new();
-        let mut had_connection_error = false;
-        for (start, count) in crate::config::BULK_READ_RANGES {
+        let mut connection_dead = false;
+        for reg in regs {
             let ctx = match self.ensure_conn(ctx_slot).await {
                 Ok(c) => c,
                 Err(_) => {
-                    had_connection_error = true;
+                    connection_dead = true;
                     break;
                 }
             };
-            match read_holding_on(ctx, *start, *count).await {
-                Ok(regs) => {
-                    for (i, val) in regs.iter().enumerate() {
-                        collected.insert(start + i as u16, *val);
+            match read_holding_on(ctx, *reg, 1).await {
+                Ok(values) => {
+                    if let Some(v) = values.first() {
+                        collected.insert(*reg, *v);
                     }
                 }
                 Err(e) => {
-                    // Most likely: the variant doesn't expose this range
-                    // (Modbus exception 0x02 ILLEGAL_DATA_ADDRESS). Skip
-                    // quietly. If it was a connection error we'll catch
-                    // it on the next ensure_conn.
+                    // Either the variant doesn't expose this address
+                    // (Modbus exception 0x02), or it's a transient bus
+                    // error. Either way: skip this register, keep
+                    // going. If the connection is actually dead, the
+                    // NEXT ensure_conn will tell us and we'll bail.
                     debug!(
                         battery = %self.battery.id,
-                        start, count,
+                        register = *reg,
+                        ?tier,
                         error = %e,
-                        "bulk-read range failed (likely unsupported on this variant)"
+                        "register read failed — skipping"
                     );
                 }
             }
         }
         if collected.is_empty() {
-            if had_connection_error {
+            if connection_dead {
                 drop_ctx(ctx_slot).await;
             }
-            return Err(anyhow!("bulk-read returned no data"));
+            return Err(anyhow!("{tier:?} refresh returned no data"));
         }
 
         let now = Instant::now();
-        self.last_bulk_refresh_at = Some(now);
-        // Bulk read covers SoC — keep `last_soc_read_at` in sync so the
-        // dedicated SoC timer in the select stays asleep.
-        self.last_soc_read_at = Some(now);
+        match tier {
+            Tier::Fast => {
+                self.last_fast_refresh_at = Some(now);
+                // FAST tier covers SoC + battery_power, so keep the
+                // dedicated SoC timer asleep.
+                self.last_soc_read_at = Some(now);
+            }
+            Tier::Slow => {
+                self.last_slow_refresh_at = Some(now);
+            }
+        }
 
-        // Derive the dispatcher-facing values (SoC, battery_power) from
-        // the cached register block. Same scaling rules as `read_soc_on`
-        // / `read_battery_power_on`.
-        let soc_reg = model.soc_register();
-        let soc_scale = model.soc_scale();
-        let soc = collected
-            .get(&soc_reg)
-            .map(|r| f64::from(*r) * soc_scale)
-            .filter(|s| (0.0..=100.0).contains(s));
-        let bp_reg = model.battery_power_register();
-        let bp = if model.battery_power_is_int32() {
-            match (collected.get(&bp_reg), collected.get(&(bp_reg + 1))) {
-                (Some(hi), Some(lo)) => {
-                    let combined = ((u32::from(*hi)) << 16) | u32::from(*lo);
-                    Some(f64::from(combined as i32))
+        // Derive dispatcher-facing values from FAST tier only — SoC and
+        // battery_power are guaranteed there for every variant. Doing
+        // it on both tiers is harmless but redundant; we keep it FAST-
+        // only for clarity.
+        if matches!(tier, Tier::Fast) {
+            let soc_reg = model.soc_register();
+            let soc_scale = model.soc_scale();
+            let soc = collected
+                .get(&soc_reg)
+                .map(|r| f64::from(*r) * soc_scale)
+                .filter(|s| (0.0..=100.0).contains(s));
+            let bp_reg = model.battery_power_register();
+            let bp = if model.battery_power_is_int32() {
+                match (collected.get(&bp_reg), collected.get(&(bp_reg + 1))) {
+                    (Some(hi), Some(lo)) => {
+                        let combined = ((u32::from(*hi)) << 16) | u32::from(*lo);
+                        Some(f64::from(combined as i32))
+                    }
+                    _ => None,
                 }
-                _ => None,
+            } else {
+                collected.get(&bp_reg).map(|r| f64::from(*r as i16))
+            };
+
+            let mut bats = self.state.batteries.write();
+            if let Some(b) = bats.get_mut(&self.battery.id) {
+                if let Some(s) = soc {
+                    b.soc_pct = Some(s);
+                    b.soc_at = Some(std::time::Instant::now());
+                    b.soc_source = Some(format!("modbus:{soc_reg}"));
+                }
+                if let Some(p) = bp {
+                    b.last_battery_power_w = Some(p);
+                }
+                // Merge new readings into the cache (don't replace —
+                // we only re-read the FAST subset and want to keep the
+                // SLOW values until the next slow refresh).
+                for (k, v) in &collected {
+                    b.cached_holding_regs.insert(*k, *v);
+                }
+                b.cached_regs_refreshed_at = Some(now);
             }
         } else {
-            collected.get(&bp_reg).map(|r| f64::from(*r as i16))
-        };
-
-        let mut bats = self.state.batteries.write();
-        if let Some(b) = bats.get_mut(&self.battery.id) {
-            if let Some(s) = soc {
-                b.soc_pct = Some(s);
-                b.soc_at = Some(std::time::Instant::now());
-                b.soc_source = Some(format!("modbus:{soc_reg}"));
+            // SLOW tier: just merge into cache, no derived-value path.
+            let mut bats = self.state.batteries.write();
+            if let Some(b) = bats.get_mut(&self.battery.id) {
+                for (k, v) in &collected {
+                    b.cached_holding_regs.insert(*k, *v);
+                }
+                b.cached_regs_refreshed_at = Some(now);
             }
-            if let Some(p) = bp {
-                b.last_battery_power_w = Some(p);
-            }
-            b.cached_holding_regs = collected;
-            b.cached_regs_refreshed_at = Some(now);
         }
         Ok(())
     }
