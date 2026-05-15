@@ -423,7 +423,11 @@ async fn write_setpoint_once(battery: &BatteryConfig, sp: Setpoint) -> Result<()
     let target = battery.modbus_target();
     let unit = Slave(battery.modbus_unit_id);
     let mut ctx = open(target, unit).await?;
-    let r = write_setpoint_on(&mut ctx, sp).await;
+    // `write_setpoint_once` is the retry path of the OUTER write
+    // helper (`write_setpoint`), used by pulse-mode-fallback callers.
+    // No traffic-debug flag accessible here, so we pass `false` and let
+    // BatteryWriter's `do_write` carry the debug flag for the hot path.
+    let r = write_setpoint_on(&mut ctx, sp, &battery.id, false).await;
     let _ = ctx.disconnect().await;
     r
 }
@@ -433,41 +437,91 @@ async fn write_setpoint_once(battery: &BatteryConfig, sp: Setpoint) -> Result<()
 /// task lifetime and reuses it across writes / SoC reads — opening a
 /// fresh TCP socket on every operation puts unnecessary load on the
 /// Marstek (or its bridge) when we already have the bus exclusively.
+///
+/// `battery_id` + `debug_modbus` are threaded through so each
+/// individual write step gets a `modbus_traffic` log line with timing.
+/// Lets us see which step of the multi-write sequence is the one that
+/// times out / fails — invaluable on V3 where ~40 % of dispatch writes
+/// were failing in the field with no visibility into the cause.
 async fn write_setpoint_on(
     ctx: &mut tokio_modbus::client::Context,
     sp: Setpoint,
+    battery_id: &str,
+    debug_modbus: bool,
 ) -> Result<()> {
     // Step 1: re-arm RS485 control mode + give the firmware time.
-    write_reg(ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON).await?;
+    logged_write(
+        ctx, REG_RS485_CONTROL_MODE, RS485_CTRL_ON, battery_id, debug_modbus, "rs485_on",
+    )
+    .await?;
     time::sleep(Duration::from_millis(100)).await;
 
     match sp {
         Setpoint::Standby => {
             // Park cleanly: zero both power setpoints, THEN force_mode=0.
-            write_reg(ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
-            write_reg(ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
-            write_reg(ctx, REG_FORCE_MODE, 0).await?;
+            logged_write(ctx, REG_CHARGE_POWER_SETPOINT, 0, battery_id, debug_modbus, "zero_charge").await?;
+            logged_write(ctx, REG_DISCHARGE_POWER_SETPOINT, 0, battery_id, debug_modbus, "zero_discharge").await?;
+            logged_write(ctx, REG_FORCE_MODE, 0, battery_id, debug_modbus, "force_standby").await?;
         }
         Setpoint::Charge { watts } => {
             // Zero the opposite (discharge) direction first, then switch
             // mode, then write the new charge power. Sleeps between
             // steps come from the Python reference impl — without them
             // the Marstek silently drops the command.
-            write_reg(ctx, REG_DISCHARGE_POWER_SETPOINT, 0).await?;
+            logged_write(ctx, REG_DISCHARGE_POWER_SETPOINT, 0, battery_id, debug_modbus, "zero_discharge").await?;
             time::sleep(Duration::from_millis(200)).await;
-            write_reg(ctx, REG_FORCE_MODE, 1).await?;
+            logged_write(ctx, REG_FORCE_MODE, 1, battery_id, debug_modbus, "force_charge").await?;
             time::sleep(Duration::from_millis(500)).await;
-            write_reg(ctx, REG_CHARGE_POWER_SETPOINT, watts).await?;
+            logged_write(ctx, REG_CHARGE_POWER_SETPOINT, watts, battery_id, debug_modbus, "set_charge_power").await?;
         }
         Setpoint::Discharge { watts } => {
-            write_reg(ctx, REG_CHARGE_POWER_SETPOINT, 0).await?;
+            logged_write(ctx, REG_CHARGE_POWER_SETPOINT, 0, battery_id, debug_modbus, "zero_charge").await?;
             time::sleep(Duration::from_millis(200)).await;
-            write_reg(ctx, REG_FORCE_MODE, 2).await?;
+            logged_write(ctx, REG_FORCE_MODE, 2, battery_id, debug_modbus, "force_discharge").await?;
             time::sleep(Duration::from_millis(500)).await;
-            write_reg(ctx, REG_DISCHARGE_POWER_SETPOINT, watts).await?;
+            logged_write(ctx, REG_DISCHARGE_POWER_SETPOINT, watts, battery_id, debug_modbus, "set_discharge_power").await?;
         }
     }
     Ok(())
+}
+
+/// `write_reg` plus a `modbus_traffic` log line carrying the per-step
+/// label, register, value, elapsed milliseconds and outcome. Lets the
+/// operator pinpoint which step of `write_setpoint_on`'s multi-write
+/// sequence is the slow / failing one without rebuilding with extra
+/// `eprintln!`s.
+async fn logged_write(
+    ctx: &mut tokio_modbus::client::Context,
+    register: u16,
+    value: u16,
+    battery_id: &str,
+    debug_modbus: bool,
+    step: &'static str,
+) -> Result<()> {
+    let start = Instant::now();
+    let result = write_reg(ctx, register, value).await;
+    let elapsed_ms = start.elapsed().as_millis();
+    match &result {
+        Ok(()) => {
+            crate::modbus_server::log_traffic(
+                debug_modbus,
+                "out/write-step-ok",
+                format_args!(
+                    "battery={battery_id} step={step} reg={register} val={value} elapsed={elapsed_ms}ms"
+                ),
+            );
+        }
+        Err(e) => {
+            crate::modbus_server::log_traffic(
+                debug_modbus,
+                "out/write-step-fail",
+                format_args!(
+                    "battery={battery_id} step={step} reg={register} val={value} elapsed={elapsed_ms}ms → {e}"
+                ),
+            );
+        }
+    }
+    result
 }
 
 /// BMS-configured SoC cutoffs read once during dispatch init.
@@ -907,7 +961,7 @@ impl BatteryWriter {
                 biased;
                 _ = self.shutdown.recv() => {
                     if let Ok(c) = self.ensure_conn(&mut ctx).await {
-                        let _ = write_setpoint_on(c, Setpoint::Standby).await;
+                        let _ = write_setpoint_on(c, Setpoint::Standby, &self.battery.id, self.debug_modbus).await;
                     }
                     drop_ctx(&mut ctx).await;
                     let _ = failsafe_shutdown(&self.battery).await;
@@ -1035,7 +1089,7 @@ impl BatteryWriter {
                     continue;
                 }
             };
-            match write_setpoint_on(ctx, sp).await {
+            match write_setpoint_on(ctx, sp, &self.battery.id, self.debug_modbus).await {
                 Ok(()) => {
                     self.state
                         .modbus_stats
