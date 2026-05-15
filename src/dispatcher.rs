@@ -508,62 +508,45 @@ fn step_modbus(
     };
     let targets = compute_targets(state, dcfg, grid_w, now);
 
-    // SEQUENTIAL per circuit: we issue at most ONE new setpoint per
-    // circuit per cycle, and only to a battery whose previous write
-    // has settled (plug confirmed via `modbus_settled`). Why:
+    // PARALLEL dispatch: write the computed target to EVERY eligible
+    // battery on every cycle. Why this matters more than it sounds:
     //
-    //   - Circuit cap is structurally safe — between writes the plug
-    //     reflects the latest commanded setpoint, so the next decision
-    //     uses real measurements, not assumptions about commands that
-    //     haven't materialised yet.
-    //   - BMS taper / refusal handled naturally — if battery A under-
-    //     delivers, A's plug shows the actual power and the next
-    //     candidate on the circuit gets the remainder.
+    //   Up to v0.9 step_modbus dispatched sequentially per circuit —
+    //   one battery per cycle, only the one with the biggest delta
+    //   from its last setpoint, and only when its previous write had
+    //   "settled" (plug movement observed + 3 s of stability, or 5 s
+    //   timeout). With two batteries on a circuit the second battery's
+    //   setpoint was 3-5 s stale by the time it got refreshed. Field
+    //   testing showed grid swings staying uncorrected for 30+ seconds
+    //   because the dispatcher's intent was right but it could only
+    //   write to one battery at a time. v0.10 fires every battery in
+    //   parallel: a grid swing now corrects within ONE dispatcher tick
+    //   (limited only by the Marstek's 1-3 s hardware ramp).
     //
-    // No write heartbeat: the dispatcher itself drives every
-    // setpoint change. Batteries we don't pick this cycle hold their
-    // previous setpoint at the Marstek end (firmware persists the
-    // last force_mode + power) until they're picked again.
+    // Cap-safety: compute_targets already enforces the per-circuit
+    // fuse cap on the SUM of targets, so parallel writes can't push
+    // a circuit over its limit. Each battery's writer task suppresses
+    // duplicate-ish writes via WRITE_DEADBAND_W (25 W) so micro-jitter
+    // in the target doesn't spam Modbus traffic.
     let bats = state.batteries.read();
     let circuits = state.circuits.read();
-    for cs in circuits.values() {
-        // Skip muted circuits — same as compute_targets does for
-        // eligibility (deltas computed for them are already zero).
-        if cs.silent_until.map(|t| t > now).unwrap_or(false) {
+    for b in bats.values() {
+        // Skip cut plugs (emergency cutoff or night cutoff active).
+        if b.plug_cut_until.map(|t| t > now).unwrap_or(false) {
             continue;
         }
-        // Find the candidate with the BIGGEST delta between desired
-        // target and last-written setpoint, among settled members
-        // whose plug isn't currently cut.
-        let pick = cs
-            .member_ids
-            .iter()
-            .filter_map(|id| bats.get(id))
-            .filter(|b| b.plug_cut_until.is_none())
-            .filter(|b| {
-                b.modbus_settled(crate::config::PLUG_STABLE_DURATION_S, dcfg.settle_timeout_s)
-            })
-            .map(|b| {
-                let target = targets.get(&b.id).copied().unwrap_or(0.0);
-                let last = b.last_modbus_setpoint_w.unwrap_or(0.0);
-                let delta = (target - last).abs();
-                (b, target, delta)
-            })
-            .max_by(|a, c| {
-                a.2.partial_cmp(&c.2)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-        if let Some((b, target_w, delta)) = pick {
-            // Skip the write if it's below the setpoint deadband — saves
-            // Modbus traffic on micro-jitters. The writer task's
-            // heartbeat covers the "I'm still here" angle.
-            if delta < dcfg.deadband_w {
-                continue;
-            }
-            let sp = Setpoint::from_signed_watts(target_w, b.max_charge_w, b.max_discharge_w);
-            dispatch.send(&b.id, sp);
+        // Skip muted circuits (plug or grid stale → wait for recovery).
+        let muted = circuits
+            .get(&b.circuit)
+            .and_then(|c| c.silent_until)
+            .map(|t| t > now)
+            .unwrap_or(false);
+        if muted {
+            continue;
         }
+        let target = targets.get(&b.id).copied().unwrap_or(0.0);
+        let sp = Setpoint::from_signed_watts(target, b.max_charge_w, b.max_discharge_w);
+        dispatch.send(&b.id, sp);
     }
     Ok(())
 }
@@ -648,7 +631,7 @@ fn detect_pulse_outcomes(state: &AppState, dcfg: &DispatcherConfig, now: Instant
             b.last_pulse_delta_w = None;
             continue;
         }
-        if delta.abs() < dcfg.deadband_w {
+        if delta.abs() < crate::config::WRITE_DEADBAND_W {
             // Below deadband; we shouldn't even have queued it. Decline
             // to draw a conclusion either way.
             b.last_pulse_delta_w = None;
@@ -790,43 +773,37 @@ fn warn_throttled_grid_stale(state: &AppState, now: Instant) {
 //
 // The asymmetric `grid_bias_w` policy is "never cross zero in the
 // direction we don't want":
-//   • while CHARGING (current plug sum < 0): NEVER import. Any positive
-//     grid is a hard policy violation that must be addressed immediately
-//     — bypass the deadband, push the correction through so the next
-//     write reduces charging. On the export side, leave `grid_bias_w` W
-//     of headroom (don't chase tiny export wobble).
-//   • while DISCHARGING (current plug sum > 0): mirror — never export.
-//   • IDLE / near-zero plug sum: classic asymmetric bias picks the
-//     starting direction; deadband filters noise.
+//   • while CHARGING (current plug sum well below zero): target grid =
+//     -SAFETY_MARGIN_W (10 W export). Any grid value above -margin
+//     pulls our setpoint toward less charging; if needed the math
+//     naturally flips through standby into discharging.
+//   • while DISCHARGING (current plug sum well above zero): target
+//     grid = +SAFETY_MARGIN_W. Same mirror behaviour.
+//   • IDLE: grid in [-margin, +margin] is "hold"; outside fires the
+//     appropriate direction.
 //
-// In every direction-aware branch we cap the correction so `desired_total`
-// can't cross zero from the dispatch direction — a single bad cycle
-// shouldn't flip a charging battery into discharge.
+// The output is a single signed correction: the watts we'd need to add
+// to plug_sum to land grid_w at the target. The caller adds it to the
+// current measured plug_sum and lets `compute_targets` distribute the
+// result across batteries (with per-battery [low_bound, high_bound]
+// clamps, per-cycle rate-limit, and per-circuit cap scaling).
 //
-// Pre-v0.8.1 bug: the bias check looked only at the grid sign, not at
-// the current dispatch direction. With grid = +28 W and bias = 100 W
-// the code computed `(28 - 100).max(0) = 0` and held position — even
-// though the dispatcher was charging at -600 W and the +28 W was a
-// pure policy violation. Symptom: persistent low-watt grid import while
-// the system was nominally "charging from surplus".
-//
-// Pre-v0.8.3 bug: direction was detected via `deadband_w`, but the
-// Marstek's idle inverter loss (~5-15 W per battery while plugged in
-// but not actively dispatching) plus a sub-50 W `deadband_w` config
-// (user-tunable) made the system mistake standby losses for "we're
-// charging". The zero-crossing cap then blocked any discharge dispatch
-// even when the grid imported 400+ W. Fix: use a dedicated idle
-// threshold that scales with battery count and sits in the dead zone
-// between observed standby losses and the smallest active command
-// (Marstek MIN_W = 50 W, so `MIN_W / 2` per battery is safe).
+// History:
+//   • v0.8.1: introduced the "never cross zero in dispatch direction"
+//     rule.
+//   • v0.8.3: dedicated idle threshold so Marstek standby loss
+//     (~5-15 W per inverter) doesn't get misread as active charging.
+//   • v0.10:  dropped the asymmetric `grid_bias_w` and the noise-filter
+//     `deadband_w` from the config schema. Hardcoded SAFETY_MARGIN_W
+//     = 10 W is enough because (a) dispatch fires every cycle (~200 ms)
+//     in parallel to every battery, and (b) Marstek ramps in 1-3 s, so
+//     fast feedback control replaces a big tuning buffer.
 fn compute_grid_correction(
     grid_w: f64,
     current_total: f64,
     eligible_count: usize,
-    dcfg: &DispatcherConfig,
 ) -> f64 {
-    let bias = dcfg.grid_bias_w;
-    let deadband = dcfg.deadband_w;
+    let margin = crate::config::SAFETY_MARGIN_W;
     // Direction-detection threshold: |current dispatch power| must
     // exceed this to count as "actively charging/discharging". Below it
     // we treat the system as idle. Scales with battery count so the
@@ -835,41 +812,30 @@ fn compute_grid_correction(
     // MIN_W = 50 W as the smallest commanded value — a `MIN_W / 2`
     // per-battery slice sits cleanly in the gap).
     let idle_threshold = (crate::modbus::MARSTEK_MIN_W * eligible_count as f64 / 2.0)
-        .max(deadband);
+        .max(margin);
     let charging_now = current_total < -idle_threshold;
     let discharging_now = current_total > idle_threshold;
-    if charging_now {
-        if grid_w > 0.0 {
-            // Violation: importing while charging. React immediately,
-            // no deadband. Cap so desired_total ≤ 0 (no direction flip).
-            (grid_w + bias).min(-current_total)
-        } else {
-            // Charging with export — pull toward grid = -bias if the
-            // adjustment is bigger than the deadband, else hold.
-            let raw = (grid_w + bias).min(-current_total);
-            if raw.abs() < deadband { 0.0 } else { raw }
-        }
+
+    // Where do we want grid_w to land?
+    let target_grid = if charging_now {
+        -margin
     } else if discharging_now {
-        if grid_w < 0.0 {
-            // Violation: exporting while discharging. React immediately.
-            // Cap so desired_total ≥ 0.
-            (grid_w - bias).max(-current_total)
-        } else {
-            let raw = (grid_w - bias).max(-current_total);
-            if raw.abs() < deadband { 0.0 } else { raw }
-        }
+        margin
+    } else if grid_w > margin {
+        // Idle + grid imports more than margin → start discharging.
+        margin
+    } else if grid_w < -margin {
+        // Idle + grid exports more than margin → start charging.
+        -margin
     } else {
-        // Idle / near-zero plug sum — classic asymmetric bias on
-        // whichever side the grid is sitting on. Deadband filters noise.
-        let raw = if grid_w > bias {
-            grid_w - bias
-        } else if grid_w < -bias {
-            grid_w + bias
-        } else {
-            0.0
-        };
-        if raw.abs() < deadband { 0.0 } else { raw }
-    }
+        // Idle + grid inside the band → hold position.
+        return 0.0;
+    };
+
+    // Each W added to plug_sum (more discharge / less charge) REDUCES
+    // grid_w by 1 W. We want new_grid = target_grid, so the correction
+    // we have to add to plug_sum is grid_w - target_grid.
+    grid_w - target_grid
 }
 
 // ---------------------------------------------------------------------------
@@ -958,10 +924,12 @@ fn compute_deltas(
         .map(|b| b.last_plug_w.unwrap_or(0.0))
         .sum();
     let grid_correction =
-        compute_grid_correction(grid_w, current_total, eligible.len(), dcfg);
+        compute_grid_correction(grid_w, current_total, eligible.len());
 
     // Conflict detection: any active circuit with opposing flows above
-    // deadband must be realigned even when the grid itself is balanced.
+    // MIN_W must be realigned even when the grid itself is balanced.
+    // Threshold = MARSTEK_MIN_W (50 W) so a battery's standby loss
+    // doesn't get counted as "active discharge".
     let has_conflict = circuits.values().any(|cs| {
         if cs.silent_until.map(|t| t > now).unwrap_or(false) {
             return false;
@@ -972,8 +940,9 @@ fn compute_deltas(
             .filter_map(|id| bats.get(id))
             .filter_map(|b| b.last_plug_w)
             .collect();
-        let any_pos = plugs.iter().any(|w| *w > dcfg.deadband_w);
-        let any_neg = plugs.iter().any(|w| *w < -dcfg.deadband_w);
+        let threshold = crate::modbus::MARSTEK_MIN_W;
+        let any_pos = plugs.iter().any(|w| *w > threshold);
+        let any_neg = plugs.iter().any(|w| *w < -threshold);
         any_pos && any_neg
     });
 
@@ -1162,7 +1131,7 @@ fn compute_targets(
     // `compute_grid_correction` for the rule.
     let current_total: f64 = eligible.iter().map(|b| b.last_plug_w.unwrap_or(0.0)).sum();
     let grid_correction =
-        compute_grid_correction(grid_w, current_total, eligible.len(), dcfg);
+        compute_grid_correction(grid_w, current_total, eligible.len());
     let desired_total = current_total + grid_correction;
     let charging = desired_total < 0.0;
 
@@ -1368,7 +1337,7 @@ fn compute_targets(
 
 fn queue_pulses(
     state: &AppState,
-    dcfg: &DispatcherConfig,
+    _dcfg: &DispatcherConfig,
     deltas: &HashMap<String, f64>,
     now: Instant,
 ) {
@@ -1402,7 +1371,7 @@ fn queue_pulses(
         // its previous pulse or hit settle_timeout_s before we get here.
 
         let delta = deltas.get(&b.id).copied().unwrap_or(0.0);
-        if delta.abs() < dcfg.deadband_w {
+        if delta.abs() < crate::config::WRITE_DEADBAND_W {
             continue;
         }
 
@@ -1443,131 +1412,114 @@ mod tests {
     /// charging" bug. With current_total = -600 (charging hard) and
     /// grid = +28 (small import), the old code computed
     /// `(28 - 100).max(0) = 0` and held position. The new code
-    /// recognises this as a policy violation and pushes a +128 W
-    /// correction (reduce charging by 128 W → grid lands at -100 W).
+    /// Charging at -600 W, grid imports +28 W = policy violation. With
+    /// SAFETY_MARGIN_W = 10 the dispatcher wants grid to land at -10 W
+    /// (export 10), so the correction is grid - target_grid = 28 - (-10)
+    /// = 38 W → reduce charging by 38 W.
     #[test]
-    fn grid_correction_charging_with_small_import_is_violation() {
-        let cfg = dcfg();
-        // current_total = -600 W, grid = +28 W, bias = 100 W, 2 batt.
-        // idle_threshold = max(50, 50 * 2 / 2) = 50. |-600| > 50 → charging.
-        let corr = compute_grid_correction(28.0, -600.0, 2, &cfg);
-        // raw = 28 + 100 = 128, capped at -current_total = 600.
-        // 128 ≤ 600 → correction = 128.
+    fn grid_correction_charging_with_small_import_reduces_charging() {
+        // current_total = -600 W, grid = +28 W, 2 batteries.
+        // idle_threshold = max(10, 50 * 2 / 2) = 50. |-600| > 50 → charging.
+        let corr = compute_grid_correction(28.0, -600.0, 2);
         assert!(
-            (corr - 128.0).abs() < 1e-6,
-            "expected +128 W correction (= grid+bias), got {corr}"
+            (corr - 38.0).abs() < 1e-6,
+            "expected +38 W correction (= grid - target_grid), got {corr}"
         );
     }
 
-    /// Mirror: discharging with a small export is the same policy
-    /// violation in the other direction.
+    /// Mirror: discharging while exporting → reduce discharging.
     #[test]
-    fn grid_correction_discharging_with_small_export_is_violation() {
-        let cfg = dcfg();
-        let corr = compute_grid_correction(-28.0, 600.0, 2, &cfg);
-        // raw = -28 - 100 = -128, capped at -current_total = -600.
+    fn grid_correction_discharging_with_small_export_reduces_discharging() {
+        // current_total = +600 (discharging), grid = -28 (export).
+        // target_grid = +10. correction = -28 - 10 = -38.
+        let corr = compute_grid_correction(-28.0, 600.0, 2);
         assert!(
-            (corr - (-128.0)).abs() < 1e-6,
-            "expected -128 W correction, got {corr}"
+            (corr - (-38.0)).abs() < 1e-6,
+            "expected -38 W correction, got {corr}"
         );
     }
 
-    /// Violation correction is capped so desired_total can't cross
-    /// zero — a battery dispatching at -100 W shouldn't flip to +200 W
-    /// because of a single +200 W import spike.
+    /// Big import while charging only a little → the correction
+    /// naturally flips the dispatch direction (charging → discharging).
+    /// The user's directive: "richtung umdrehen wenn nötig" (flip if
+    /// needed). No artificial zero-crossing cap.
     #[test]
-    fn grid_correction_violation_capped_at_zero_crossing() {
-        let cfg = dcfg();
-        // current_total = -100 (clearly charging), grid = +200 (heavy
-        // import). Naive correction = 200 + 100 = 300. Capped to
-        // -current_total = 100 → desired_total = 0 (standby), no flip.
-        // With 1 battery: idle_threshold = max(50, 25) = 50. |-100| > 50.
-        let corr = compute_grid_correction(200.0, -100.0, 1, &cfg);
+    fn grid_correction_big_import_flips_charging_to_discharging() {
+        // current_total = -100 W (charging slightly), grid = +500 W
+        // (big import). idle_threshold = 50, |-100| > 50 → charging.
+        // target = -10. correction = 500 - (-10) = 510.
+        // desired_total = -100 + 510 = +410 → flips to discharge.
+        let corr = compute_grid_correction(500.0, -100.0, 1);
         assert!(
-            (corr - 100.0).abs() < 1e-6,
-            "expected correction capped to 100 W, got {corr}"
+            (corr - 510.0).abs() < 1e-6,
+            "expected +510 W correction (flips direction), got {corr}"
         );
     }
 
-    /// Normal case: charging with healthy export. Correction pulls
-    /// grid toward -bias (= 100 W export). Was working before the
-    /// fix; must still work.
+    /// Charging with healthy export → keep charging, pull grid toward
+    /// the export margin (-10 W).
     #[test]
     fn grid_correction_charging_with_big_export_increases_charging() {
-        let cfg = dcfg();
-        // current_total = -1000, grid = -600, bias = 100.
-        // raw = -600 + 100 = -500. Capped at -current_total = 1000.
-        // |abs| = 500 > deadband 50 → correction = -500.
-        let corr = compute_grid_correction(-600.0, -1000.0, 2, &cfg);
+        // current_total = -1000, grid = -600 (600 W export).
+        // target = -10. correction = -600 - (-10) = -590 (charge more).
+        let corr = compute_grid_correction(-600.0, -1000.0, 2);
         assert!(
-            (corr - (-500.0)).abs() < 1e-6,
-            "expected -500 W correction, got {corr}"
+            (corr - (-590.0)).abs() < 1e-6,
+            "expected -590 W correction, got {corr}"
         );
     }
 
-    /// Charging with export already inside the bias band → no action.
+    /// Idle with tiny grid imbalance inside the margin band → hold.
     #[test]
-    fn grid_correction_charging_inside_bias_band_does_nothing() {
-        let cfg = dcfg();
-        // current_total = -1000, grid = -90 (close to bias).
-        // raw = -90 + 100 = 10. |10| < deadband 50 → 0.
-        let corr = compute_grid_correction(-90.0, -1000.0, 2, &cfg);
+    fn grid_correction_idle_inside_margin_holds() {
+        // current_total = -13 (Marstek standby loss, idle), grid = +8.
+        // |grid| <= margin → hold, correction = 0.
+        let corr = compute_grid_correction(8.0, -13.0, 2);
+        assert_eq!(corr, 0.0);
+        let corr = compute_grid_correction(-8.0, -13.0, 2);
         assert_eq!(corr, 0.0);
     }
 
-    /// Regression test for the v0.8.2 "standby loss misread as charging"
-    /// bug. Both batteries idle (plug = -7 W each from inverter standby
-    /// loss only). Grid imports +192 W. With deadband=5 (user-tunable)
-    /// the old code saw current_total = -13 < -5 and concluded "we're
-    /// charging" → zero-crossing cap on the violation correction →
-    /// desired_total = 0 (Standby). Result: grid stuck at +192 W
-    /// indefinitely. The dedicated idle_threshold (= MIN_W * N / 2 = 50
-    /// for 2 batt) correctly classifies this as idle → idle branch →
-    /// pull toward grid = +bias by discharging.
+    /// Regression test for the v0.8.3 "standby loss misread as
+    /// charging" bug. Both batteries idle (plug = -7 W each from
+    /// inverter standby loss only). Grid imports +192 W. The dedicated
+    /// idle_threshold (= MIN_W * N / 2 = 50 for 2 batt) correctly
+    /// classifies -13 W as idle → idle branch → start discharging.
     #[test]
     fn grid_correction_ignores_marstek_standby_loss() {
-        let mut cfg = dcfg();
-        // User config from the field report.
-        cfg.deadband_w = 5.0;
-        cfg.grid_bias_w = 20.0;
-        let corr = compute_grid_correction(192.0, -13.0, 2, &cfg);
-        // idle_threshold = max(5, 50 * 2 / 2) = 50. |-13| < 50 → idle.
-        // idle branch: grid > bias → raw = 192 - 20 = 172. > deadband.
+        let corr = compute_grid_correction(192.0, -13.0, 2);
+        // idle (|-13| < 50). grid > +margin → target = +10.
+        // correction = 192 - 10 = 182.
         assert!(
-            (corr - 172.0).abs() < 1e-6,
-            "expected +172 W discharge correction (idle), got {corr}"
+            (corr - 182.0).abs() < 1e-6,
+            "expected +182 W discharge correction (idle), got {corr}"
         );
     }
 
-    /// Sanity: actual charging (current_total clearly past idle_threshold)
-    /// still triggers the charging branch and its violation rules.
+    /// Sanity: actual charging (current_total clearly past threshold)
+    /// still uses the charging branch.
     #[test]
     fn grid_correction_actively_charging_still_uses_charging_branch() {
-        let cfg = dcfg();
-        // current_total = -800 W (clearly charging, well past threshold
-        // of 50 for any sane battery count). Grid +30 W = violation.
-        let corr = compute_grid_correction(30.0, -800.0, 2, &cfg);
-        // raw = 30 + 100 = 130, capped at -current_total = 800.
+        // current_total = -800 W, grid = +30. target = -10.
+        // correction = 30 - (-10) = 40.
+        let corr = compute_grid_correction(30.0, -800.0, 2);
         assert!(
-            (corr - 130.0).abs() < 1e-6,
-            "expected +130 W correction, got {corr}"
+            (corr - 40.0).abs() < 1e-6,
+            "expected +40 W correction, got {corr}"
         );
     }
 
-    /// Regression test for the v0.8.1 "persistent low-watt import while
-    /// both batteries STANDBY" bug. With 2 batteries at plug≈0 and a
-    /// grid import of +182 W (bias=100 → correction +82, target/battery
-    /// = +41), the naïve equal split puts every battery's setpoint
-    /// below MARSTEK_MIN_W = 50 → `Setpoint::from_signed_watts` rounds
-    /// each to Standby and nothing fires. The consolidation pass must
-    /// detect this and assign the entire ~82 W to ONE battery.
+    /// Regression test for the "small dispatch lost to MIN_W rounding"
+    /// bug. With 3 batteries idle (plug=0) and grid +130 W: target =
+    /// +10, correction = +120 W. Split 3-way that's 40 W per battery
+    /// — every share is below MARSTEK_MIN_W = 50 so
+    /// `Setpoint::from_signed_watts` would round each to Standby and
+    /// nothing fires. The consolidation pass must detect this and
+    /// concentrate the 120 W onto ONE battery.
     #[test]
     fn compute_targets_consolidates_sub_min_w_split_onto_one_battery() {
         let state = three_battery_state();
-        // Two-battery scenario: idle plugs, grid importing 180 W.
-        // (three_battery_state has 3 batteries, but the math is the
-        // same — split across 3 would be 27 W each, still sub-MIN_W.)
-        fresh_grid_snapshot(&state, 180.0);
+        fresh_grid_snapshot(&state, 130.0);
         let now = Instant::now();
         {
             let mut bats = state.batteries.write();
@@ -1577,10 +1529,10 @@ mod tests {
             }
         }
         let dcfg = dcfg();
-        let targets = compute_targets(&state, &dcfg, 180.0, now);
+        let targets = compute_targets(&state, &dcfg, 130.0, now);
 
-        // Total discharge target ≈ 80 W (grid 180 - bias 100). After
-        // consolidation: ONE battery near 80, others at 0.
+        // Total discharge target = grid - margin = 120 W. After
+        // consolidation: ONE battery near 120, others at 0.
         let nonzero: Vec<(&String, &f64)> =
             targets.iter().filter(|(_, t)| t.abs() > 1e-3).collect();
         assert_eq!(
@@ -1594,8 +1546,8 @@ mod tests {
             "{id}: target {t} should be ≥ MARSTEK_MIN_W after consolidation"
         );
         assert!(
-            *t < 100.0,
-            "{id}: target {t} should be ≤ correction ~80, got way more"
+            *t < 150.0,
+            "{id}: target {t} should be ≤ correction ~120, got way more"
         );
     }
 
@@ -1627,17 +1579,15 @@ mod tests {
     }
 
     /// Idle case (plug sum near zero): classic asymmetric bias picks
-    /// the starting direction, deadband filters noise.
+    /// the starting direction, margin (10 W) is the hysteresis band.
     #[test]
-    fn grid_correction_idle_uses_classic_bias() {
-        let cfg = dcfg();
-        // Idle, grid = +200, bias = 100 → raw = 100 → fires, start
-        // discharging.
-        assert!((compute_grid_correction(200.0, 0.0, 2, &cfg) - 100.0).abs() < 1e-6);
-        // Idle, grid = +50 (< bias) → 0, hold.
-        assert_eq!(compute_grid_correction(50.0, 0.0, 2, &cfg), 0.0);
-        // Idle, grid = -300, bias = 100 → raw = -200 → fires, charge.
-        assert!((compute_grid_correction(-300.0, 0.0, 2, &cfg) - (-200.0)).abs() < 1e-6);
+    fn grid_correction_idle_picks_direction_from_grid_sign() {
+        // Idle, grid = +200 → target +10, correction = 190 (discharge).
+        assert!((compute_grid_correction(200.0, 0.0, 2) - 190.0).abs() < 1e-6);
+        // Idle, grid = +5 (< margin) → 0, hold.
+        assert_eq!(compute_grid_correction(5.0, 0.0, 2), 0.0);
+        // Idle, grid = -300 → target -10, correction = -290 (charge).
+        assert!((compute_grid_correction(-300.0, 0.0, 2) - (-290.0)).abs() < 1e-6);
     }
 
     fn make_battery(id: &str, plug_w: f64, max_charge: f64, max_discharge: f64) -> BatteryState {
@@ -2180,11 +2130,11 @@ modbus_host = "192.168.1.93"
         let targets = compute_targets(&state, &dcfg, 1500.0, now);
 
         let sum: f64 = targets.values().sum();
-        // Grid bias of 100 W: corrected import is 1400 W; expect ~1400 W
-        // total discharge spread across 3 batteries.
+        // SAFETY_MARGIN_W = 10 W: target grid = +10, so correction =
+        // 1490 W (= 1500 - 10). Distributed across 3 batteries.
         assert!(
-            (sum - 1400.0).abs() < 1.0,
-            "sum of targets should equal grid - bias, got {sum}"
+            (sum - 1490.0).abs() < 1.0,
+            "sum of targets should equal grid - margin, got {sum}"
         );
         // Each battery gets roughly a third — positive (discharge).
         for (id, t) in &targets {
@@ -2482,5 +2432,339 @@ max_discharge_w = 800
             bats.insert(bs.id.clone(), bs);
         }
         state
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end multi-cycle scenario tests
+    //
+    // These simulate the real dispatcher loop: every cycle we compute
+    // targets, apply them as the new plug readings (modelling the
+    // Marstek as a perfect setpoint follower for the test), and then
+    // recompute grid_w from the energy-balance invariant
+    //     external_load = grid + plug_sum
+    // where `external_load` (= house consumption - PV production) is
+    // held constant across the simulation. Each test verifies that the
+    // dispatcher converges grid_w to the ±SAFETY_MARGIN_W band within
+    // a small number of cycles.
+    //
+    // These are the tests that catch the kind of bug the v0.10 rework
+    // fixed: slow response when sequential dispatch + the 5 s settle
+    // gate meant only one battery per circuit got an updated setpoint
+    // per cycle. With parallel dispatch the same scenarios should
+    // converge in 1-3 cycles.
+    // -----------------------------------------------------------------
+
+    /// Run `cycles` dispatcher iterations starting from whatever state
+    /// the caller seeded. Returns a Vec of (cycle_idx, grid_w,
+    /// plug_sum) snapshots taken AFTER each cycle.
+    fn simulate(
+        state: &std::sync::Arc<AppState>,
+        dcfg: &DispatcherConfig,
+        cycles: usize,
+    ) -> Vec<(usize, f64, f64)> {
+        let mut history = Vec::new();
+        for cycle in 0..cycles {
+            let now = Instant::now();
+            let grid = state
+                .snapshot
+                .load_full()
+                .status
+                .total_act_power
+                .unwrap_or(0.0);
+            let plug_sum_before: f64 = state
+                .batteries
+                .read()
+                .values()
+                .filter_map(|b| b.last_plug_w)
+                .sum();
+            let external_load = grid + plug_sum_before;
+
+            let targets = compute_targets(state, dcfg, grid, now);
+            let plug_sum_after: f64 = targets.values().copied().sum();
+
+            // Marstek model: perfect setpoint follower. The real
+            // Marstek ramps over 1-3 s, but rate_limit_w_per_cycle
+            // (= 500 W default) is what bounds each cycle's change
+            // — and that's already applied inside compute_targets. So
+            // "plug = target" is a faithful simulation of one cycle's
+            // worth of dispatch.
+            {
+                let mut bats = state.batteries.write();
+                for b in bats.values_mut() {
+                    if let Some(t) = targets.get(&b.id).copied() {
+                        b.last_plug_w = Some(t);
+                        b.last_plug_at = Some(now);
+                    }
+                }
+            }
+            // Conservation: external load is constant; the new grid
+            // reading is whatever load isn't covered by the batteries.
+            let new_grid = external_load - plug_sum_after;
+            fresh_grid_snapshot(state, new_grid);
+            history.push((cycle, new_grid, plug_sum_after));
+        }
+        history
+    }
+
+    /// Build a 2-battery test state on a circuit with a fat fuse (no
+    /// circuit-cap interference). Each battery has 2500 W in both
+    /// directions and SoC = 50 % (well clear of any gate / taper).
+    fn two_battery_state() -> std::sync::Arc<AppState> {
+        // Build via TOML — keeps the test in sync with the actual
+        // config schema (defaults + validation) instead of cooking up
+        // a raw struct literal.
+        let cfg: Config = toml::from_str(
+            r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+
+[virtual_shelly]
+
+[management]
+
+[[circuits]]
+id = "c1"
+fuse_amps = 32
+phases = 1
+voltage = 230
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let cfg_circuit = cfg.circuits[0].clone();
+        let state = AppState::from_config(&cfg);
+        let mut a = make_battery("a", 0.0, 2500.0, 2500.0);
+        a.soc_pct = Some(50.0);
+        let mut b = make_battery("b", 0.0, 2500.0, 2500.0);
+        b.soc_pct = Some(50.0);
+        b.address = "127.0.0.2".parse().unwrap();
+        b.plug_url = "http://127.0.0.99".into();
+        {
+            let mut bats = state.batteries.write();
+            bats.insert("a".into(), a);
+            bats.insert("b".into(), b);
+        }
+        // Need a circuit state too — AppState::from_config didn't
+        // build one because batteries are added after the fact.
+        {
+            let mut circuits = state.circuits.write();
+            circuits.insert(
+                "c1".into(),
+                crate::state::CircuitState {
+                    config: cfg_circuit,
+                    member_ids: vec!["a".into(), "b".into()],
+                    silent_until: None,
+                    overload_started_at: None,
+                },
+            );
+        }
+        state
+    }
+
+    fn dcfg_loose() -> DispatcherConfig {
+        // Default config but with the rate_limit lifted high enough
+        // that single-cycle convergence is possible for the scenarios
+        // that don't deliberately test the ramp.
+        let mut d = dcfg();
+        d.rate_limit_w_per_cycle = 9999.0;
+        d
+    }
+
+    // ---- The bug screenshots ----
+
+    /// Field report screenshot #1: grid importing +140 W, both
+    /// batteries charging (a = -242 W, b = -277 W). With sequential
+    /// dispatch this took 30+ s to correct. With parallel dispatch
+    /// the very next cycle's targets land grid at -10 W (the export
+    /// margin).
+    #[test]
+    fn scenario_charging_with_grid_import_converges_in_one_cycle() {
+        let state = two_battery_state();
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(-242.0);
+            bats.get_mut("a").unwrap().last_plug_at = Some(Instant::now());
+            bats.get_mut("b").unwrap().last_plug_w = Some(-277.0);
+            bats.get_mut("b").unwrap().last_plug_at = Some(Instant::now());
+        }
+        fresh_grid_snapshot(&state, 140.0);
+
+        let history = simulate(&state, &dcfg_loose(), 2);
+        let (_, grid_after_first_cycle, _) = history[0];
+        // Target grid is -10 W (charging → 10 W export). With no rate
+        // limit getting in the way, one cycle should land us inside
+        // the margin band.
+        assert!(
+            (grid_after_first_cycle - (-10.0)).abs() < 1.0,
+            "expected grid to land at -10 W after one cycle, got {grid_after_first_cycle}"
+        );
+    }
+
+    /// Field report screenshot #2: idle (~0 W plug sum), grid
+    /// exporting -164 W. Within one cycle we should start charging,
+    /// pulling grid up to -10 W.
+    #[test]
+    fn scenario_idle_with_grid_export_starts_charging_in_one_cycle() {
+        let state = two_battery_state();
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(0.0);
+            bats.get_mut("a").unwrap().last_plug_at = Some(Instant::now());
+            bats.get_mut("b").unwrap().last_plug_w = Some(0.0);
+            bats.get_mut("b").unwrap().last_plug_at = Some(Instant::now());
+        }
+        fresh_grid_snapshot(&state, -164.0);
+
+        let history = simulate(&state, &dcfg_loose(), 2);
+        let (_, grid_after, plug_sum_after) = history[0];
+        assert!(
+            (grid_after - (-10.0)).abs() < 1.0,
+            "expected grid to land at -10 W after one cycle, got {grid_after}"
+        );
+        // The 154 W that grid no longer absorbs has gone into the
+        // batteries → plug_sum should be ≈ -154 (charging).
+        assert!(
+            plug_sum_after < -100.0,
+            "expected batteries to be charging after one cycle, got plug_sum={plug_sum_after}"
+        );
+    }
+
+    /// Discharging while exporting (the mirror violation): reduce
+    /// discharging until grid lands at +10 W (the import margin).
+    #[test]
+    fn scenario_discharging_with_grid_export_converges_in_one_cycle() {
+        let state = two_battery_state();
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(200.0);
+            bats.get_mut("a").unwrap().last_plug_at = Some(Instant::now());
+            bats.get_mut("b").unwrap().last_plug_w = Some(300.0);
+            bats.get_mut("b").unwrap().last_plug_at = Some(Instant::now());
+        }
+        fresh_grid_snapshot(&state, -50.0);
+
+        let history = simulate(&state, &dcfg_loose(), 2);
+        let (_, grid_after, _) = history[0];
+        assert!(
+            (grid_after - 10.0).abs() < 1.0,
+            "expected grid to land at +10 W, got {grid_after}"
+        );
+    }
+
+    /// Direction flip: charging at a tiny -100 W, grid suddenly imports
+    /// +800 W (e.g. a kettle switches on). The reduction goes through
+    /// standby into discharging — the user said "richtung umdrehen wenn
+    /// nötig", and the algorithm does so naturally over two cycles:
+    ///
+    ///   * cycle 1: charging direction at decision time, target grid =
+    ///     -10. Math says "go from -100 to +710" → flip. New grid -10.
+    ///   * cycle 2: now discharging direction, target grid = +10.
+    ///     Trim back from +710 to +690 → grid lands at +10, stable.
+    ///
+    /// Both grid values are inside the ±margin band the whole time
+    /// (never crosses zero into a worse violation), and the dispatch
+    /// is in the right direction (discharging while grid imports).
+    #[test]
+    fn scenario_huge_import_flips_charging_to_discharging() {
+        let state = two_battery_state();
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(-50.0);
+            bats.get_mut("a").unwrap().last_plug_at = Some(Instant::now());
+            bats.get_mut("b").unwrap().last_plug_w = Some(-50.0);
+            bats.get_mut("b").unwrap().last_plug_at = Some(Instant::now());
+        }
+        fresh_grid_snapshot(&state, 800.0);
+
+        let history = simulate(&state, &dcfg_loose(), 3);
+        // After cycle 1 we're already in the margin band (-10 W),
+        // discharging.
+        let (_, grid_1, plug_sum_1) = history[0];
+        assert!(
+            grid_1.abs() < 15.0,
+            "cycle 1: grid should be near zero (within margin), got {grid_1}"
+        );
+        assert!(
+            plug_sum_1 > 0.0,
+            "cycle 1: should have flipped to discharging, got plug_sum={plug_sum_1}"
+        );
+        // By cycle 2 the direction-aware target settles at +10 W
+        // (discharging → import-side margin).
+        let (_, grid_2, plug_sum_2) = history[1];
+        assert!(
+            (grid_2 - 10.0).abs() < 1.0,
+            "cycle 2: grid should land at +10 W, got {grid_2}"
+        );
+        assert!(
+            plug_sum_2 > 0.0,
+            "cycle 2: discharging, got plug_sum={plug_sum_2}"
+        );
+    }
+
+    /// Stable equilibrium: once we've reached grid in the ±margin band
+    /// the dispatcher should HOLD (no oscillation, no bleeding the
+    /// batteries dry just to chase a few watts).
+    #[test]
+    fn scenario_equilibrium_holds_inside_margin() {
+        let state = two_battery_state();
+        // Discharging steadily; grid already at the +10 target.
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(200.0);
+            bats.get_mut("a").unwrap().last_plug_at = Some(Instant::now());
+            bats.get_mut("b").unwrap().last_plug_w = Some(200.0);
+            bats.get_mut("b").unwrap().last_plug_at = Some(Instant::now());
+        }
+        fresh_grid_snapshot(&state, 10.0);
+
+        let history = simulate(&state, &dcfg_loose(), 5);
+        for (cycle, grid, plug_sum) in &history {
+            // Grid should stay within a tight band around +10 W —
+            // tiny jitter is OK, big swings are NOT.
+            assert!(
+                (*grid - 10.0).abs() < 5.0,
+                "cycle {cycle}: grid drifted to {grid} from equilibrium"
+            );
+            // Discharging should hold near the equilibrium plug sum.
+            assert!(
+                (*plug_sum - 400.0).abs() < 50.0,
+                "cycle {cycle}: plug_sum drifted to {plug_sum} from equilibrium ~400"
+            );
+        }
+    }
+
+    /// Rate-limited ramp: idle batteries, sudden big import. The
+    /// rate-limit caps each per-cycle change to 500 W per battery.
+    /// With 2 batteries that's 1000 W/cycle. So a 3000 W import takes
+    /// 3 cycles to fully cover.
+    #[test]
+    fn scenario_rate_limited_ramp_converges_in_three_cycles() {
+        let state = two_battery_state();
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(0.0);
+            bats.get_mut("a").unwrap().last_plug_at = Some(Instant::now());
+            bats.get_mut("b").unwrap().last_plug_w = Some(0.0);
+            bats.get_mut("b").unwrap().last_plug_at = Some(Instant::now());
+        }
+        fresh_grid_snapshot(&state, 3000.0);
+
+        // Default rate_limit_w_per_cycle = 500.
+        let dcfg = dcfg();
+        let history = simulate(&state, &dcfg, 5);
+        // Within 3 cycles grid should land in the margin band.
+        let (_, grid_after_3, _) = history[2];
+        assert!(
+            (grid_after_3 - 10.0).abs() < 30.0,
+            "expected grid near +10 W after 3 cycles under rate-limit, got {grid_after_3}"
+        );
+        // And subsequent cycles must stay there.
+        for (cycle, grid, _) in &history[3..] {
+            assert!(
+                (*grid - 10.0).abs() < 30.0,
+                "cycle {cycle}: grid drifted after converging — {grid}"
+            );
+        }
     }
 }

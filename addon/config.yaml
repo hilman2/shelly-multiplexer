@@ -1,6 +1,6 @@
 ---
 name: Shelly Multiplexer
-version: "0.9.1"
+version: "0.10.0"
 slug: shelly_multiplexer
 description: >-
   Modbus-TCP dispatcher: writes absolute power setpoints to multiple
