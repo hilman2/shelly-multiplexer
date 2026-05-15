@@ -53,6 +53,8 @@ pub async fn run(
         .route("/api/config/section/{name}", put(api_put_section))
         .route("/api/cutoff/{battery_id}/reset", post(api_cutoff_reset))
         .route("/api/health", get(api_health))
+        .route("/api/modbus/debug", get(api_modbus_debug))
+        .route("/api/modbus/decoded/{battery_id}", get(api_modbus_decoded))
         .route("/{*path}", get(serve_static))
         .with_state(ctx);
 
@@ -336,6 +338,102 @@ async fn api_status(State(ctx): State<AdminCtx>) -> impl IntoResponse {
 
 async fn api_health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+/// Modbus traffic + cache snapshot. Returns enough state for the
+/// operator to diagnose why HA's Modbus integration can or can't read
+/// a specific battery: counters per response type + per-battery cache
+/// freshness + the FULL register cache (as `address: u16` pairs) so a
+/// curl/browser can introspect exactly what we'd serve to HA.
+async fn api_modbus_debug(State(ctx): State<AdminCtx>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stats = &ctx.state.modbus_stats;
+    let bats = ctx.state.batteries.read();
+    let now = std::time::Instant::now();
+    let batteries: Vec<Value> = bats
+        .values()
+        .map(|b| {
+            // Sort cache by address so the JSON output is stable.
+            let mut sorted: Vec<(u16, u16)> = b.cached_holding_regs.iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            sorted.sort_unstable_by_key(|(k, _)| *k);
+            let cache: serde_json::Map<String, Value> = sorted
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), Value::from(v)))
+                .collect();
+            json!({
+                "id": b.id,
+                "virtual_unit_id": b.virtual_unit_id,
+                "cache_size": b.cached_holding_regs.len(),
+                "cache_refreshed_age_s": b.cached_regs_refreshed_at
+                    .map(|t| now.saturating_duration_since(t).as_secs_f64()),
+                "last_modbus_setpoint_w": b.last_modbus_setpoint_w,
+                "last_modbus_write_age_s": b.last_modbus_write_at
+                    .map(|t| now.saturating_duration_since(t).as_secs_f64()),
+                "last_modbus_write_error": b.last_modbus_write_error,
+                "cache": cache,
+            })
+        })
+        .collect();
+    Json(json!({
+        "server": {
+            "connections_accepted": stats.server_connections_accepted.load(Relaxed),
+            "requests_total": stats.server_requests_total.load(Relaxed),
+            "requests_ok": stats.server_requests_ok.load(Relaxed),
+            "requests_illegal_address": stats.server_requests_illegal_address.load(Relaxed),
+            "requests_server_busy": stats.server_requests_server_busy.load(Relaxed),
+            "requests_illegal_function": stats.server_requests_illegal_function.load(Relaxed),
+            "requests_gateway_unavailable": stats.server_requests_gateway_unavailable.load(Relaxed),
+        },
+        "outbound": {
+            "reads_total": stats.outbound_reads_total.load(Relaxed),
+            "reads_ok": stats.outbound_reads_ok.load(Relaxed),
+            "reads_failed": stats.outbound_reads_failed.load(Relaxed),
+            "writes_total": stats.outbound_writes_total.load(Relaxed),
+            "writes_ok": stats.outbound_writes_ok.load(Relaxed),
+            "writes_failed": stats.outbound_writes_failed.load(Relaxed),
+        },
+        "batteries": batteries,
+    }))
+}
+
+/// Decoded register view: cached `u16`s turned into typed, scaled,
+/// unit-bearing values per the variant's known register map. Drives
+/// the "Battery details" UI tab — same view HA's ViperRNMC integration
+/// would show, but rendered from our cache.
+async fn api_modbus_decoded(
+    State(ctx): State<AdminCtx>,
+    Path(battery_id): Path<String>,
+) -> Response {
+    let bats = ctx.state.batteries.read();
+    let Some(b) = bats.get(&battery_id) else {
+        return (StatusCode::NOT_FOUND, format!("unknown battery: {battery_id}")).into_response();
+    };
+    let cfg = ctx.config.load_full();
+    // Find the BatteryConfig for the marstek_model — BatteryState
+    // doesn't carry it, the dispatcher reads it from the live config.
+    let model = cfg
+        .batteries
+        .iter()
+        .find(|c| c.id == battery_id)
+        .map(|c| c.marstek_model);
+    let Some(model) = model else {
+        return (StatusCode::NOT_FOUND, format!("battery {battery_id} not in current config"))
+            .into_response();
+    };
+    let decoded = crate::modbus_decode::decode(model, &b.cached_holding_regs);
+    let now = std::time::Instant::now();
+    Json(json!({
+        "battery_id": battery_id,
+        "virtual_unit_id": b.virtual_unit_id,
+        "marstek_model": model,
+        "cache_size": b.cached_holding_regs.len(),
+        "cache_refreshed_age_s": b.cached_regs_refreshed_at
+            .map(|t| now.saturating_duration_since(t).as_secs_f64()),
+        "registers": decoded,
+    }))
+    .into_response()
 }
 
 /// Manual override for the emergency plug cutoff. Re-enables the plug

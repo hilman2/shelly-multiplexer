@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -459,6 +460,31 @@ pub struct AppState {
     /// Throttle for the grid-stale warning so a long real-Shelly outage
     /// doesn't spam the log.
     pub last_grid_stale_warn: Mutex<Option<Instant>>,
+    /// Modbus traffic counters — incremented by `modbus_server.rs`
+    /// (every inbound request) and `modbus.rs` (every outbound op).
+    /// Exposed via `/api/modbus/debug`. Lets the user verify that HA
+    /// is actually reaching the server, see which response types
+    /// dominate, and spot bulk-refresh issues against the bridge.
+    pub modbus_stats: ModbusStats,
+}
+
+#[derive(Debug, Default)]
+pub struct ModbusStats {
+    // -- Inbound (HA → our virtual server) --
+    pub server_requests_total: AtomicU64,
+    pub server_requests_ok: AtomicU64,
+    pub server_requests_illegal_address: AtomicU64,
+    pub server_requests_server_busy: AtomicU64,
+    pub server_requests_illegal_function: AtomicU64,
+    pub server_requests_gateway_unavailable: AtomicU64,
+    pub server_connections_accepted: AtomicU64,
+    // -- Outbound (us → inverter via bridge), aggregated across batteries --
+    pub outbound_reads_total: AtomicU64,
+    pub outbound_reads_ok: AtomicU64,
+    pub outbound_reads_failed: AtomicU64,
+    pub outbound_writes_total: AtomicU64,
+    pub outbound_writes_ok: AtomicU64,
+    pub outbound_writes_failed: AtomicU64,
 }
 
 impl AppState {
@@ -497,6 +523,7 @@ impl AppState {
             circuits: RwLock::new(circuits),
             by_addr,
             by_unit_id,
+            modbus_stats: ModbusStats::default(),
             energy: RwLock::new(EnergyCounters::default()),
             started_at: Instant::now(),
             last_grid_stale_warn: Mutex::new(None),

@@ -38,6 +38,7 @@ use crate::state::AppState;
 #[derive(Clone)]
 struct BatteryProxyService {
     state: Arc<AppState>,
+    debug: bool,
 }
 
 impl tokio_modbus::server::Service for BatteryProxyService {
@@ -49,17 +50,39 @@ impl tokio_modbus::server::Service for BatteryProxyService {
 
     fn call(&self, req: Self::Request) -> Self::Future {
         let state = self.state.clone();
-        Box::pin(async move { handle_request(state, req).await })
+        let debug = self.debug;
+        Box::pin(async move { handle_request(state, req, debug).await })
     }
 }
+
+/// Dedicated tracing target for every line emitted by either modbus
+/// path (inbound server + outbound bulk-refresh / writes). Lets the
+/// user filter with `RUST_LOG=modbus_traffic=debug` or — when
+/// `virtual_modbus.debug = true` is set in the addon config — see
+/// the same lines at INFO level without any RUST_LOG fiddling.
+pub const TRAFFIC_TARGET: &str = "modbus_traffic";
 
 async fn handle_request(
     state: Arc<AppState>,
     req: SlaveRequest<'_>,
+    debug_enabled: bool,
 ) -> Result<Option<Response>, ExceptionCode> {
+    use std::sync::atomic::Ordering::Relaxed;
+    state
+        .modbus_stats
+        .server_requests_total
+        .fetch_add(1, Relaxed);
     let unit = req.slave;
     let Some(battery_id) = state.by_unit_id.get(&unit).cloned() else {
-        debug!(unit, "modbus server: unknown unit id");
+        state
+            .modbus_stats
+            .server_requests_gateway_unavailable
+            .fetch_add(1, Relaxed);
+        log_traffic(
+            debug_enabled,
+            "in/unknown-unit",
+            format_args!("unit={unit} → GatewayPathUnavailable"),
+        );
         return Err(ExceptionCode::GatewayPathUnavailable);
     };
 
@@ -68,25 +91,30 @@ async fn handle_request(
         | Request::ReadInputRegisters(addr, count) => {
             let bats = state.batteries.read();
             let Some(b) = bats.get(&battery_id) else {
+                state
+                    .modbus_stats
+                    .server_requests_gateway_unavailable
+                    .fetch_add(1, Relaxed);
                 return Err(ExceptionCode::GatewayPathUnavailable);
             };
             // Distinguish three failure modes:
-            //   1. cache is COMPLETELY EMPTY → BatteryWriter hasn't
-            //      finished its first bulk-refresh yet (race against
-            //      addon startup). Return ServerDeviceBusy so the HA
-            //      integration retries instead of marking the device
-            //      "not present".
-            //   2. cache has SOME data but not the requested register
-            //      → really not in our covered ranges. Return
-            //      IllegalDataAddress (matches what a real inverter
-            //      returns for unsupported registers).
+            //   1. cache COMPLETELY EMPTY → first bulk-refresh hasn't
+            //      finished yet. Return ServerDeviceBusy so HA retries.
+            //   2. cache has data but not THIS register → not in our
+            //      covered set for the variant. IllegalDataAddress
+            //      (matches what a real inverter returns).
             //   3. all requested registers in cache → serve them.
             if b.cached_holding_regs.is_empty() {
-                debug!(
-                    unit,
-                    battery = %battery_id,
-                    addr, count,
-                    "modbus server: cache empty (waiting for first bulk refresh) — returning ServerDeviceBusy"
+                state
+                    .modbus_stats
+                    .server_requests_server_busy
+                    .fetch_add(1, Relaxed);
+                log_traffic(
+                    debug_enabled,
+                    "in/busy",
+                    format_args!(
+                        "unit={unit} battery={battery_id} read holding {addr}..+{count} → ServerDeviceBusy (cache empty, refresh pending)"
+                    ),
                 );
                 return Err(ExceptionCode::ServerDeviceBusy);
             }
@@ -96,24 +124,31 @@ async fn handle_request(
                 match b.cached_holding_regs.get(&reg) {
                     Some(v) => out.push(*v),
                     None => {
-                        debug!(
-                            battery = %battery_id,
-                            unit,
-                            register = reg,
-                            requested_start = addr,
-                            requested_count = count,
-                            "modbus server: register not in cache"
+                        state
+                            .modbus_stats
+                            .server_requests_illegal_address
+                            .fetch_add(1, Relaxed);
+                        log_traffic(
+                            debug_enabled,
+                            "in/no-such-reg",
+                            format_args!(
+                                "unit={unit} battery={battery_id} read holding {addr}..+{count} → IllegalDataAddress on reg {reg}"
+                            ),
                         );
                         return Err(ExceptionCode::IllegalDataAddress);
                     }
                 }
             }
-            debug!(
-                unit,
-                battery = %battery_id,
-                addr,
-                count,
-                "modbus server: read OK"
+            state
+                .modbus_stats
+                .server_requests_ok
+                .fetch_add(1, Relaxed);
+            log_traffic(
+                debug_enabled,
+                "in/ok",
+                format_args!(
+                    "unit={unit} battery={battery_id} read holding {addr}..+{count} → {out:?}"
+                ),
             );
             Ok(Some(Response::ReadHoldingRegisters(out)))
         }
@@ -126,32 +161,60 @@ async fn handle_request(
         | Request::WriteMultipleRegisters(_, _)
         | Request::MaskWriteRegister(_, _, _)
         | Request::ReadWriteMultipleRegisters(_, _, _, _) => {
-            debug!(
-                unit,
-                battery = %battery_id,
-                "modbus server: write request rejected (we own control)"
+            state
+                .modbus_stats
+                .server_requests_illegal_function
+                .fetch_add(1, Relaxed);
+            log_traffic(
+                debug_enabled,
+                "in/write-refused",
+                format_args!(
+                    "unit={unit} battery={battery_id} write rejected → IllegalFunction (we own control)"
+                ),
             );
             Err(ExceptionCode::IllegalFunction)
         }
-        // Coils + discrete inputs: Marstek doesn't expose any, return
-        // not-implemented so HA fails fast instead of getting garbage.
+        // Coils + discrete inputs: Marstek doesn't expose any.
         Request::ReadCoils(_, _) | Request::ReadDiscreteInputs(_, _) => {
-            debug!(
-                unit,
-                battery = %battery_id,
-                "modbus server: coil/discrete request rejected (Marstek has none)"
+            state
+                .modbus_stats
+                .server_requests_illegal_function
+                .fetch_add(1, Relaxed);
+            log_traffic(
+                debug_enabled,
+                "in/coils-refused",
+                format_args!(
+                    "unit={unit} battery={battery_id} coil/discrete rejected → IllegalFunction (Marstek has none)"
+                ),
             );
             Err(ExceptionCode::IllegalFunction)
         }
         other => {
-            debug!(
-                unit,
-                battery = %battery_id,
-                ?other,
-                "modbus server: unsupported function code"
+            state
+                .modbus_stats
+                .server_requests_illegal_function
+                .fetch_add(1, Relaxed);
+            log_traffic(
+                debug_enabled,
+                "in/unsupported",
+                format_args!(
+                    "unit={unit} battery={battery_id} fc={other:?} → IllegalFunction"
+                ),
             );
             Err(ExceptionCode::IllegalFunction)
         }
+    }
+}
+
+/// Emit a single line into the `modbus_traffic` target. When
+/// `virtual_modbus.debug = true` the line is at INFO (visible at the
+/// addon's default log_level); otherwise at DEBUG. Either way it's
+/// uniquely filterable with `RUST_LOG=modbus_traffic=…`.
+pub fn log_traffic(debug_enabled: bool, kind: &'static str, args: std::fmt::Arguments<'_>) {
+    if debug_enabled {
+        info!(target: TRAFFIC_TARGET, kind, "{}", args);
+    } else {
+        debug!(target: TRAFFIC_TARGET, kind, "{}", args);
     }
 }
 
@@ -184,9 +247,24 @@ pub async fn run(state: Arc<AppState>, config: Arc<arc_swap::ArcSwap<Config>>) -
 
     let service = BatteryProxyService {
         state: state.clone(),
+        debug: cfg.virtual_modbus.debug,
     };
     let server = Server::new(listener);
-    let new_service = move |_socket_addr| Ok(Some(service.clone()));
+    let state_for_accept = state.clone();
+    let debug_for_accept = cfg.virtual_modbus.debug;
+    let new_service = move |sa| {
+        use std::sync::atomic::Ordering::Relaxed;
+        state_for_accept
+            .modbus_stats
+            .server_connections_accepted
+            .fetch_add(1, Relaxed);
+        log_traffic(
+            debug_for_accept,
+            "in/connect",
+            format_args!("new TCP connection from {sa}"),
+        );
+        Ok(Some(service.clone()))
+    };
     let on_connected = move |stream, socket_addr| {
         let new_service = new_service.clone();
         async move { accept_tcp_connection(stream, socket_addr, new_service) }
@@ -249,7 +327,7 @@ virtual_unit_id = 7
             slave: 7,
             request: Request::ReadHoldingRegisters(32104, 2),
         };
-        let resp = handle_request(state, req).await.unwrap();
+        let resp = handle_request(state, req, false).await.unwrap();
         match resp {
             Some(Response::ReadHoldingRegisters(vs)) => assert_eq!(vs, vec![42, 100]),
             other => panic!("expected ReadHoldingRegisters, got {other:?}"),
@@ -263,7 +341,7 @@ virtual_unit_id = 7
             slave: 7,
             request: Request::ReadInputRegisters(32104, 1),
         };
-        let resp = handle_request(state, req).await.unwrap();
+        let resp = handle_request(state, req, false).await.unwrap();
         match resp {
             Some(Response::ReadHoldingRegisters(vs)) => assert_eq!(vs, vec![42]),
             other => panic!("expected ReadHoldingRegisters wrap, got {other:?}"),
@@ -277,7 +355,7 @@ virtual_unit_id = 7
             slave: 99,
             request: Request::ReadHoldingRegisters(32104, 1),
         };
-        let err = handle_request(state, req).await.unwrap_err();
+        let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::GatewayPathUnavailable);
     }
 
@@ -288,7 +366,7 @@ virtual_unit_id = 7
             slave: 7,
             request: Request::ReadHoldingRegisters(50000, 1),
         };
-        let err = handle_request(state, req).await.unwrap_err();
+        let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::IllegalDataAddress);
     }
 
@@ -325,7 +403,7 @@ virtual_unit_id = 7
             slave: 7,
             request: Request::ReadHoldingRegisters(32104, 1),
         };
-        let err = handle_request(state, req).await.unwrap_err();
+        let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::ServerDeviceBusy);
     }
 
@@ -336,7 +414,7 @@ virtual_unit_id = 7
             slave: 7,
             request: Request::WriteSingleRegister(42010, 1),
         };
-        let err = handle_request(state, req).await.unwrap_err();
+        let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::IllegalFunction);
 
         let state = fixture();
@@ -344,7 +422,7 @@ virtual_unit_id = 7
             slave: 7,
             request: Request::WriteMultipleRegisters(42020, std::borrow::Cow::Owned(vec![100])),
         };
-        let err = handle_request(state, req).await.unwrap_err();
+        let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::IllegalFunction);
     }
 
@@ -360,7 +438,7 @@ virtual_unit_id = 7
             // 32104 is cached, 32106 is not (only 32104 + 32105 seeded).
             request: Request::ReadHoldingRegisters(32104, 3),
         };
-        let err = handle_request(state, req).await.unwrap_err();
+        let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::IllegalDataAddress);
     }
 

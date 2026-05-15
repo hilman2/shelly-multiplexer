@@ -87,8 +87,155 @@ document.querySelectorAll("nav button").forEach((btn) => {
     btn.classList.add("active");
     document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
     document.getElementById(`view-${btn.dataset.view}`).classList.add("active");
+    if (btn.dataset.view === "details") {
+      refreshDetails();
+    }
   });
 });
+
+// ----------------------------------------------------------- battery details
+
+let detailsTimer = null;
+
+async function refreshDetails() {
+  try {
+    const dbg = await fetch("/api/modbus/debug").then((r) => r.json());
+    renderModbusStats(dbg);
+    const decodedPerBattery = await Promise.all(
+      (dbg.batteries || []).map(async (b) => {
+        try {
+          return await fetch(`/api/modbus/decoded/${encodeURIComponent(b.id)}`).then((r) =>
+            r.json(),
+          );
+        } catch (e) {
+          return { battery_id: b.id, error: String(e) };
+        }
+      }),
+    );
+    renderBatteryDetails(decodedPerBattery, dbg.batteries || []);
+  } catch (e) {
+    document.getElementById("details-body").innerHTML =
+      `<div class="hint" style="color:var(--err)">debug fetch failed: ${escapeHtml(String(e))}</div>`;
+  }
+  // re-arm only while the tab is active
+  clearTimeout(detailsTimer);
+  if (document.getElementById("view-details").classList.contains("active")) {
+    detailsTimer = setTimeout(refreshDetails, 2000);
+  }
+}
+
+function renderModbusStats(dbg) {
+  const body = document.getElementById("modbus-stats-body");
+  if (!body) return;
+  const s = dbg.server || {};
+  const o = dbg.outbound || {};
+  const okRate = s.requests_total ? ((s.requests_ok / s.requests_total) * 100).toFixed(1) : "–";
+  const outboundOkRate = o.reads_total
+    ? ((o.reads_ok / o.reads_total) * 100).toFixed(1)
+    : "–";
+  body.innerHTML = `
+    <div><div class="label">Connections accepted</div><div class="value">${s.connections_accepted ?? 0}</div></div>
+    <div><div class="label">Server requests (total / ok)</div><div class="value">${s.requests_total ?? 0} / ${s.requests_ok ?? 0} (${okRate}%)</div></div>
+    <div><div class="label">→ IllegalDataAddress</div><div class="value">${s.requests_illegal_address ?? 0}</div></div>
+    <div><div class="label">→ ServerDeviceBusy</div><div class="value">${s.requests_server_busy ?? 0}</div></div>
+    <div><div class="label">→ IllegalFunction</div><div class="value">${s.requests_illegal_function ?? 0}</div></div>
+    <div><div class="label">→ GatewayPathUnavailable</div><div class="value">${s.requests_gateway_unavailable ?? 0}</div></div>
+    <div><div class="label">Outbound reads (total / ok)</div><div class="value">${o.reads_total ?? 0} / ${o.reads_ok ?? 0} (${outboundOkRate}%)</div></div>
+    <div><div class="label">Outbound reads failed</div><div class="value">${o.reads_failed ?? 0}</div></div>
+    <div><div class="label">Outbound writes (total / ok / fail)</div><div class="value">${o.writes_total ?? 0} / ${o.writes_ok ?? 0} / ${o.writes_failed ?? 0}</div></div>
+  `;
+}
+
+function renderBatteryDetails(decodedList, dbgBatteries) {
+  const body = document.getElementById("details-body");
+  if (!body) return;
+  if (decodedList.length === 0) {
+    body.innerHTML = '<div class="hint">no batteries configured</div>';
+    return;
+  }
+  const dbgById = Object.fromEntries(dbgBatteries.map((b) => [b.id, b]));
+  body.innerHTML = decodedList
+    .map((d) => {
+      const dbg = dbgById[d.battery_id] || {};
+      if (d.error) {
+        return `<div class="card"><h3>${escapeHtml(d.battery_id)}</h3>
+          <div class="hint" style="color:var(--err)">${escapeHtml(d.error)}</div></div>`;
+      }
+      const sections = {};
+      (d.registers || []).forEach((r) => {
+        if (!sections[r.section]) sections[r.section] = [];
+        sections[r.section].push(r);
+      });
+      const sectionOrder = [
+        "Battery",
+        "AC Grid",
+        "AC Off-grid",
+        "MPPT",
+        "Energy",
+        "Temperature",
+        "Cells",
+        "State",
+        "Control",
+        "BMS",
+        "Connectivity",
+        "Metadata",
+      ];
+      const sectionHtml = sectionOrder
+        .filter((name) => sections[name])
+        .map((name) => {
+          const rows = sections[name]
+            .map(
+              (r) => `
+            <tr>
+              <td class="reg-name">${escapeHtml(r.name)}</td>
+              <td class="reg-value">${formatRegisterValue(r)}</td>
+              <td class="reg-addr"><code>${r.address}</code></td>
+            </tr>`,
+            )
+            .join("");
+          return `
+            <details open class="register-section">
+              <summary><strong>${escapeHtml(name)}</strong> <small>(${sections[name].length})</small></summary>
+              <table class="register-table"><tbody>${rows}</tbody></table>
+            </details>`;
+        })
+        .join("");
+      const age = dbg.cache_refreshed_age_s;
+      const ageLabel =
+        age == null ? "never refreshed" : `${age.toFixed(1)} s ago`;
+      return `
+        <div class="card">
+          <h3>
+            ${escapeHtml(d.battery_id)}
+            <span class="mode-pill">${escapeHtml(d.marstek_model || "")}</span>
+            <span class="mode-pill" title="virtual Modbus unit ID HA reads under">unit ${dbg.virtual_unit_id ?? "?"}</span>
+          </h3>
+          <p class="hint">Cache: ${dbg.cache_size ?? 0} registers · refreshed ${escapeHtml(ageLabel)}</p>
+          ${sectionHtml || '<div class="hint">no decoded sections yet</div>'}
+        </div>`;
+    })
+    .join("");
+}
+
+function formatRegisterValue(r) {
+  if (r.value === null || r.value === undefined) {
+    return `<span class="hint">–</span>`;
+  }
+  if (typeof r.value === "number") {
+    const formatted = Number.isInteger(r.value) ? r.value : r.value.toFixed(4).replace(/\.?0+$/, "");
+    return `<strong>${formatted}</strong>${r.unit ? ` <small>${escapeHtml(r.unit)}</small>` : ""}`;
+  }
+  return `<strong>${escapeHtml(String(r.value))}</strong>`;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 // ----------------------------------------------------------- status
 

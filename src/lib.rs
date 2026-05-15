@@ -4,6 +4,7 @@ pub mod ha;
 pub mod http_admin;
 pub mod http_shelly;
 pub mod modbus;
+pub mod modbus_decode;
 pub mod modbus_server;
 pub mod mdns;
 pub mod plug;

@@ -293,3 +293,18 @@ code {
   nav { padding: 6px 12px; }
   nav button { padding: 6px 10px; font-size: 12px; }
 }
+
+/* battery details tab */
+.register-section { margin: 10px 0; }
+.register-section summary { cursor: pointer; padding: 4px 0; font-size: 13px; color: var(--fg-faint); }
+.register-section summary strong { color: var(--fg); }
+.register-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+.register-table td { padding: 4px 8px; border-bottom: 1px solid var(--bg-card); font-size: 13px; }
+.register-table td.reg-name { color: var(--fg-faint); width: 40%; font-family: monospace; font-size: 12px; }
+.register-table td.reg-value { text-align: right; }
+.register-table td.reg-value strong { color: var(--accent); font-weight: 600; }
+.register-table td.reg-value small { color: var(--fg-faint); margin-left: 4px; }
+.register-table td.reg-addr { width: 60px; text-align: right; color: var(--fg-faint); }
+.register-table td.reg-addr code { font-size: 11px; }
+#modbus-stats-body .label { color: var(--fg-faint); font-size: 11px; }
+#modbus-stats-body .value { font-size: 16px; font-weight: 600; color: var(--accent); }
