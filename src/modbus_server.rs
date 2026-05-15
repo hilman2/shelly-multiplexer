@@ -70,10 +70,26 @@ async fn handle_request(
             let Some(b) = bats.get(&battery_id) else {
                 return Err(ExceptionCode::GatewayPathUnavailable);
             };
-            // Pull each requested register from the cache. Any missing
-            // address → IllegalDataAddress so the HA integration sees
-            // the same exception it would get from a real inverter that
-            // doesn't expose that register on this variant.
+            // Distinguish three failure modes:
+            //   1. cache is COMPLETELY EMPTY → BatteryWriter hasn't
+            //      finished its first bulk-refresh yet (race against
+            //      addon startup). Return ServerDeviceBusy so the HA
+            //      integration retries instead of marking the device
+            //      "not present".
+            //   2. cache has SOME data but not the requested register
+            //      → really not in our covered ranges. Return
+            //      IllegalDataAddress (matches what a real inverter
+            //      returns for unsupported registers).
+            //   3. all requested registers in cache → serve them.
+            if b.cached_holding_regs.is_empty() {
+                debug!(
+                    unit,
+                    battery = %battery_id,
+                    addr, count,
+                    "modbus server: cache empty (waiting for first bulk refresh) — returning ServerDeviceBusy"
+                );
+                return Err(ExceptionCode::ServerDeviceBusy);
+            }
             let mut out = Vec::with_capacity(count as usize);
             for offset in 0..count {
                 let reg = addr.wrapping_add(offset);
@@ -84,12 +100,21 @@ async fn handle_request(
                             battery = %battery_id,
                             unit,
                             register = reg,
+                            requested_start = addr,
+                            requested_count = count,
                             "modbus server: register not in cache"
                         );
                         return Err(ExceptionCode::IllegalDataAddress);
                     }
                 }
             }
+            debug!(
+                unit,
+                battery = %battery_id,
+                addr,
+                count,
+                "modbus server: read OK"
+            );
             Ok(Some(Response::ReadHoldingRegisters(out)))
         }
         // Every write function: refuse. We own the inverter; letting
@@ -111,9 +136,22 @@ async fn handle_request(
         // Coils + discrete inputs: Marstek doesn't expose any, return
         // not-implemented so HA fails fast instead of getting garbage.
         Request::ReadCoils(_, _) | Request::ReadDiscreteInputs(_, _) => {
+            debug!(
+                unit,
+                battery = %battery_id,
+                "modbus server: coil/discrete request rejected (Marstek has none)"
+            );
             Err(ExceptionCode::IllegalFunction)
         }
-        _ => Err(ExceptionCode::IllegalFunction),
+        other => {
+            debug!(
+                unit,
+                battery = %battery_id,
+                ?other,
+                "modbus server: unsupported function code"
+            );
+            Err(ExceptionCode::IllegalFunction)
+        }
     }
 }
 
@@ -252,6 +290,43 @@ virtual_unit_id = 7
         };
         let err = handle_request(state, req).await.unwrap_err();
         assert_eq!(err, ExceptionCode::IllegalDataAddress);
+    }
+
+    /// Empty cache (= addon just started, first bulk refresh hasn't
+    /// completed yet) → ServerDeviceBusy so HA retries rather than
+    /// concluding the device is missing.
+    #[tokio::test]
+    async fn empty_cache_yields_server_device_busy() {
+        // Build a state where battery has unit_id 7 but no cached regs
+        // (skip the fixture's seed-the-cache step).
+        let cfg_str = r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+[virtual_shelly]
+[management]
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+[[batteries]]
+id = "a"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+modbus_host = "192.168.1.91"
+virtual_unit_id = 7
+"#;
+        let cfg: Config = toml::from_str(cfg_str).unwrap();
+        cfg.validate().unwrap();
+        let state = AppState::from_config(&cfg);
+        let req = SlaveRequest {
+            slave: 7,
+            request: Request::ReadHoldingRegisters(32104, 1),
+        };
+        let err = handle_request(state, req).await.unwrap_err();
+        assert_eq!(err, ExceptionCode::ServerDeviceBusy);
     }
 
     #[tokio::test]
