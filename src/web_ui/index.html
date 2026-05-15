@@ -40,6 +40,7 @@
   <nav>
     <button data-view="status" class="active">Status</button>
     <button data-view="batteries">Circuits &amp; Batteries</button>
+    <button data-view="details">Battery details</button>
     <button data-view="config">Configuration</button>
   </nav>
 
@@ -168,6 +169,36 @@
           <button type="button" class="secondary" id="btn-add-battery">+ Add battery</button>
           <button type="button" class="primary" id="btn-save-batteries">Save batteries</button>
           <span class="form-status" id="status-batteries"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ BATTERY DETAILS VIEW ============================ -->
+    <section id="view-details" class="view">
+      <div class="card">
+        <h2>Battery details</h2>
+        <p class="hint">
+          Decoded Modbus telemetry per battery — same view HA's
+          Marstek-Modbus integration shows you, rendered from our
+          cache. Refreshes every <strong>2 s</strong>. Sections in
+          the order their data lives on the inverter: metadata,
+          connectivity, battery DC, AC grid, AC off-grid, energy,
+          temperature, cells, state, control, BMS.
+        </p>
+        <div id="details-body">
+          <div class="hint">Loading…</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Modbus traffic stats</h3>
+        <p class="hint">
+          Counters since addon start. HA's integration shows up here
+          as <code>requests_*</code>. Outbound is our bulk-refresh
+          against the inverter via the RS485 bridge.
+        </p>
+        <div class="form-grid" id="modbus-stats-body">
+          <div class="hint" style="grid-column:1/-1">Loading…</div>
         </div>
       </div>
     </section>
@@ -377,6 +408,10 @@
             <label>Slow refresh (ms)
               <input name="slow_refresh_ms" type="number" min="1000" max="600000" step="100">
               <small style="color:var(--fg-faint);font-size:11px">metadata, schedules, energy counters, BMS limits, per-cell voltages. 60000 = every 60 s</small>
+            </label>
+            <label class="checkbox">
+              <input name="debug" type="checkbox">
+              <span>Verbose traffic logs (every request/response at INFO under target <code>modbus_traffic</code>)</span>
             </label>
           </div>
           <div class="form-actions">

@@ -679,6 +679,7 @@ impl ModbusDispatch {
                 rx: sp_rx,
                 shutdown: shutdown_rx,
                 state: state.clone(),
+                debug_modbus: cfg.virtual_modbus.debug,
                 last_written: None,
                 last_write_at: None,
                 soc_interval: Duration::from_millis(b.soc_interval_ms.max(1_000)),
@@ -795,6 +796,9 @@ struct BatteryWriter {
     rx: watch::Receiver<Setpoint>,
     shutdown: mpsc::Receiver<()>,
     state: Arc<AppState>,
+    /// Mirror of `virtual_modbus.debug` so we can log outbound modbus
+    /// traffic at the same level as the server logs its inbound side.
+    debug_modbus: bool,
     last_written: Option<Setpoint>,
     last_write_at: Option<Instant>,
     /// Upper bound on how often we re-read SoC (and battery_power).
@@ -992,11 +996,16 @@ impl BatteryWriter {
         ctx_slot: &mut Option<tokio_modbus::client::Context>,
         sp: Setpoint,
     ) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         // Retry budget applies here so a single connect blip doesn't
         // cause a missed setpoint update — without dropping the
         // connection lifecycle benefit.
         let max_attempts = write_retries().saturating_add(1);
         let mut last_err: Option<anyhow::Error> = None;
+        self.state
+            .modbus_stats
+            .outbound_writes_total
+            .fetch_add(1, Relaxed);
         for attempt in 1..=max_attempts {
             let ctx = match self.ensure_conn(ctx_slot).await {
                 Ok(c) => c,
@@ -1009,8 +1018,19 @@ impl BatteryWriter {
             };
             match write_setpoint_on(ctx, sp).await {
                 Ok(()) => {
+                    self.state
+                        .modbus_stats
+                        .outbound_writes_ok
+                        .fetch_add(1, Relaxed);
                     self.record_success(sp);
-                    debug!(battery = %self.battery.id, ?sp, "setpoint written");
+                    crate::modbus_server::log_traffic(
+                        self.debug_modbus,
+                        "out/write-ok",
+                        format_args!(
+                            "battery={} setpoint={sp:?} attempt={attempt}",
+                            self.battery.id
+                        ),
+                    );
                     // Piggyback SoC if due. A failure here is logged
                     // but doesn't roll back the successful write.
                     if self.soc_poll_due() {
@@ -1034,9 +1054,20 @@ impl BatteryWriter {
                 }
             }
         }
+        self.state
+            .modbus_stats
+            .outbound_writes_failed
+            .fetch_add(1, Relaxed);
         let err = last_err.unwrap_or_else(|| anyhow!("write_setpoint exhausted retries"));
         self.record_error(format!("write: {err:#}"));
-        debug!(battery = %self.battery.id, error = %err, "modbus write failed");
+        crate::modbus_server::log_traffic(
+            self.debug_modbus,
+            "out/write-fail",
+            format_args!(
+                "battery={} setpoint failed after {max_attempts} attempts: {err:#}",
+                self.battery.id
+            ),
+        );
         Err(err)
     }
 
@@ -1109,12 +1140,15 @@ impl BatteryWriter {
         ctx_slot: &mut Option<tokio_modbus::client::Context>,
         tier: Tier,
     ) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         let model = self.battery.marstek_model;
         let regs = match tier {
             Tier::Fast => model.fast_registers(),
             Tier::Slow => model.slow_registers(),
         };
+        let debug_enabled = self.debug_modbus;
         let mut collected: HashMap<u16, u16> = HashMap::new();
+        let mut failed: Vec<u16> = Vec::new();
         let mut connection_dead = false;
         for reg in regs {
             let ctx = match self.ensure_conn(ctx_slot).await {
@@ -1124,28 +1158,49 @@ impl BatteryWriter {
                     break;
                 }
             };
+            self.state
+                .modbus_stats
+                .outbound_reads_total
+                .fetch_add(1, Relaxed);
             match read_holding_on(ctx, *reg, 1).await {
                 Ok(values) => {
+                    self.state
+                        .modbus_stats
+                        .outbound_reads_ok
+                        .fetch_add(1, Relaxed);
                     if let Some(v) = values.first() {
                         collected.insert(*reg, *v);
                     }
                 }
                 Err(e) => {
-                    // Either the variant doesn't expose this address
-                    // (Modbus exception 0x02), or it's a transient bus
-                    // error. Either way: skip this register, keep
-                    // going. If the connection is actually dead, the
-                    // NEXT ensure_conn will tell us and we'll bail.
-                    debug!(
-                        battery = %self.battery.id,
-                        register = *reg,
-                        ?tier,
-                        error = %e,
-                        "register read failed — skipping"
+                    self.state
+                        .modbus_stats
+                        .outbound_reads_failed
+                        .fetch_add(1, Relaxed);
+                    failed.push(*reg);
+                    crate::modbus_server::log_traffic(
+                        debug_enabled,
+                        "out/read-fail",
+                        format_args!(
+                            "battery={} {:?} reg={} → {}",
+                            self.battery.id, tier, *reg, e
+                        ),
                     );
                 }
             }
         }
+        crate::modbus_server::log_traffic(
+            debug_enabled,
+            "out/refresh-summary",
+            format_args!(
+                "battery={} {:?} refresh: {} ok / {} fail ({} regs in cache after merge)",
+                self.battery.id,
+                tier,
+                collected.len(),
+                failed.len(),
+                collected.len()
+            ),
+        );
         if collected.is_empty() {
             if connection_dead {
                 drop_ctx(ctx_slot).await;

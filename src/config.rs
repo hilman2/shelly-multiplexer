@@ -87,6 +87,15 @@ pub struct VirtualModbusConfig {
     /// the Marstek app. Bigger payload (~30-80 reads) but spreads out.
     #[serde(default = "default_virtual_modbus_slow_refresh")]
     pub slow_refresh_ms: u64,
+    /// Verbose modbus-traffic logging. When `true`, every inbound
+    /// server request (HA → us) and outbound inverter operation
+    /// (us → bridge) emits an INFO-level log line under target
+    /// `modbus_traffic`. Lets the user diagnose HA integration
+    /// problems by tailing the addon log. Off by default — the
+    /// `/api/modbus/debug` endpoint always exposes counters + the
+    /// per-battery cache snapshot regardless of this toggle.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 impl Default for VirtualModbusConfig {
@@ -96,6 +105,7 @@ impl Default for VirtualModbusConfig {
             bind_address: default_virtual_modbus_bind(),
             bulk_refresh_ms: default_virtual_modbus_fast_refresh(),
             slow_refresh_ms: default_virtual_modbus_slow_refresh(),
+            debug: false,
         }
     }
 }
