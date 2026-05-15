@@ -1,9 +1,9 @@
 [package]
 name = "shelly-multiplexer"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.87"
-description = "Modbus-TCP dispatcher steering multiple Marstek Venus batteries with per-battery Shelly Plug PM Gen3 feedback (pulse-mode CT emulation kept as legacy path)"
+description = "Modbus-TCP dispatcher steering multiple Marstek Venus batteries with per-battery Shelly Plug PM Gen3 feedback; exposes a Modbus-TCP cache server so HA integrations keep working while we own the Marstek's only Modbus slot"
 license = "Apache-2.0"
 
 [dependencies]
@@ -31,7 +31,7 @@ local-ip-address = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 scopeguard = "1.2"
-tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
+tokio-modbus = { version = "0.17", default-features = false, features = ["tcp", "tcp-server"] }
 sunrise = "3"
 
 [profile.release]

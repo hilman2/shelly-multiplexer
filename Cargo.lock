@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "shelly-multiplexer"
-version = "0.8.3"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1817,6 +1817,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "log",
+ "socket2 0.6.3",
  "thiserror",
  "tokio",
  "tokio-util",

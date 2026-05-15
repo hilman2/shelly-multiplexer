@@ -13,7 +13,8 @@ use shelly_multiplexer::config::{Config, DispatchMode};
 use shelly_multiplexer::modbus::ModbusDispatch;
 use shelly_multiplexer::state::AppState;
 use shelly_multiplexer::{
-    dispatcher, ha, http_admin, http_shelly, mdns, modbus, plug, real_shelly, virtual_shelly,
+    dispatcher, ha, http_admin, http_shelly, mdns, modbus, modbus_server, plug, real_shelly,
+    virtual_shelly,
 };
 
 #[derive(Parser, Debug)]
@@ -186,6 +187,15 @@ async fn main() -> Result<()> {
         tasks.spawn(async move {
             let r = modbus::run(s, c).await;
             log_task_exit("modbus", r);
+        });
+    }
+
+    {
+        let s = state.clone();
+        let c = cfg_swap.clone();
+        tasks.spawn(async move {
+            let r = modbus_server::run(s, c).await;
+            log_task_exit("modbus_server", r);
         });
     }
 

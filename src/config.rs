@@ -21,6 +21,12 @@ pub struct Config {
     pub home_assistant: HomeAssistantConfig,
     #[serde(default)]
     pub location: LocationConfig,
+    /// Re-publish each battery's Modbus telemetry on a virtual Modbus
+    /// TCP server we host ourselves. Lets HA's existing Marstek-Modbus
+    /// integrations keep working even though we now own the inverters'
+    /// single Modbus slot.
+    #[serde(default)]
+    pub virtual_modbus: VirtualModbusConfig,
     #[serde(default)]
     pub circuits: Vec<CircuitConfig>,
     #[serde(default)]
@@ -36,6 +42,81 @@ pub struct LocationConfig {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
 }
+
+// ---------------------------------------------------------------------------
+// Virtual Modbus server (re-publish telemetry so HA integrations keep working)
+// ---------------------------------------------------------------------------
+
+/// We hold a persistent Modbus TCP connection to each Marstek (via its
+/// RS485-to-LAN bridge) for setpoint writes + SoC reads. Most Marstek
+/// variants — and definitely the RS485 bridges — only accept ONE Modbus
+/// client at a time, so a user's existing HA Modbus integration that
+/// used to read from the bridge directly now gets blocked.
+///
+/// This server fixes that: every `bulk_refresh_ms` we read a range of
+/// the inverter's holding registers via the connection we already own
+/// and cache the raw u16 values per battery. The server listens on
+/// `bind_address` and serves cached values for any read in the covered
+/// ranges. Writes are rejected (ILLEGAL_FUNCTION) — we own setpoint
+/// control, HA shouldn't accidentally write conflicting commands.
+///
+/// Per-battery routing uses Modbus unit IDs: each battery's
+/// `virtual_unit_id` (default = `index + 1`) becomes the unit ID HA
+/// has to talk to. Unit IDs must be unique across the configured
+/// batteries; the original `modbus_unit_id` (per-bridge) is unrelated.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VirtualModbusConfig {
+    #[serde(default = "default_virtual_modbus_enabled")]
+    pub enabled: bool,
+    /// Bind address (host:port). Default 1502 — non-privileged port, no
+    /// CAP_NET_BIND_SERVICE needed. Override to 502 if your HA
+    /// integration insists on the standard port and the addon has
+    /// capability granted.
+    #[serde(default = "default_virtual_modbus_bind")]
+    pub bind_address: String,
+    /// How often we refresh the cached register block (ms). Bulk-read
+    /// happens on the BatteryWriter's existing connection, so this is
+    /// effectively the freshness ceiling for HA telemetry.
+    #[serde(default = "default_virtual_modbus_refresh")]
+    pub bulk_refresh_ms: u64,
+}
+
+impl Default for VirtualModbusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_virtual_modbus_enabled(),
+            bind_address: default_virtual_modbus_bind(),
+            bulk_refresh_ms: default_virtual_modbus_refresh(),
+        }
+    }
+}
+
+fn default_virtual_modbus_enabled() -> bool {
+    true
+}
+fn default_virtual_modbus_bind() -> String {
+    "0.0.0.0:1502".into()
+}
+fn default_virtual_modbus_refresh() -> u64 {
+    // Marstek inverters publish slow-moving signals (SoC, voltage,
+    // energy counters) so 5 s is plenty fresh for HA dashboards while
+    // costing us only ~2 Modbus round-trips per battery per refresh.
+    5_000
+}
+
+/// Register ranges we bulk-read on every refresh. Picked to cover the
+/// holding-register addresses every Marstek variant in the ViperRNMC
+/// integration uses (status, AC/DC, energy counters, SoC, BMS cutoffs,
+/// control registers). 125-register chunk size is the Modbus protocol
+/// maximum per request.
+pub const BULK_READ_RANGES: &[(u16, u16)] = &[
+    (30000, 125), // 30000..30124 — most variants' status block
+    (32100, 125), // 32100..32224 — v1/v2 SoC + power + energy
+    (34000, 125), // 34000..34124 — v3 SoC + status
+    (42000, 30),  // 42000..42029 — RS485 control + force_mode + setpoints
+    (43000, 10),  // 43000..43009 — user_work_mode + related
+    (44000, 10),  // 44000..44009 — BMS charging/discharging cutoffs
+];
 
 // ---------------------------------------------------------------------------
 // Real Shelly (grid measurement source)
@@ -453,6 +534,14 @@ pub struct BatteryConfig {
     /// Modbus unit / slave ID (default 1).
     #[serde(default = "default_modbus_unit_id")]
     pub modbus_unit_id: u8,
+    /// Unit ID this battery will be exposed under on our own virtual
+    /// Modbus TCP server (see `[virtual_modbus]`). HA's existing
+    /// Marstek-Modbus integration just re-points its host at us and
+    /// uses this unit ID per battery. Must be unique across all
+    /// configured batteries. `None` = derive from the battery's index
+    /// (index + 1).
+    #[serde(default)]
+    pub virtual_unit_id: Option<u8>,
     /// SoC poll interval.
     #[serde(default = "default_soc_interval_ms")]
     pub soc_interval_ms: u64,
@@ -635,6 +724,15 @@ impl BatteryConfig {
     /// (where SoC came from the now-removed Local API): the file still
     /// loads, but until the user adds `soc_entity_id` or `modbus_host`
     /// the affected battery just sits idle.
+    /// Effective virtual Modbus unit ID. Either the explicit
+    /// `virtual_unit_id` from the TOML, or `index + 1` as a fallback
+    /// (so the first battery in the file gets unit 1, second unit 2,
+    /// etc.).
+    pub fn effective_virtual_unit_id(&self, index: usize) -> u8 {
+        self.virtual_unit_id
+            .unwrap_or_else(|| (index + 1).min(247) as u8)
+    }
+
     pub fn has_soc_source(&self, ha_enabled: bool) -> bool {
         if ha_enabled {
             self.soc_entity_id
@@ -886,6 +984,45 @@ impl Config {
         if self.real_shelly.poll_interval_ms == 0 {
             anyhow::bail!("real_shelly.poll_interval_ms must be > 0");
         }
+
+        // Virtual Modbus server validation
+        if self.virtual_modbus.enabled {
+            if self.virtual_modbus.bulk_refresh_ms == 0 {
+                anyhow::bail!("virtual_modbus.bulk_refresh_ms must be > 0");
+            }
+            self.virtual_modbus
+                .bind_address
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| {
+                    format!(
+                        "virtual_modbus.bind_address `{}` is not a valid SocketAddr (expected host:port)",
+                        self.virtual_modbus.bind_address
+                    )
+                })?;
+            // Unit-ID uniqueness across batteries. The effective unit ID
+            // is either the explicit `virtual_unit_id` or the index+1
+            // fallback — both share one namespace.
+            let mut seen_units = std::collections::HashSet::new();
+            for (idx, b) in self.batteries.iter().enumerate() {
+                let unit = b.effective_virtual_unit_id(idx);
+                if unit == 0 {
+                    anyhow::bail!(
+                        "battery {}: virtual_unit_id must be in 1..=247 (got {})",
+                        b.id,
+                        unit
+                    );
+                }
+                if !seen_units.insert(unit) {
+                    anyhow::bail!(
+                        "battery {}: virtual_unit_id {} clashes with another battery — \
+                         every battery needs a unique unit ID on the virtual Modbus server",
+                        b.id,
+                        unit
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }

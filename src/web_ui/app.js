@@ -543,6 +543,7 @@ function addBatteryCard(b = {}) {
       <label class="soc-modbus">modbus_host — IP of the RS485-to-LAN bridge (Waveshare / EW11 / DR134 / M5Stack). On Venus E V3 with Ethernet cable, use the same value as "address". Leave blank to keep the battery inactive.<input data-f="modbus_host" type="text" placeholder="e.g. 192.168.1.91" value="${escapeAttr(b.modbus_host || "")}"></label>
       <label class="soc-modbus">modbus_port<input data-f="modbus_port" type="number" min="1" max="65535" value="${b.modbus_port ?? 502}"></label>
       <label class="soc-modbus">modbus_unit_id<input data-f="modbus_unit_id" type="number" min="1" max="255" value="${b.modbus_unit_id ?? 1}"></label>
+      <label class="soc-modbus">virtual_unit_id (HA reads this battery under this unit ID on our virtual Modbus server; blank = index+1)<input data-f="virtual_unit_id" type="number" min="1" max="247" value="${b.virtual_unit_id == null ? "" : b.virtual_unit_id}"></label>
       <label>soc_interval_ms<input data-f="soc_interval_ms" type="number" min="1000" max="600000" value="${b.soc_interval_ms ?? 30000}"></label>
       <label>soc_full_pct (override; blank = dispatcher default)<input data-f="soc_full_pct" type="number" min="0" max="100" step="any" value="${b.soc_full_pct == null ? "" : b.soc_full_pct}"></label>
       <label>soc_empty_pct (override; blank = dispatcher default)<input data-f="soc_empty_pct" type="number" min="0" max="100" step="any" value="${b.soc_empty_pct == null ? "" : b.soc_empty_pct}"></label>
@@ -619,6 +620,8 @@ function readBatteries() {
       modbus_unit_id: num("modbus_unit_id") ?? 1,
       soc_interval_ms: num("soc_interval_ms") ?? 30000,
     };
+    const vUnit = num("virtual_unit_id");
+    if (vUnit != null) out.virtual_unit_id = vUnit;
     const mbHost = get("modbus_host");
     if (mbHost) out.modbus_host = mbHost;
     const ent = get("soc_entity_id");
