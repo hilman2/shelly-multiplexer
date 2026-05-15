@@ -104,15 +104,23 @@ fn default_virtual_modbus_refresh() -> u64 {
     5_000
 }
 
-/// Register ranges we bulk-read on every refresh. Picked to cover the
-/// holding-register addresses every Marstek variant in the ViperRNMC
-/// integration uses (status, AC/DC, energy counters, SoC, BMS cutoffs,
-/// control registers). 125-register chunk size is the Modbus protocol
-/// maximum per request.
+/// Register ranges we bulk-read on every refresh. Aims to cover every
+/// holding-register address the ViperRNMC integration's variant YAMLs
+/// (`e_v12.yaml`, `e_v3.yaml`, `d.yaml`, `a.yaml`) might reference —
+/// inverter status, AC/DC, energy counters, SoC, BMS state, control
+/// registers. 125-register chunk size is the Modbus protocol maximum
+/// per request, and we issue these sequentially against the existing
+/// persistent connection so the bridge sees the same pace as before.
 pub const BULK_READ_RANGES: &[(u16, u16)] = &[
-    (30000, 125), // 30000..30124 — most variants' status block
-    (32100, 125), // 32100..32224 — v1/v2 SoC + power + energy
-    (34000, 125), // 34000..34124 — v3 SoC + status
+    (30000, 125), // 30000..30124 — status block (every variant)
+    (30125, 125), // 30125..30249 — continuation
+    (31000, 125), // 31000..31124 — AC / inverter telemetry on some variants
+    (32000, 100), // 32000..32099 — gap-filler before 32100
+    (32100, 125), // 32100..32224 — V1/V2 SoC + power + energy
+    (32225, 75),  // 32225..32299 — V1/V2 tail
+    (33000, 125), // 33000..33124 — energy counters / daily stats
+    (34000, 125), // 34000..34124 — V3 SoC + status
+    (34125, 75),  // 34125..34199 — V3 tail
     (42000, 30),  // 42000..42029 — RS485 control + force_mode + setpoints
     (43000, 10),  // 43000..43009 — user_work_mode + related
     (44000, 10),  // 44000..44009 — BMS charging/discharging cutoffs
