@@ -1597,6 +1597,7 @@ mod tests {
             address: format!("127.0.0.{}", id.bytes().last().unwrap_or(1))
                 .parse()
                 .unwrap(),
+            marstek_model: crate::config::MarstekModel::VenusEV1V2,
             plug_url: format!("http://127.0.0.{}", id.bytes().last().unwrap_or(1) + 100),
             active: true,
             max_charge_w: max_charge,

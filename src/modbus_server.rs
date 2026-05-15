@@ -29,8 +29,30 @@ use tokio_modbus::prelude::*;
 use tokio_modbus::server::tcp::{accept_tcp_connection, Server};
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, MarstekModel};
 use crate::state::AppState;
+
+/// Resolve a probe register requested by HA to the actual cached
+/// register on this variant. Lets us paper over hardcoded probes in
+/// upstream HA integrations: the ViperRNMC `marstek_modbus` integration
+/// reads register **32104** during the "Test connection" step
+/// regardless of which variant the user picked. That register is the
+/// V1/V2 SoC slot — V3 firmware doesn't expose it. Without aliasing,
+/// HA can't add a V3 device because our virtual server returns
+/// IllegalDataAddress for 32104 on V3 units and the integration
+/// surfaces that as "Keine Antwort von Unit-ID".
+///
+/// For each model, list `(probe_address, actual_address)` pairs. The
+/// server transparently substitutes `actual_address` when looking up
+/// the cache. After the connection test passes, the integration loads
+/// the variant-specific YAML and reads the real V3 addresses (34002
+/// etc.) directly — no alias needed for normal operation.
+fn alias_probe_register(model: MarstekModel, addr: u16) -> u16 {
+    match model {
+        MarstekModel::VenusEV3 if addr == 32104 => 34002, // V1/V2 SoC slot → V3 SoC
+        _ => addr,
+    }
+}
 
 /// The Service impl that handles one TCP connection's requests. Cheap
 /// to clone (it's an Arc to shared state); the tokio-modbus framework
@@ -121,7 +143,14 @@ async fn handle_request(
             let mut out = Vec::with_capacity(count as usize);
             for offset in 0..count {
                 let reg = addr.wrapping_add(offset);
-                match b.cached_holding_regs.get(&reg) {
+                // Resolve any per-variant probe-register alias before
+                // hitting the cache. Lets HA's hardcoded 32104 probe
+                // succeed on V3 (V3 firmware doesn't have 32104; we
+                // serve 34002's value instead). For variants that
+                // expose the requested address natively, the alias
+                // function is the identity → no change.
+                let cache_key = alias_probe_register(b.marstek_model, reg);
+                match b.cached_holding_regs.get(&cache_key) {
                     Some(v) => out.push(*v),
                     None => {
                         state
@@ -132,7 +161,7 @@ async fn handle_request(
                             debug_enabled,
                             "in/no-such-reg",
                             format_args!(
-                                "unit={unit} battery={battery_id} read holding {addr}..+{count} → IllegalDataAddress on reg {reg}"
+                                "unit={unit} battery={battery_id} read holding {addr}..+{count} → IllegalDataAddress on reg {reg} (cache_key={cache_key})"
                             ),
                         );
                         return Err(ExceptionCode::IllegalDataAddress);
@@ -440,6 +469,103 @@ virtual_unit_id = 7
         };
         let err = handle_request(state, req, false).await.unwrap_err();
         assert_eq!(err, ExceptionCode::IllegalDataAddress);
+    }
+
+    /// HA's ViperRNMC integration hardcodes a read of register 32104
+    /// as its connection-test probe regardless of variant. V3 firmware
+    /// doesn't expose 32104, so without aliasing the test fails and
+    /// the user can't add a V3 device. Verify our server transparently
+    /// substitutes 34002 (V3 SoC) for probes of 32104 on V3 units.
+    #[tokio::test]
+    async fn v3_probe_of_32104_is_aliased_to_34002_so_ha_connect_succeeds() {
+        let cfg_str = r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+[virtual_shelly]
+[management]
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+[[batteries]]
+id = "v3"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+modbus_host = "192.168.1.91"
+marstek_model = "venus_e_v3"
+virtual_unit_id = 7
+"#;
+        let cfg: Config = toml::from_str(cfg_str).unwrap();
+        cfg.validate().unwrap();
+        let state = AppState::from_config(&cfg);
+        // Seed only 34002 (V3 SoC) — NOT 32104. Probe should still
+        // succeed via the alias.
+        {
+            let mut bats = state.batteries.write();
+            let b = bats.get_mut("v3").unwrap();
+            b.cached_holding_regs.insert(34002, 970); // SoC = 97.0 %
+        }
+
+        let req = SlaveRequest {
+            slave: 7,
+            request: Request::ReadHoldingRegisters(32104, 1),
+        };
+        let resp = handle_request(state, req, false).await.unwrap();
+        match resp {
+            Some(Response::ReadHoldingRegisters(vs)) => assert_eq!(vs, vec![970]),
+            other => panic!("expected aliased read to succeed, got {other:?}"),
+        }
+    }
+
+    /// The same probe on a V1/V2 unit should hit 32104 directly — the
+    /// alias function is the identity for V1/V2.
+    #[tokio::test]
+    async fn v12_probe_of_32104_reads_32104_directly() {
+        let cfg_str = r#"
+[real_shelly]
+host = "192.168.1.50"
+udp_port = 2020
+[virtual_shelly]
+[management]
+[[circuits]]
+id = "c1"
+fuse_amps = 16
+[[batteries]]
+id = "v12"
+address = "192.168.1.51"
+circuit = "c1"
+plug_url = "http://192.168.1.71"
+max_charge_w = 2500
+max_discharge_w = 800
+modbus_host = "192.168.1.91"
+marstek_model = "venus_e_v1_v2"
+virtual_unit_id = 5
+"#;
+        let cfg: Config = toml::from_str(cfg_str).unwrap();
+        cfg.validate().unwrap();
+        let state = AppState::from_config(&cfg);
+        {
+            let mut bats = state.batteries.write();
+            let b = bats.get_mut("v12").unwrap();
+            b.cached_holding_regs.insert(32104, 87); // SoC = 87 %
+            b.cached_holding_regs.insert(34002, 970); // unrelated
+        }
+
+        let req = SlaveRequest {
+            slave: 5,
+            request: Request::ReadHoldingRegisters(32104, 1),
+        };
+        let resp = handle_request(state, req, false).await.unwrap();
+        match resp {
+            Some(Response::ReadHoldingRegisters(vs)) => {
+                // Must read the literal 32104 cache entry, NOT alias to 34002.
+                assert_eq!(vs, vec![87]);
+            }
+            other => panic!("expected literal read, got {other:?}"),
+        }
     }
 
     #[test]
