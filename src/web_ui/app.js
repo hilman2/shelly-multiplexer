@@ -120,7 +120,7 @@ async function refreshDetails() {
   // re-arm only while the tab is active
   clearTimeout(detailsTimer);
   if (document.getElementById("view-details").classList.contains("active")) {
-    detailsTimer = setTimeout(refreshDetails, 2000);
+    detailsTimer = setTimeout(refreshDetails, 30000);
   }
 }
 

@@ -1169,6 +1169,17 @@ impl BatteryWriter {
         let mut collected: HashMap<u16, u16> = HashMap::new();
         let mut failed: Vec<u16> = Vec::new();
         let mut connection_dead = false;
+        // Counter for back-to-back non-firmware (= wire/codec) errors.
+        // Resets to 0 on every successful read OR on a real firmware
+        // exception (= inverter responded properly with an error code).
+        // Drop the ctx only when 3 in a row signal a genuinely dead
+        // socket — single transient hiccups don't poison the codec
+        // catastrophically, and the field showed v3 occasionally
+        // burping on a specific register without the whole session
+        // being lost. Forcing reconnect on every single blip caused
+        // V3's cache to stall at 5-8 entries.
+        let mut consecutive_wire_errors: u32 = 0;
+        const WIRE_ERROR_DROP_THRESHOLD: u32 = 3;
         for reg in regs {
             let ctx = match self.ensure_conn(ctx_slot).await {
                 Ok(c) => c,
@@ -1190,6 +1201,7 @@ impl BatteryWriter {
                     if let Some(v) = values.first() {
                         collected.insert(*reg, *v);
                     }
+                    consecutive_wire_errors = 0;
                 }
                 Err(e) => {
                     self.state
@@ -1198,25 +1210,15 @@ impl BatteryWriter {
                         .fetch_add(1, Relaxed);
                     failed.push(*reg);
                     let s = e.to_string();
-                    // Distinguish "firmware says this register doesn't
-                    // exist" (= IllegalDataAddress, connection is fine,
-                    // keep going) from "wire/TCP failure" (everything
-                    // else, treat the connection as broken).
-                    //
-                    // Without this split, a transient socket failure
-                    // mid-refresh leaves `ctx` Some-but-dead — every
-                    // subsequent read fails the same way and we never
-                    // reconnect because `ensure_conn` only opens a new
-                    // session when `ctx` is None. Field traces with V3
-                    // had three reads succeed and then everything fail
-                    // for 30+ seconds with the cache stuck at three
-                    // entries. Dropping ctx the moment a non-firmware
-                    // error appears triggers a fresh `tcp::connect`
-                    // on the next iteration.
-                    let is_firmware_exception = s.contains("IllegalDataAddress")
-                        || s.contains("IllegalFunction")
-                        || s.contains("IllegalDataValue")
-                        || s.contains("ServerDeviceFailure");
+                    // `read_holding_on` formats firmware-side errors
+                    // with the prefix "modbus exception (reg <N>):"
+                    // regardless of which exception code (IllegalData
+                    // Address, ServerDeviceBusy, Acknowledge, Gateway
+                    // PathUnavailable, …). Anything else (timeout,
+                    // IO error, decode error) is a wire / codec
+                    // problem that may have left the tokio-modbus
+                    // codec mid-frame and corrupted the ctx.
+                    let is_firmware_exception = s.starts_with("modbus exception");
                     crate::modbus_server::log_traffic(
                         debug_enabled,
                         "out/read-fail",
@@ -1225,18 +1227,27 @@ impl BatteryWriter {
                             self.battery.id, tier, *reg, e
                         ),
                     );
-                    if !is_firmware_exception {
-                        crate::modbus_server::log_traffic(
-                            debug_enabled,
-                            "out/conn-suspect",
-                            format_args!(
-                                "battery={} non-firmware error mid-refresh — dropping ctx so next tick reconnects",
-                                self.battery.id
-                            ),
-                        );
-                        drop_ctx(ctx_slot).await;
-                        connection_dead = true;
-                        break;
+                    if is_firmware_exception {
+                        // Inverter responded properly. Connection is
+                        // healthy, the variant just doesn't expose
+                        // this register. Reset the wire-error streak
+                        // and move on.
+                        consecutive_wire_errors = 0;
+                    } else {
+                        consecutive_wire_errors += 1;
+                        if consecutive_wire_errors >= WIRE_ERROR_DROP_THRESHOLD {
+                            crate::modbus_server::log_traffic(
+                                debug_enabled,
+                                "out/conn-suspect",
+                                format_args!(
+                                    "battery={} {} consecutive non-firmware errors — dropping ctx so next tick reconnects",
+                                    self.battery.id, consecutive_wire_errors
+                                ),
+                            );
+                            drop_ctx(ctx_slot).await;
+                            connection_dead = true;
+                            break;
+                        }
                     }
                 }
             }
