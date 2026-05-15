@@ -1,6 +1,6 @@
 [package]
 name = "shelly-multiplexer"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.87"
 description = "Modbus-TCP dispatcher steering multiple Marstek Venus batteries with per-battery Shelly Plug PM Gen3 feedback; exposes a Modbus-TCP cache server so HA integrations keep working while we own the Marstek's only Modbus slot"

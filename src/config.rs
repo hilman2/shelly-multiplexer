@@ -801,39 +801,59 @@ const VENUS_E_V1V2_SLOW: &[u16] = &[
 ];
 
 // ----- Venus E V3 -----
+//
+// Field traces show HA's ViperRNMC "E v3" integration queries both the
+// V3-native addresses (30001/30100/34002 etc.) AND the V1/V2-style
+// block (32100-32104, 32200-32204, 32300-32303). Either the V3 firmware
+// keeps the legacy addresses for backward compatibility OR the
+// integration probes a superset and tolerates per-register exceptions.
+// Either way we list everything HA might ask for — bulk_refresh skips
+// addresses the inverter refuses silently, so over-listing is safe;
+// under-listing leaves HA without sensors.
 
 const VENUS_E_V3_FAST: &[u16] = &[
-    // battery + power (16-bit on V3)
+    // V3-native power / battery (16-bit single-register fields)
     30001, 30006,
     30100, 30101,
-    34002, // soc (scale 0.1)
-    // AC
-    32200, 32204, 37004,
-    32300, 32301, 32302,
-    // temperature
+    34002, // SoC (scale 0.1)
+    // V1/V2-style DC block — V3 firmware appears to expose these too
+    32100, 32101, 32102, 32103, 32104,
+    // AC grid
+    32200, 32201, 32202, 32203, 32204,
+    37004, // V3-style AC current
+    // AC off-grid
+    32300, 32301, 32302, 32303,
+    // temperatures
     35000, 35001, 35002,
-    // state + control
-    35100, 42000, 42010, 42011, 42020, 42021,
+    // state + alarms + control
+    35100, 36000, 36001, 36100, 36101, 36102, 36103,
+    42000, 42010, 42011, 42020, 42021,
 ];
 
 const VENUS_E_V3_SLOW: &[u16] = &[
-    // metadata
+    // V3-style metadata block
     30200, 30202, 30204,
     31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009,
     30350, 30351, 30352, 30353, 30354, 30355,
     30304, 30305, 30306, 30307, 30308, 30309,
     30300, 30301, 30302, 30303,
+    // V1/V2-style metadata block — V3 firmware may also expose this.
+    31100, 31101, 31102,
+    31200, 31201, 31202, 31203, 31204, 31205, 31206, 31207, 31208, 31209,
+    30800, 30801, 30802, 30803, 30804, 30805,
+    30402, 30403, 30404, 30405, 30406, 30407,
     // total energy + cycle count
     32105, 34003,
     // energy counters
     33000, 33001, 33002, 33003, 33004, 33005,
     33006, 33007, 33008, 33009, 33010, 33011,
-    // cell extremes + per-cell voltages (16 cells)
+    // cell extremes + per-cell voltages (16 cells on V3)
     35010, 35011, 37007, 37008,
     34018, 34019, 34020, 34021, 34022, 34023, 34024, 34025,
     34026, 34027, 34028, 34029, 34030, 34031, 34032, 34033,
-    // config
-    41100, 41200, 44002, 44003,
+    // config + BMS limits
+    41010, 41100, 41200, 44000, 44001, 44002, 44003, 44100,
+    // work mode + schedules
     43000,
     43100, 43101, 43102, 43103, 43104,
     43105, 43106, 43107, 43108, 43109,
