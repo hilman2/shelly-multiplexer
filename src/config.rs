@@ -812,46 +812,39 @@ const VENUS_E_V1V2_SLOW: &[u16] = &[
 
 // ----- Venus E V3 -----
 //
-// Field traces show HA's ViperRNMC "E v3" integration queries both the
-// V3-native addresses (30001/30100/34002 etc.) AND the V1/V2-style
-// block (32100-32104, 32200-32204, 32300-32303). Either the V3 firmware
-// keeps the legacy addresses for backward compatibility OR the
-// integration probes a superset and tolerates per-register exceptions.
-// Either way we list everything HA might ask for — bulk_refresh skips
-// addresses the inverter refuses silently, so over-listing is safe;
-// under-listing leaves HA without sensors.
+// Addresses verified by direct probing of a real V3 unit. v0.10.1
+// optimistically added the V1/V2 DC block (32100..32104) hoping V3
+// kept it for backward compat — it doesn't. Probing showed V3 returns
+// errors on every V1/V2-only address, so listing them just wastes
+// per-cycle Modbus traffic on guaranteed failures.
 
 const VENUS_E_V3_FAST: &[u16] = &[
-    // V3-native power / battery (16-bit single-register fields)
-    30001, 30006,
-    30100, 30101,
-    34002, // SoC (scale 0.1)
-    // V1/V2-style DC block — V3 firmware appears to expose these too
-    32100, 32101, 32102, 32103, 32104,
-    // AC grid
-    32200, 32201, 32202, 32203, 32204,
-    37004, // V3-style AC current
+    // Battery DC (16-bit single-register fields on V3)
+    30001,  // battery_power
+    30006,  // ac_power
+    30100,  // battery_voltage
+    30101,  // battery_current
+    34002,  // battery_soc (scale 0.1)
+    // AC grid — only the V3-native subset (32100..32104 don't exist on V3)
+    32200,  // ac_voltage
+    37004,  // ac_current (V3-style 0.004 scale)
+    32204,  // ac_frequency
     // AC off-grid
-    32300, 32301, 32302, 32303,
+    32300, 32301, 32302,
     // temperatures
     35000, 35001, 35002,
-    // state + alarms + control
-    35100, 36000, 36001, 36100, 36101, 36102, 36103,
+    // state + control
+    35100,
     42000, 42010, 42011, 42020, 42021,
 ];
 
 const VENUS_E_V3_SLOW: &[u16] = &[
-    // V3-style metadata block
+    // V3-style metadata block (probed: all present)
     30200, 30202, 30204,
     31000, 31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009,
     30350, 30351, 30352, 30353, 30354, 30355,
     30304, 30305, 30306, 30307, 30308, 30309,
     30300, 30301, 30302, 30303,
-    // V1/V2-style metadata block — V3 firmware may also expose this.
-    31100, 31101, 31102,
-    31200, 31201, 31202, 31203, 31204, 31205, 31206, 31207, 31208, 31209,
-    30800, 30801, 30802, 30803, 30804, 30805,
-    30402, 30403, 30404, 30405, 30406, 30407,
     // total energy + cycle count
     32105, 34003,
     // energy counters
@@ -861,8 +854,8 @@ const VENUS_E_V3_SLOW: &[u16] = &[
     35010, 35011, 37007, 37008,
     34018, 34019, 34020, 34021, 34022, 34023, 34024, 34025,
     34026, 34027, 34028, 34029, 34030, 34031, 34032, 34033,
-    // config + BMS limits
-    41010, 41100, 41200, 44000, 44001, 44002, 44003, 44100,
+    // config + BMS limits (V3 only has 44002/44003, not 44000/44001)
+    41100, 41200, 44002, 44003,
     // work mode + schedules
     43000,
     43100, 43101, 43102, 43103, 43104,
