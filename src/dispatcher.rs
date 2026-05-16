@@ -90,7 +90,7 @@ pub async fn run(
         // over cap on incoming plug readings, we cut the worst offender
         // BEFORE the dispatcher math gets a chance to issue setpoints
         // that the rogue battery would ignore anyway.
-        enforce_circuit_safety(state.clone(), &cfg.dispatcher);
+        enforce_circuit_safety(state.clone(), &cfg.dispatcher, &modbus_dispatch);
         // Night cutoff: cut empty batteries between sunset and sunrise
         // to skip the Marstek inverter's standby losses.
         enforce_night_cutoff(state.clone(), &cfg.dispatcher, &cfg.location, chrono::Utc::now());
@@ -292,32 +292,49 @@ pub async fn manual_reset_cutoff(state: Arc<AppState>, battery_id: &str) -> anyh
 }
 
 // ---------------------------------------------------------------------------
-// Emergency circuit cutoff — hard safety relay layer.
+// Emergency circuit cutoff — TWO-PHASE escalation.
 // ---------------------------------------------------------------------------
 //
-// The dispatcher's soft control (Modbus setpoints / CT pulses) keeps
-// the circuit under cap in normal operation. This layer catches the
-// pathological case where soft control failed:
-//   - we commanded standby but the battery kept charging anyway, or
-//   - measurement glitch let us issue setpoints past the cap, or
-//   - a battery's BMS overrode our command for its own reasons.
+// `compute_targets`'s per-circuit cap normally keeps measured plug
+// power under fuse. But Marstek inverters over-deliver — commanded
+// -1500 W often reads -1600 W at the plug — so transient overshoots
+// happen. The OLD policy went straight from "over cap + margin for
+// 5 s" to "open the plug relay", which the user observed firing
+// "ohne not" (without need) on routine over-delivery.
 //
-// Detection: signed sum of plug_w across the circuit > effective cap
-// + `emergency_cutoff_margin_w` for `emergency_cutoff_grace_s` seconds.
-// Action: identify the battery contributing the most to the over-cap
-// direction and trigger `plug::set_relay(url, false)` on its plug.
+// New escalation:
+//   Phase 1 (after `EMERGENCY_CUTOFF_GRACE_S` over cap):
+//     SOFT remediation — push `Setpoint::Standby` to every battery on
+//     the circuit. Marsteks ramp toward zero in 1-3 s. Circuit cap
+//     soft logic in `compute_targets` is also pulling targets down
+//     every cycle; this is a more aggressive escalation that bypasses
+//     all the gradual ramping.
+//   Phase 2 (after another `EMERGENCY_SOFT_REMEDIATION_GRACE_S`, plus
+//   the original grace, still over cap):
+//     HARD remediation — physically open the worst offender's plug
+//     relay. Only reached when soft control has failed: a battery is
+//     ignoring our Standby command. That's the pathological case the
+//     plug relay is designed for.
 //
-// Recovery: after `emergency_cutoff_recovery_s` the dispatcher re-enables
-// the relay. If the condition recurs, the cut is re-armed.
-fn enforce_circuit_safety(state: Arc<AppState>, dcfg: &DispatcherConfig) {
+// Recovery: as soon as the circuit drops back under cap, both phase
+// timestamps reset. After `EMERGENCY_CUTOFF_RECOVERY_S` an already-
+// tripped plug auto-reenables.
+fn enforce_circuit_safety(
+    state: Arc<AppState>,
+    dcfg: &DispatcherConfig,
+    dispatch: &Option<ModbusDispatch>,
+) {
     if dcfg.emergency_cutoff_margin_w <= 0.0 {
         // Feature disabled — skip everything.
         return;
     }
     let now = Instant::now();
     let grace = Duration::from_secs_f64(crate::config::EMERGENCY_CUTOFF_GRACE_S.max(0.5));
+    let soft_grace =
+        Duration::from_secs_f64(crate::config::EMERGENCY_SOFT_REMEDIATION_GRACE_S.max(1.0));
     let recovery = Duration::from_secs_f64(crate::config::EMERGENCY_CUTOFF_RECOVERY_S.max(60.0));
 
+    let mut to_soft_remediate: Vec<String> = Vec::new(); // battery_ids to Standby
     let mut to_trip: Vec<(String, String, String)> = Vec::new(); // (id, plug_url, reason)
     let mut to_reenable: Vec<(String, String)> = Vec::new(); // (id, plug_url)
 
@@ -339,46 +356,67 @@ fn enforce_circuit_safety(state: Arc<AppState>, dcfg: &DispatcherConfig) {
                 .collect();
             if members.is_empty() {
                 cs.overload_started_at = None;
+                cs.soft_remediation_started_at = None;
                 continue;
             }
             let signed_sum: f64 = members.iter().filter_map(|b| b.last_plug_w).sum();
             let overload = signed_sum.abs() > cap + margin;
 
-            if overload {
-                let started = *cs.overload_started_at.get_or_insert(now);
-                if now.duration_since(started) >= grace {
-                    // Trip: find the worst offender in the violating
-                    // direction. We only cut ONE plug per cycle even if
-                    // the margin is huge — the next cycle's measurement
-                    // will tell us whether more cuts are needed.
-                    let dir = signed_sum.signum();
-                    let worst = members
-                        .iter()
-                        .filter(|b| {
-                            b.plug_cut_until.map_or(true, |t| t <= now)
-                                && b.last_plug_w
-                                    .map(|w| w.signum() == dir && w.abs() > 0.0)
-                                    .unwrap_or(false)
-                        })
-                        .max_by(|a, b| {
-                            let av = a.last_plug_w.unwrap_or(0.0).abs();
-                            let bv = b.last_plug_w.unwrap_or(0.0).abs();
-                            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    if let Some(b) = worst {
-                        let reason = format!(
-                            "circuit {} over cap: |{:.0} W| > {:.0} W + {:.0} W margin for {:.1}s",
-                            cs.config.id,
-                            signed_sum,
-                            cap,
-                            margin,
-                            now.duration_since(started).as_secs_f64()
-                        );
-                        to_trip.push((b.id.clone(), b.plug_url.clone(), reason));
-                    }
-                }
-            } else {
+            if !overload {
                 cs.overload_started_at = None;
+                cs.soft_remediation_started_at = None;
+                continue;
+            }
+
+            let started = *cs.overload_started_at.get_or_insert(now);
+            let over_for = now.duration_since(started);
+            if over_for < grace {
+                // Brief overshoot — let compute_targets' soft cap
+                // logic handle it on the next dispatcher tick.
+                continue;
+            }
+
+            // Phase 1: soft remediation. Push Standby to everyone on
+            // the circuit immediately. compute_targets will keep them
+            // there as long as the over-cap condition persists.
+            let soft_started = *cs.soft_remediation_started_at.get_or_insert(now);
+            for m in &members {
+                if m.plug_cut_until.map_or(true, |t| t <= now) {
+                    to_soft_remediate.push(m.id.clone());
+                }
+            }
+
+            // Phase 2: if soft remediation has been in effect for the
+            // full soft_grace window AND we're STILL over cap, the
+            // Marstek is refusing to honour our Standby. Trip the
+            // worst offender's plug relay.
+            if now.duration_since(soft_started) >= soft_grace {
+                let dir = signed_sum.signum();
+                let worst = members
+                    .iter()
+                    .filter(|b| {
+                        b.plug_cut_until.map_or(true, |t| t <= now)
+                            && b.last_plug_w
+                                .map(|w| w.signum() == dir && w.abs() > 0.0)
+                                .unwrap_or(false)
+                    })
+                    .max_by(|a, b| {
+                        let av = a.last_plug_w.unwrap_or(0.0).abs();
+                        let bv = b.last_plug_w.unwrap_or(0.0).abs();
+                        av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some(b) = worst {
+                    let reason = format!(
+                        "circuit {} over cap: |{:.0} W| > {:.0} W + {:.0} W margin for {:.1}s (soft remediation didn't help after {:.1}s)",
+                        cs.config.id,
+                        signed_sum,
+                        cap,
+                        margin,
+                        over_for.as_secs_f64(),
+                        now.duration_since(soft_started).as_secs_f64(),
+                    );
+                    to_trip.push((b.id.clone(), b.plug_url.clone(), reason));
+                }
             }
         }
 
@@ -392,6 +430,26 @@ fn enforce_circuit_safety(state: Arc<AppState>, dcfg: &DispatcherConfig) {
                     to_reenable.push((b.id.clone(), b.plug_url.clone()));
                 }
             }
+        }
+    }
+
+    // Phase 1 soft remediation: command Standby on every battery whose
+    // circuit has been over-cap for `grace`. This is in addition to
+    // `compute_targets`' soft-scaling pass (which already pulls
+    // targets down proportionally every cycle); a direct Standby
+    // bypasses the rate limiter and tells the Marstek to drop to 0
+    // as fast as its own ramp allows. Sent every cycle while the
+    // overload persists, which is fine — `ModbusDispatch::send`
+    // dedupes to the channel's last value internally.
+    if let Some(d) = dispatch {
+        for id in &to_soft_remediate {
+            d.send(id, crate::modbus::Setpoint::Standby);
+        }
+        if !to_soft_remediate.is_empty() {
+            info!(
+                batteries = ?to_soft_remediate,
+                "circuit overload: SOFT remediation — pushing Standby to all members"
+            );
         }
     }
 
@@ -1302,8 +1360,21 @@ fn compute_targets(
         }
     }
 
-    // Per-circuit cap on the sum of TARGETS (modbus path enforces the
-    // fuse limit on commanded power, not on plug+delta — much simpler).
+    // Per-circuit cap with PLUG-FEEDBACK enforcement.
+    //
+    // Pre-v0.11.6 capped only `target_sum`. That ignored Marstek
+    // over-delivery — a Venus E commanded at -1500 W typically reads
+    // -1550 to -1650 W at the plug (5-10 % over). With both batteries
+    // on a 3220 W (14 A) circuit running at the target cap of 3059 W
+    // (0.95 headroom), plug sums of 3200-3300 W are normal — well
+    // over the emergency_cutoff_margin trigger, which then tripped
+    // the plug relay "ohne not".
+    //
+    // Fix: also consider the CURRENT plug sum when scaling. If the
+    // measured power is over cap (because Marstek is over-delivering
+    // a previous setpoint), shrink targets BELOW cap so the next
+    // commanded value pulls the plug back down. Use the larger of
+    // |target_sum| and |plug_sum| as the constraint basis.
     for cs in circuits.values() {
         let cap = cs.cap_w() * dcfg.circuit_headroom;
         let member_ids: Vec<String> = cs.member_ids.clone();
@@ -1311,14 +1382,22 @@ fn compute_targets(
             .iter()
             .filter_map(|id| targets.get(id).copied())
             .sum();
-        if target_sum.abs() > cap {
-            let scale = cap / target_sum.abs();
+        let plug_sum: f64 = member_ids
+            .iter()
+            .filter_map(|id| bats.get(id))
+            .filter_map(|b| b.last_plug_w)
+            .sum();
+        let worst_case = target_sum.abs().max(plug_sum.abs());
+        if worst_case > cap {
+            let scale = cap / worst_case;
             warn!(
                 circuit = %cs.config.id,
                 cap_w = cap,
                 target_sum,
+                plug_sum,
+                worst_case,
                 applied_scale = scale,
-                "circuit cap engaged — scaling targets"
+                "circuit cap engaged — scaling targets (plug-feedback)"
             );
             for id in &member_ids {
                 if let Some(t) = targets.get_mut(id) {
@@ -2265,7 +2344,7 @@ modbus_host = "192.168.1.93"
             }
         }
         let dcfg = dcfg();
-        enforce_circuit_safety(state.clone(), &dcfg);
+        enforce_circuit_safety(state.clone(), &dcfg, &None);
         let circuits = state.circuits.read();
         let cs = circuits.get("c1").unwrap();
         assert!(
@@ -2290,7 +2369,7 @@ modbus_host = "192.168.1.93"
             }
         }
         let dcfg = dcfg();
-        enforce_circuit_safety(state.clone(), &dcfg);
+        enforce_circuit_safety(state.clone(), &dcfg, &None);
         let circuits = state.circuits.read();
         let cs = circuits.get("c1").unwrap();
         assert!(
@@ -2319,17 +2398,28 @@ modbus_host = "192.168.1.93"
                 b.plug_relay_state = Some(true);
             }
         }
-        // Pretend the overload has been going on for longer than grace.
+        // Pretend the overload has been going on for longer than grace
+        // AND soft remediation has been in effect long enough that
+        // Phase 2 (hard trip) is justified. Without both timestamps
+        // the function would only push Standby on this cycle.
         {
             let mut circuits = state.circuits.write();
-            circuits.get_mut("c1").unwrap().overload_started_at = Some(
+            let cs = circuits.get_mut("c1").unwrap();
+            cs.overload_started_at = Some(
                 now - Duration::from_secs_f64(
-                    crate::config::EMERGENCY_CUTOFF_GRACE_S + 1.0,
+                    crate::config::EMERGENCY_CUTOFF_GRACE_S
+                        + crate::config::EMERGENCY_SOFT_REMEDIATION_GRACE_S
+                        + 1.0,
+                ),
+            );
+            cs.soft_remediation_started_at = Some(
+                now - Duration::from_secs_f64(
+                    crate::config::EMERGENCY_SOFT_REMEDIATION_GRACE_S + 1.0,
                 ),
             );
         }
         let dcfg = dcfg();
-        enforce_circuit_safety(state.clone(), &dcfg);
+        enforce_circuit_safety(state.clone(), &dcfg, &None);
         let bats = state.batteries.read();
         let c = bats.get("c").unwrap();
         assert!(
@@ -2339,6 +2429,97 @@ modbus_host = "192.168.1.93"
         // a and b should not be cut (only ONE per cycle).
         assert!(bats.get("a").unwrap().plug_cut_until.is_none());
         assert!(bats.get("b").unwrap().plug_cut_until.is_none());
+    }
+
+    /// Disabled feature (margin = 0) is a complete no-op.
+    #[test]
+    /// After grace, but before soft_grace elapses: the function must
+    /// stamp `soft_remediation_started_at` and NOT trip any plug. This
+    /// is the bug the user reported in v0.11.5 ("Plugs ausgeschaltet
+    /// anstatt die Ladeleistung anzupassen"): the dispatcher must
+    /// attempt soft remediation first.
+    #[test]
+    fn cutoff_soft_remediates_before_tripping() {
+        let state = three_battery_state();
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            bats.get_mut("a").unwrap().last_plug_w = Some(2500.0);
+            bats.get_mut("b").unwrap().last_plug_w = Some(2500.0);
+            bats.get_mut("c").unwrap().last_plug_w = Some(4500.0);
+            for b in bats.values_mut() {
+                b.last_plug_at = Some(now);
+                b.plug_relay_state = Some(true);
+            }
+        }
+        // Overload has been going on past `grace` but NOT past
+        // `grace + soft_grace`. So Phase 1 must engage, Phase 2 not.
+        {
+            let mut circuits = state.circuits.write();
+            circuits.get_mut("c1").unwrap().overload_started_at = Some(
+                now - Duration::from_secs_f64(
+                    crate::config::EMERGENCY_CUTOFF_GRACE_S + 0.5,
+                ),
+            );
+        }
+        let dcfg = dcfg();
+        enforce_circuit_safety(state.clone(), &dcfg, &None);
+        // Soft remediation timestamp now set.
+        {
+            let circuits = state.circuits.read();
+            let cs = circuits.get("c1").unwrap();
+            assert!(
+                cs.soft_remediation_started_at.is_some(),
+                "Phase 1 must stamp soft_remediation_started_at"
+            );
+        }
+        // No plug trip yet — soft_grace hasn't elapsed.
+        let bats = state.batteries.read();
+        assert!(
+            bats.get("a").unwrap().plug_cut_until.is_none(),
+            "no plug should be cut during soft-remediation phase"
+        );
+        assert!(
+            bats.get("b").unwrap().plug_cut_until.is_none(),
+            "no plug should be cut during soft-remediation phase"
+        );
+        assert!(
+            bats.get("c").unwrap().plug_cut_until.is_none(),
+            "no plug should be cut during soft-remediation phase"
+        );
+    }
+
+    /// Recovery: once the circuit comes back under cap, BOTH
+    /// `overload_started_at` and `soft_remediation_started_at` reset,
+    /// so the next overload starts the clock fresh.
+    #[test]
+    fn cutoff_recovery_clears_both_timestamps() {
+        let state = three_battery_state();
+        let now = Instant::now();
+        {
+            let mut bats = state.batteries.write();
+            for b in bats.values_mut() {
+                b.last_plug_w = Some(1000.0); // well under cap
+                b.last_plug_at = Some(now);
+                b.plug_relay_state = Some(true);
+            }
+        }
+        // Pretend Phase 1 was previously engaged.
+        {
+            let mut circuits = state.circuits.write();
+            let cs = circuits.get_mut("c1").unwrap();
+            cs.overload_started_at = Some(now - Duration::from_secs(30));
+            cs.soft_remediation_started_at = Some(now - Duration::from_secs(20));
+        }
+        let dcfg = dcfg();
+        enforce_circuit_safety(state.clone(), &dcfg, &None);
+        let circuits = state.circuits.read();
+        let cs = circuits.get("c1").unwrap();
+        assert!(cs.overload_started_at.is_none(), "recovery must clear overload_started_at");
+        assert!(
+            cs.soft_remediation_started_at.is_none(),
+            "recovery must clear soft_remediation_started_at"
+        );
     }
 
     /// Disabled feature (margin = 0) is a complete no-op.
@@ -2356,7 +2537,7 @@ modbus_host = "192.168.1.93"
         }
         let mut dcfg = dcfg();
         dcfg.emergency_cutoff_margin_w = 0.0; // disable
-        enforce_circuit_safety(state.clone(), &dcfg);
+        enforce_circuit_safety(state.clone(), &dcfg, &None);
         let circuits = state.circuits.read();
         let cs = circuits.get("c1").unwrap();
         assert!(
@@ -2557,6 +2738,7 @@ voltage = 230
                     member_ids: vec!["a".into(), "b".into()],
                     silent_until: None,
                     overload_started_at: None,
+                    soft_remediation_started_at: None,
                 },
             );
         }

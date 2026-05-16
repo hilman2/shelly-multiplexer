@@ -443,6 +443,11 @@ pub struct CircuitState {
     /// back under cap. Used by `enforce_circuit_safety` to enforce the
     /// `emergency_cutoff_grace_s` debounce before tripping a plug.
     pub overload_started_at: Option<Instant>,
+    /// Wall-clock when the soft-remediation phase started (Standby
+    /// commands sent to every member). If the circuit is still over
+    /// cap `SOFT_REMEDIATION_GRACE_S` after this, we escalate to the
+    /// hard plug-trip. Reset whenever the circuit recovers below cap.
+    pub soft_remediation_started_at: Option<Instant>,
 }
 
 impl CircuitState {
@@ -521,6 +526,7 @@ impl AppState {
                     member_ids: members,
                     silent_until: None,
                     overload_started_at: None,
+                    soft_remediation_started_at: None,
                 },
             );
         }
