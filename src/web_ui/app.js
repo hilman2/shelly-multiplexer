@@ -249,7 +249,10 @@ function renderCircuitsStatus(circuits) {
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id))
     .map((c) => {
-      const cap = c.cap_w * 0.95;
+      // The dispatcher enforces |measured_sum| ≤ cap_w directly — no
+      // built-in headroom factor. The user picks fuse_amps to a value
+      // they're comfortable driving at 100 %.
+      const cap = c.cap_w;
       const measuredAbs = Math.abs(c.measured_sum_w);
       const headroom = cap - measuredAbs;
       const hClass = headroom < 0 ? "cap-over" : headroom < cap * 0.1 ? "cap-tight" : "cap-ok";

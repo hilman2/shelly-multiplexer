@@ -264,11 +264,6 @@ pub struct DispatcherConfig {
     #[serde(default = "default_soc_empty")]
     pub soc_empty_pct: f64,
 
-    /// Fraction of the fuse cap that the dispatcher will actually
-    /// use. 0.95 = 5 % jitter buffer.
-    #[serde(default = "default_circuit_headroom")]
-    pub circuit_headroom: f64,
-
     /// Plug silent this long → mute its circuit.
     #[serde(default = "default_plug_stale_s")]
     pub plug_stale_s: f64,
@@ -284,9 +279,9 @@ pub struct DispatcherConfig {
     pub settle_timeout_s: f64,
 
     /// Hardware safety: when the SIGNED plug-power sum on a circuit
-    /// exceeds `cap × headroom + this`, the dispatcher physically
-    /// opens the worst offender's Shelly Plug PM Gen3 relay. 0
-    /// disables. Grace + recovery are hardcoded at 5 s / 600 s.
+    /// exceeds `cap + this`, the dispatcher physically opens the
+    /// worst offender's Shelly Plug PM Gen3 relay. 0 disables.
+    /// Grace + recovery are hardcoded at 5 s / 600 s.
     #[serde(default = "default_emergency_cutoff_margin_w")]
     pub emergency_cutoff_margin_w: f64,
 
@@ -321,7 +316,6 @@ impl Default for DispatcherConfig {
             rate_limit_w_per_cycle: default_rate_limit_w(),
             soc_full_pct: default_soc_full(),
             soc_empty_pct: default_soc_empty(),
-            circuit_headroom: default_circuit_headroom(),
             plug_stale_s: default_plug_stale_s(),
             grid_stale_s: default_grid_stale_s(),
             settle_timeout_s: default_settle_timeout_s(),
@@ -345,9 +339,6 @@ fn default_soc_full() -> f64 {
 }
 fn default_soc_empty() -> f64 {
     5.0
-}
-fn default_circuit_headroom() -> f64 {
-    0.95
 }
 fn default_plug_stale_s() -> f64 {
     5.0
@@ -1217,9 +1208,6 @@ impl Config {
         if self.dispatcher.cycle_ms == 0 {
             anyhow::bail!("dispatcher.cycle_ms must be > 0");
         }
-        if !(0.0..=1.0).contains(&self.dispatcher.circuit_headroom) {
-            anyhow::bail!("dispatcher.circuit_headroom must be in [0, 1]");
-        }
         if self.dispatcher.rate_limit_w_per_cycle <= 0.0 {
             anyhow::bail!("dispatcher.rate_limit_w_per_cycle must be > 0");
         }
@@ -1387,7 +1375,6 @@ soc_full_pct = 95
 soc_empty_pct = 5
 plug_stale_s = 2.0
 group_silent_after_stale_s = 60.0
-circuit_headroom = 0.95
 
 [[circuits]]
 id = "c1"

@@ -327,10 +327,6 @@
               <input name="soc_empty_pct" type="number" min="0" max="100" step="any" required>
               <small style="color:var(--fg-faint);font-size:11px">BMS cutoff (reg 44001) wins when available</small>
             </label>
-            <label>Circuit headroom (0–1)
-              <input name="circuit_headroom" type="number" min="0" max="1" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">fraction of fuse cap to actually use. 0.95 = 5 % jitter buffer</small>
-            </label>
             <label>Plug stale (s)
               <input name="plug_stale_s" type="number" min="0" step="any" required>
               <small style="color:var(--fg-faint);font-size:11px">plug silent this long → mute its circuit</small>
@@ -345,7 +341,7 @@
             </label>
             <label>Emergency cutoff margin (W)
               <input name="emergency_cutoff_margin_w" type="number" min="0" step="any" required>
-              <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap × headroom + this. 0 = disabled. Grace/recovery hardcoded at 5 s / 600 s</small>
+              <small style="color:var(--fg-faint);font-size:11px">trip plug relay when circuit sum exceeds cap + this. 0 = disabled. Grace/recovery hardcoded at 5 s / 600 s</small>
             </label>
             <label class="checkbox">
               <input name="night_cutoff_enabled" type="checkbox">

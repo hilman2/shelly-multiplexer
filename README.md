@@ -80,9 +80,10 @@ on plug movement plus a stability window.
   and reach the healthy mid-SoC band roughly in sync.
 - **Plug-driven circuit cap** — the signed sum of plug readings on a
   circuit, plus any pending deltas, must stay below
-  `fuse_amps × voltage × phases × circuit_headroom`. Violations shrink
-  the deltas toward zero; the dispatcher never flips direction to
-  "fix" an over-cap state.
+  `fuse_amps × voltage × phases`. Violations shrink the deltas toward
+  zero; the dispatcher never flips direction to "fix" an over-cap
+  state. There is no built-in safety fraction — `fuse_amps` IS the
+  ceiling, so pick a value you're comfortable driving at 100 %.
 - **Stale-measurement safety** — a stale plug mutes its circuit; a
   stale grid measurement mutes every circuit. In pulse mode the CT
   signal goes silent for 60 s (hardcoded) so every battery's CT
@@ -344,7 +345,6 @@ Per-battery overrides are also available (see `[[batteries]]`).
 |---|---|---|
 | `plug_stale_s` | 5.0 | Plug silent this long → mute its circuit. |
 | `grid_stale_s` | 5.0 | Real Shelly silent this long → mute every circuit. |
-| `circuit_headroom` | 0.95 | Use only this fraction of the calculated fuse cap (jitter buffer). |
 
 In pulse mode there's an additional 60 s "silent after stale" cooldown
 to let the Marstek's internal CT integrator clear. In modbus mode that
@@ -397,7 +397,8 @@ dispatch via empirical detection until you wire up a SoC source.
 ### `[[circuits]]` — shared fuses
 
 One entry per shared protective device (typically one MCB). The cap
-is `fuse_amps × voltage × phases × circuit_headroom`.
+is `fuse_amps × voltage × phases` — set `fuse_amps` to a value you're
+comfortable driving at 100 %.
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -457,10 +458,11 @@ Per cycle, with N eligible batteries on one or more circuits:
    batteries up to six times.
 5. **Modbus mode**: each target's distance from the current plug-
    measured power is clamped to `±rate_limit_w_per_cycle` so big swings
-   become ramps. Then per-circuit cap on the sum of targets; if it
-   would exceed `fuse cap × circuit_headroom`, every target on that
-   circuit is scaled toward zero. The BatteryWriter writes the
-   resulting absolute setpoint to its battery via Modbus.
+   become ramps. Then per-circuit cap on the sum of targets; if either
+   the would-be commanded sum OR the live plug sum exceeds the fuse
+   cap, every target on that circuit is scaled toward zero. The
+   BatteryWriter writes the resulting absolute setpoint to its battery
+   via Modbus.
 6. **Pulse mode**: `delta = target - plug_w` for each battery. Deltas
    below `deadband_w` are dropped; the per-circuit cap is enforced on
    the plug+delta sum. Surviving deltas are queued as 3 identical CT
