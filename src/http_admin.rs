@@ -84,28 +84,73 @@ pub async fn run(
 // Static / index
 // ---------------------------------------------------------------------------
 
-async fn serve_index() -> Response {
-    serve_embed("index.html")
+async fn serve_index(headers: axum::http::HeaderMap) -> Response {
+    serve_embed("index.html", &headers)
 }
 
-async fn serve_static(Path(path): Path<String>) -> Response {
-    serve_embed(&path)
+async fn serve_static(
+    Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    serve_embed(&path, &headers)
 }
 
-fn serve_embed(path: &str) -> Response {
-    match WebAssets::get(path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            Response::builder()
-                .header(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_str(mime.as_ref()).unwrap(),
-                )
-                .body(Body::from(content.data.into_owned()))
-                .unwrap()
+/// Embedded-asset response with ETag-based revalidation.
+///
+/// v0.11.9: until now `serve_embed` set no cache-related headers at
+/// all, which means browsers fell back to heuristic caching and would
+/// silently re-use a months-old `app.js` even after we pushed a new
+/// dispatcher release. The user hit exactly that: v0.11.7's UI fix
+/// (drop the hardcoded × 0.95 on the dashboard headroom column) was
+/// shipped in the binary but his browser kept showing the stale
+/// version.
+///
+/// Fix: emit an ETag derived from rust-embed's per-file SHA-256 hash
+/// (computed at compile time, so essentially free at request time)
+/// and `Cache-Control: no-cache` so the browser revalidates EVERY
+/// load. Cheap path on identical content (32-byte If-None-Match
+/// check → 304 Not Modified, empty body); guaranteed pickup on any
+/// asset change (different hash → 200 with new content).
+fn serve_embed(path: &str, req_headers: &axum::http::HeaderMap) -> Response {
+    let Some(content) = WebAssets::get(path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    // Strong ETag: hex-encoded SHA-256 of the embedded file. Quoted
+    // per RFC 7232 §2.3. The hash is part of the embedded metadata
+    // populated by the proc macro, so each release ships a stable
+    // tag per file.
+    let etag_value = format!("\"{}\"", hex_encode(&content.metadata.sha256_hash()));
+    if let Some(in_match) = req_headers.get(header::IF_NONE_MATCH) {
+        if in_match.as_bytes() == etag_value.as_bytes() {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, etag_value)
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::empty())
+                .unwrap();
         }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(mime.as_ref()).unwrap(),
+        )
+        .header(header::ETAG, etag_value)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(content.data.into_owned()))
+        .unwrap()
+}
+
+/// Hex-encode a byte slice without pulling in another dep.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
