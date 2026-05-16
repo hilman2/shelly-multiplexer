@@ -1,153 +1,188 @@
 # ShellyMultiplexer
 
-Steers multiple battery storage systems (Marstek Venus E and other
-batteries that integrate via Shelly Pro 3EM emulation) by impersonating
-a Shelly Pro 3EM on the LAN. The dispatcher computes one *target*
-power setpoint per battery from the live grid reading and each
-battery's own plug measurement, then encodes the difference as a short
-burst of CT samples that the battery's internal integrator commits.
+Steers multiple Marstek Venus battery storage systems from a single
+real Shelly Pro 3EM grid meter. Each cycle, the dispatcher reads the
+live grid power, computes a per-battery target, and writes the
+**absolute power setpoint directly to each Marstek over Modbus TCP**.
 
-A **dedicated Shelly Plug PM Gen3 per battery** is mandatory: its
-reading is the authoritative ground truth for the dispatcher and for
-the per-circuit fuse cap.
+A dedicated **Shelly Plug PM Gen3 per battery** is mandatory — its
+reading is the authoritative truth for the per-circuit fuse cap and
+for the empirical overhead the dispatcher learns about each inverter.
 
-## How it works
+The Marstek's Modbus stack accepts exactly **one** active client at a
+time. Taking that slot would lock Home Assistant out of the battery,
+so the multiplexer also runs a **virtual Modbus TCP cache server** on
+`:1502` that re-publishes the cached register reads. HA integrations
+point at the multiplexer's port and see normal-looking Marsteks while
+the dispatcher keeps full ownership of the writes.
+
+Pulse mode (Shelly Pro 3EM CT-burst emulation, the way Marstek's app
+expects to be steered) is still in the binary for installs without
+per-battery Modbus reach. Every architectural decision since v0.10
+favours modbus mode and it should be your default.
+
+## How it works (modbus mode)
 
 ```
                   ┌────────────────────────────────────────────────────┐
-                  │  ShellyMultiplexer (v0.8+)                          │
+                  │  ShellyMultiplexer                                 │
                   │                                                    │
    Real Shelly    │   Grid poller (UDP-RPC, ~4 Hz)                     │
    ──────────    │            │                                       │
    :2020 (RPC) ◀─┤            ▼                                       │
-                  │   Dispatcher tick (2 s, mode = modbus by default)  │
+                  │   Dispatcher tick (cycle_ms, default 2 s)          │
                   │   • desired_total = Σ plug + grid_correction       │
-                  │   • split target across batteries weighted by      │
+                  │   • split across batteries weighted by             │
                   │     priority × capacity × soc_room                 │
                   │   • clamp each target to [low_bound, high_bound]   │
-                  │   • clamp Δ from current plug to                   │
-                  │     ±rate_limit_w_per_cycle (the only ramp knob)   │
-                  │   • per-circuit cap on sum-of-targets              │
+                  │   • rate-limit Δ from current plug to              │
+                  │     ±rate_limit_w_per_cycle                        │
+                  │   • per-circuit cap: scale targets so the SUM      │
+                  │     stays ≤ fuse_amps × voltage × phases           │
+                  │   • subtract per-battery EMPIRICAL overhead so     │
+                  │     plug LANDS at target (v0.11.8+)                │
                   │            │                                       │
                   │            ▼                                       │
    Marsteks    ──▶│   Per-battery BatteryWriter task                   │
-   (RS485 →      │   • persistent Modbus TCP session per battery       │
-    LAN bridge)  │   • write force_mode + power on every setpoint     │
-                  │     change ≥ deadband_w                            │
+   (RS485 →      │   • persistent Modbus TCP session                   │
+    LAN bridge)  │   • write force_mode + power every cycle           │
                   │   • piggyback SoC + battery_power reads on the     │
                   │     same connection (no second TCP slot)           │
+                  │            │                                       │
+                  │            ▼                                       │
+   HA (Modbus)  ◀─┤   Virtual Modbus cache server (:1502)              │
+                  │   • re-publishes register cache per battery        │
+                  │     (HA reads via unit ID = battery index + 1)     │
                   │                                                    │
-   Plugs (one    │   Plug HTTP poller (per-battery, cycle_ms)         │
+   Plugs (one    │   Plug HTTP poller (per-battery, ~600 ms)          │
    per battery) ─▶│   • Switch.GetStatus → last_plug_w                │
-   GET /rpc      │   • stale > plug_stale_s → mute the circuit        │
-                  │   • signed plug sum > cap + margin → EMERGENCY    │
-                  │     cutoff via Switch.Set(on = false)              │
+                  │   • EMA(plug − last_commanded) → overhead estimate │
+                  │   • stale > plug_stale_s → mute the circuit        │
+                  │   • signed plug sum > cap + margin → soft-then-    │
+                  │     hard cutoff (Standby cmd → plug relay open)    │
                   │                                                    │
    Browser   ───▶│   Admin UI (:8080) — live status + full live       │
                   │                       config editor                │
                   └────────────────────────────────────────────────────┘
 ```
 
-In **modbus mode** (default) the dispatcher writes absolute power
-setpoints — no delta math, no settle guesswork. The
-`rate_limit_w_per_cycle` knob smooths big swings into ramps at the
-algorithm level, replacing the EMA grid smoother + per-write throttle
-+ heartbeat the v0.7 schema used to expose. Per-circuit sequential
-dispatch (one write per circuit per cycle, gated on plug response)
-gives the structural "circuit can't go over cap" property.
+### Why modbus, not pulse
 
-**Pulse mode** keeps the legacy Shelly-Pro-3EM CT emulation for
-installs without per-battery Modbus reach: the dispatcher queues CT-
-pulse deltas via a virtual `:1010` UDP server and gates the next pulse
-on plug movement plus a stability window.
+|                              | Pulse mode                                                  | Modbus mode                                       |
+|------------------------------|-------------------------------------------------------------|---------------------------------------------------|
+| **Wire**                     | UDP RPC (port 1010), faking a Shelly Pro 3EM                | Modbus TCP to each battery (`modbus_host`)        |
+| **Command**                  | CT deltas — Marstek's internal integrator does the rest     | Absolute setpoint (`force_mode` + power register) |
+| **Latency to act**           | 2-3 cycles — bounded by the Marstek's integrator dynamics   | One cycle — Marstek tracks within 1-3 s           |
+| **State on disconnect**      | Stale CT signal keeps integrating; needs 60 s silence       | `force_mode = 0` → Marstek auto behaviour, instant |
+| **SoC source**               | Optional (empirical full/empty fallback works without)      | Required (Modbus host is the SoC source)          |
+| **HA can read the Marstek**  | Yes — Marstek owns its own Modbus slot                      | Only via the multiplexer's `:1502` cache server   |
+| **Default since v0.10**      |                                                             | ✅                                                |
+
+If you have an RS485-to-LAN bridge (or Venus E V3 with Ethernet), use
+modbus mode. Pulse mode is a fallback for installs where Modbus reach
+isn't possible.
 
 > ⚠ **Required configuration on the real Shelly:** move its UDP-RPC port
 > off the default 1010 (e.g. to 2020). Otherwise the multiplexer can't
-> bind 1010 and the batteries reach the real Shelly directly.
+> bind 1010 in pulse mode AND your batteries can reach the real Shelly
+> directly, behind the multiplexer's back.
 
 ## Features
 
-- **Virtual Shelly Pro 3EM** on UDP-RPC (port 1010), HTTP-REST and
-  HTTP-RPC. Wire-compatible with Marstek Venus E and other batteries
-  that integrate via Shelly Pro 3EM emulation.
-- **Discoverable via mDNS** as a real Pro 3EM (`_shelly._tcp.local`,
-  `_http._tcp.local`, correct TXT records).
-- **Multiple batteries per circuit.** Targets are split so all eligible
-  batteries always run in the same direction; one battery cannot end up
-  charging while another discharges on the same fuse.
-- **SoC-balanced distribution** — emptier batteries get more charge
-  power, fuller ones get more discharge power. All cells age together
-  and reach the healthy mid-SoC band roughly in sync.
+### Always on
 - **Plug-driven circuit cap** — the signed sum of plug readings on a
-  circuit, plus any pending deltas, must stay below
-  `fuse_amps × voltage × phases`. Violations shrink the deltas toward
-  zero; the dispatcher never flips direction to "fix" an over-cap
-  state. There is no built-in safety fraction — `fuse_amps` IS the
-  ceiling, so pick a value you're comfortable driving at 100 %.
-- **Stale-measurement safety** — a stale plug mutes its circuit; a
-  stale grid measurement mutes every circuit. In pulse mode the CT
-  signal goes silent for 60 s (hardcoded) so every battery's CT
-  integrator clears. In modbus mode recovery is immediate — `force_mode`
-  bypasses CT integration entirely.
+  circuit must stay below `fuse_amps × voltage × phases`. Targets are
+  scaled to fit; the dispatcher never flips direction to "fix" an
+  over-cap state. There is no built-in safety fraction — `fuse_amps`
+  IS the ceiling, so pick a value you're comfortable driving at 100 %.
+- **Empirical plug-overhead compensation (v0.11.8+)** — per-battery
+  EMA of `plug_w − last_commanded_w` captures inverter idle, AC↔DC
+  conversion loss, and plug-meter bias (typically 30-50 W when
+  charging at ~1.5 kW). The dispatcher subtracts this from each
+  target before writing, so the plug LANDS at the configured cap
+  instead of overshooting by 2-3 %.
+- **Soft-then-hard emergency cutoff** — when the measured plug sum
+  drifts above `cap + emergency_cutoff_margin_w` for 5 s the
+  dispatcher first commands `Standby` to every battery on the circuit
+  (soft remediation, bypasses the rate limit); only if that doesn't
+  help within 10 more seconds does it physically open the worst
+  offender's plug relay (`Switch.Set on = false`). Auto-recovery
+  after 10 min, manual reset in the admin UI.
+- **Multiple batteries per circuit** — targets are split so every
+  eligible battery on a circuit runs in the same direction. One
+  battery cannot end up charging while another discharges on the same
+  fuse.
+- **SoC-balanced distribution** — emptier batteries get more charge
+  share, fuller ones get more discharge share. All cells age together
+  and converge into the healthy mid-SoC band.
 - **SoC-aware power tapering** — optional per-battery taper knobs
-  reduce the effective charge / discharge cap near the SoC edges, so
-  the dispatcher doesn't try to push more than the BMS will accept.
-- **Direct Modbus dispatch (v0.7 default)** — instead of emulating a
-  Shelly Pro 3EM and steering each Marstek via per-poll CT deltas,
-  the dispatcher writes absolute power setpoints directly via Modbus
-  (`force_mode` register 42010 + `set_charge_power` 42020 /
-  `set_discharge_power` 42021). No more delta math, no settle
-  guesswork — we tell each battery exactly what to do, and the plug
-  feedback confirms it landed. Pulse mode is still available as
-  `dispatcher.mode = "pulse"` for installs without per-battery Modbus
-  access (or for non-Marstek inverters).
-- **Sequential per-circuit dispatch** — within a circuit we issue at
-  most ONE new setpoint per cycle, and only to a battery whose
-  previous write has settled (plug confirms the new power). This
-  gives the structural property that **a circuit can't go over cap**
-  even when commands are batched or BMS taper kicks in: the plug
-  measurement is always up-to-date before the next decision fires.
-- **Marstek SoC via Modbus TCP** — the multiplexer reads SoC from the
-  Modbus register matched by `marstek_model`. Only **Venus E V3 with
-  Ethernet** speaks Modbus TCP natively; every other Marstek variant
-  (Venus A, D, E V1, V2, V1.2, E 2.0) needs an external RS485-to-LAN
-  bridge (Waveshare RS485-to-RJ45, Elfin EW11, PUSR DR134, M5Stack
-  Atom S3 + RS485, …) wired to the battery's RS485 port. `modbus_host`
-  on each battery points at that bridge. Power telemetry still comes
-  from the plug, not the battery itself.
+  reduce effective charge / discharge cap near the SoC edges so the
+  dispatcher doesn't try to push more than the BMS will accept.
+- **Stale-measurement safety** — a stale plug mutes its circuit; a
+  stale grid measurement mutes every circuit. In modbus mode recovery
+  is instant — `force_mode` bypasses the Marstek's CT integrator
+  entirely. In pulse mode there's an extra 60 s "silent after stale"
+  cooldown to let the integrator clear.
+- **Failsafe shutdown** — Marstek firmware has no Modbus watchdog,
+  so the multiplexer carries the responsibility. SIGTERM / Ctrl-C
+  AND a Rust `panic_hook` write `force_mode = 0` plus
+  `rs485_control = off` to every battery before exit, so the
+  Marsteks fall back to their auto behaviour.
+
+### Modbus mode
+- **Direct setpoint writes** — `force_mode` (register 42010) +
+  `set_charge_power` (42020) / `set_discharge_power` (42021) every
+  cycle. No delta math, no settle guesswork.
+- **Marstek SoC over Modbus** — read from the SoC register matched
+  by `marstek_model`. Only **Venus E V3 with Ethernet** speaks
+  Modbus TCP natively; every other variant (Venus A, D, E V1, V2,
+  V1.2, E 2.0) needs an external RS485-to-LAN bridge (Waveshare
+  RS485-to-RJ45, Elfin EW11, PUSR DR134, M5Stack Atom S3 + RS485, …)
+  wired to the battery's RS485 port. `modbus_host` on each battery
+  points at that bridge.
 - **BMS cutoffs as SoC gate** — at startup we read each Marstek's
-  configured `charging_cutoff_capacity` (register 44000) and
+  configured `charging_cutoff_capacity` (44000) and
   `discharging_cutoff_capacity` (44001) and use those as the
   effective full / empty thresholds. The user's BMS setting is the
-  authoritative truth, far better than the dispatcher's TOML default.
-- **Emergency plug cutoff (safety)** — if a circuit's measured plug
-  sum exceeds `cap × headroom + emergency_cutoff_margin_w` for 5 s
-  (grace, hardcoded), the worst-offending battery's Shelly Plug PM
-  Gen3 relay is opened (`Switch.Set`, `on = false`). Auto-recovery
-  after 10 minutes (hardcoded); manual reset via the admin UI's
-  "reset" button on the offending row.
+  authoritative truth, far better than the dispatcher's TOML
+  default.
+- **Virtual Modbus TCP cache server** on `:1502` — re-publishes the
+  cached register reads so the HA Marstek integration keeps working
+  even though we own the Marstek's single Modbus slot. Unit ID per
+  battery = config-index + 1 (overridable per battery).
+
+### Pulse mode (legacy)
+- **Virtual Shelly Pro 3EM** on UDP-RPC (1010), HTTP-REST, HTTP-RPC.
+  Wire-compatible with Marstek Venus E and other batteries that
+  integrate via Shelly Pro 3EM emulation. Discoverable via mDNS
+  (`_shelly._tcp.local`, `_http._tcp.local`, correct TXT records).
+- **Empirical full/empty detection** — for installs without ANY SoC
+  source, the dispatcher infers full / empty by watching whether
+  each Marstek honours its directional CT pulses. The opposite
+  direction stays free, so a "full" battery still happily
+  discharges.
+
+### Other
 - **Night cutoff (efficiency)** — between sunset and sunrise, empty
   batteries can have their plugs opened to skip the Marstek's
   inverter standby loss (~5-15 W per unit, ~60-180 Wh per winter
-  night). Requires `[location].latitude` + `longitude` and
-  `dispatcher.night_cutoff_enabled = true`. Restored automatically
-  at sunrise.
-- **Failsafe shutdown** — Marstek firmware has no Modbus watchdog,
-  so the multiplexer carries the responsibility. SIGTERM / Ctrl-C
-  handlers AND a Rust `panic_hook` write `force_mode = 0` plus
-  `rs485_control = off` to every battery before exit, so the
-  Marsteks fall back to their auto behaviour.
+  night). Requires `[location]` + `night_cutoff_enabled = true`.
+  Restored automatically at sunrise.
 - **Home Assistant SoC mode** — alternative SoC source. When
-  `[home_assistant].enabled = true`, every battery's SoC is read from
-  its `soc_entity_id` via the HA Core REST API and the Modbus poller
-  stays idle. HA mode and Modbus mode are mutually exclusive.
-- **Admin UI on `:8080`** — live status (per-battery plug power, SoC,
-  pulse queue, taper / at-limit / silent state) **and** full live
-  configuration (real Shelly host / port, circuits, batteries,
-  dispatcher tuning, HA mode). The TOML on disk is just the bootstrap
-  seed; every setting can be edited at runtime without a restart.
-- **Cross-platform** — Linux (x86_64, aarch64, armv7, armv6), Windows
-  (x86_64), macOS (build from source).
+  `[home_assistant].enabled = true`, every battery's SoC is read
+  from its `soc_entity_id` via the HA Core REST API and the Modbus
+  SoC poller stays idle. HA mode and Modbus mode are mutually
+  exclusive.
+- **Admin UI on `:8080`** — live status (per-battery plug power,
+  SoC, commanded vs measured, taper / at-limit / silent state) AND
+  full live configuration (real Shelly host / port, circuits,
+  batteries, dispatcher tuning, HA mode). The TOML on disk is just
+  the bootstrap seed; every setting can be edited at runtime
+  without a restart. ETag-based cache invalidation (v0.11.9+) so
+  UI fixes that ship with a new release reach your browser without
+  a manual hard-refresh.
+- **Cross-platform** — Linux (x86_64, aarch64, armv7, armv6),
+  Windows (x86_64), macOS (build from source).
 
 ## Installation
 
@@ -195,21 +230,24 @@ cp config.example.toml config.toml
 #   http://<host>:8080
 ```
 
-In each battery's app, point its "Shelly Pro 3EM" target at the
-multiplexer's IP (instead of the real Shelly's IP). For SoC reads you
-need either:
+In **modbus mode** (default), each battery needs `modbus_host` set.
+For Venus E V3 with Ethernet that's the battery's own IP; for every
+other variant it's the IP of an external RS485-to-LAN bridge wired
+to the battery's RS485 port. The plug is still mandatory.
 
+In **pulse mode**, point each battery's "Shelly Pro 3EM" target at
+the multiplexer's IP (instead of the real Shelly's IP).
+
+For SoC reads you need either:
+- **Modbus mode** — `modbus_host` per battery doubles as the SoC
+  source.
 - **HA mode** — set `[home_assistant].enabled = true` and a
-  `soc_entity_id` per battery; the multiplexer reads SoC from HA.
-- **Modbus mode** — point `modbus_host` at the Modbus TCP endpoint of
-  each battery. For Venus E V3 with Ethernet that's the battery's own
-  IP; for every other variant it's the IP of an external RS485-to-LAN
-  bridge (Waveshare / Elfin EW11 / PUSR DR134 / M5Stack Atom S3 +
-  RS485) wired to the battery's RS485 port.
+  `soc_entity_id` per battery.
 
 ### Privileged ports
 
-UDP 1010 and HTTP 80 are below 1024 and need elevated rights on Linux:
+UDP 1010 (pulse mode) and HTTP 80 (optional) are below 1024 and need
+elevated rights on Linux:
 
 ```bash
 sudo setcap 'cap_net_bind_service=+ep' target/release/shelly-multiplexer
@@ -230,7 +268,8 @@ All sections in one diagram:
 
 ```
 [real_shelly]              ← grid measurement source
-[virtual_shelly]           ← face we present to the batteries (pulse mode only)
+[virtual_shelly]           ← face presented to the batteries (pulse mode only)
+[virtual_modbus]           ← cache server (modbus mode only — HA reads here)
 [management]               ← admin UI bind address
 [dispatcher]               ← global control-loop tuning + safety thresholds
 [home_assistant]           ← SoC source switch (HA mode)
@@ -250,7 +289,10 @@ The real Shelly Pro 3EM that measures the house's grid power.
 | `poll_interval_ms` | 250 | How often we poll the real Shelly for grid_w. |
 | `request_timeout_ms` | 1000 | Per-poll timeout. |
 
-### `[virtual_shelly]` — face presented to the batteries
+### `[virtual_shelly]` — face presented to the batteries (pulse mode)
+
+Only relevant in pulse mode. In modbus mode the dispatcher doesn't
+listen for the Marstek's CT-poll traffic.
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -261,6 +303,20 @@ The real Shelly Pro 3EM that measures the house's grid power.
 | `device_hostname` | (auto) | Hostname reported. Empty = `shellypro3em-<mac>`. |
 | `firmware` | `1.4.4` | Firmware string reported. Match what your batteries expect. |
 | `enable_mdns` | `true` | Announce ourselves on the LAN as a Pro 3EM. |
+
+### `[virtual_modbus]` — cache server for HA (modbus mode)
+
+Republishes the per-battery Modbus register cache so the HA Marstek
+integration keeps working even though we own the Marstek's single
+Modbus slot.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Master switch. Disable if you don't run HA against the Marsteks. |
+| `bind_address` | `0.0.0.0:1502` | Listen address for the cache server. |
+| `bulk_refresh_ms` | 1000 | How often the BatteryWriter pulls the "fast" register set (power, force_mode, ...). |
+| `slow_refresh_ms` | 60000 | Same for the "slow" set (config, telemetry that changes rarely). |
+| `debug` | `false` | Per-step Modbus traffic log (very verbose; flip on temporarily to debug refresh issues). |
 
 ### `[management]` — admin UI
 
@@ -277,27 +333,30 @@ most installs don't need to touch them.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `mode` | `modbus` | Dispatch backend. `modbus` writes setpoints directly via Modbus (v0.7+ default — requires `modbus_host` per battery). `pulse` keeps the legacy CT-emulation path (Shelly Pro 3EM virtual server). |
+| `mode` | `modbus` | Dispatch backend. `modbus` writes setpoints directly via Modbus (default — requires `modbus_host` per battery). `pulse` keeps the legacy CT-emulation path. |
 
-#### Cycle, ramp & deadband
+#### Cycle & ramp
 
 | Field | Default | Purpose |
 |---|---|---|
 | `cycle_ms` | 2000 | Dispatcher tick rate. Marstek inverters take 1-3 s to ramp toward a setpoint, so faster ticks just queue commands the inverter can't act on. |
-| `deadband_w` | 50 | Minimum delta magnitude before a pulse is queued (pulse mode) / before a setpoint is changed (modbus mode). Noise filter + Marstek-quantisation buffer. |
-| `grid_bias_w` | 100 | Asymmetric grid setpoint. The dispatcher leaves this margin on the import side when discharging and on the export side when charging — never tries to hit grid_w = 0 exactly. Set to 0 for symmetric dispatching. |
-| `rate_limit_w_per_cycle` | 500 | Max change of a battery's setpoint per cycle. Smooths big steps into a ramp (e.g. 0 → 2.5 kW takes 5 cycles ≈ 10 s). Replaces the EMA grid smoother + per-write throttle + heartbeat the v0.7 schema exposed — one knob, applied at the algorithm level. |
+| `rate_limit_w_per_cycle` | 500 | Max change of a battery's setpoint per cycle. Smooths big steps into a ramp (e.g. 0 → 2.5 kW takes 5 cycles ≈ 10 s). The ONLY ramp knob — `deadband_w` and `grid_bias_w` were folded into hardcoded constants in v0.10. |
 
 #### Emergency plug cutoff
 
 Last line of defence: physically opens the Shelly Plug PM Gen3 relay
 when soft control fails and a circuit drifts over its fuse cap.
+Two-phase escalation (v0.11.6+): a **Standby command** to every
+battery on the circuit first; only if that doesn't help within
+another 10 s does the worst offender's plug relay open.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `emergency_cutoff_margin_w` | 200 | Trigger threshold: cap × headroom + this margin. 0 disables the feature. |
+| `emergency_cutoff_margin_w` | 500 | Trigger threshold: `cap + this margin`. 0 disables the feature. |
 
-Grace (5 s) + recovery (600 s) are hardcoded — see `EMERGENCY_*` constants in `config.rs`.
+Grace (5 s before Phase 1), soft-remediation window (10 s before
+Phase 2) and recovery (600 s before plug auto-closes again) are
+hardcoded — see `EMERGENCY_*` constants in `config.rs`.
 
 #### Night cutoff
 
@@ -308,7 +367,8 @@ Marstek's ~5-15 W inverter standby loss. Requires `[location]`.
 |---|---|---|
 | `night_cutoff_enabled` | `false` | Master switch. Validation requires `[location].latitude` + `longitude` when set. |
 
-Hysteresis margin is hardcoded at 2 % SoC — see `NIGHT_CUTOFF_SOC_MARGIN_PCT` in `config.rs`.
+Hysteresis margin is hardcoded at 2 % SoC — see
+`NIGHT_CUTOFF_SOC_MARGIN_PCT` in `config.rs`.
 
 ### `[location]` — geographic location for sun-based features
 
@@ -317,11 +377,13 @@ Hysteresis margin is hardcoded at 2 % SoC — see `NIGHT_CUTOFF_SOC_MARGIN_PCT` 
 | `latitude` | — | Decimal degrees (-90 to 90). Required when `night_cutoff_enabled = true`. |
 | `longitude` | — | Decimal degrees (-180 to 180). Required when `night_cutoff_enabled = true`. |
 
-#### Settle gate
+#### Settle gate (pulse mode)
 
-After a write (modbus) / pulse (pulse mode) the dispatcher waits for the
-plug to actually move and then stop moving before issuing the next one.
-This prevents stacking deltas on top of a still-in-flight reaction.
+After a pulse the dispatcher waits for the plug to actually move and
+then stop moving before queueing the next one. This prevents stacking
+deltas on top of a still-in-flight reaction. In modbus mode this gate
+is bypassed (we write every cycle and let the rate limiter do the
+smoothing).
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -339,26 +401,17 @@ in `config.rs`.
 
 Per-battery overrides are also available (see `[[batteries]]`).
 
-#### Freshness & circuit cap
+#### Freshness
 
 | Field | Default | Purpose |
 |---|---|---|
 | `plug_stale_s` | 5.0 | Plug silent this long → mute its circuit. |
 | `grid_stale_s` | 5.0 | Real Shelly silent this long → mute every circuit. |
 
-In pulse mode there's an additional 60 s "silent after stale" cooldown
-to let the Marstek's internal CT integrator clear. In modbus mode that
-cooldown is 0 — force_mode bypasses the CT integrator entirely.
-
-#### Empirical full/empty detection (pulse mode, no-SoC fallback)
-
-For installs without a SoC source (no Modbus bridge, no HA sensor) the
-pulse-mode dispatcher infers "full" / "empty" from refused pulses: if
-a significant directional pulse goes out and the plug doesn't move
-within `settle_timeout_s`, that direction is locked for 10 minutes
-(hardcoded). The opposite direction stays free. Modbus mode doesn't
-need this — direct telemetry (SoC, force_mode, battery_power, BMS
-cutoffs) tells the dispatcher the truth.
+In pulse mode there's an additional 60 s "silent after stale"
+cooldown to let the Marstek's internal CT integrator clear. In
+modbus mode that cooldown is 0 — `force_mode` bypasses the CT
+integrator entirely.
 
 ### `[home_assistant]` — SoC source switch
 
@@ -374,18 +427,11 @@ the global switch:
 The two modes are mutually exclusive; the previous "Local API" path
 (direct UDP JSON-RPC on port 30000) was removed in v0.5.0.
 
-**No SoC source? Still works.** Since v0.6, a battery without ANY
-SoC source still participates. The dispatcher derives "full" /
-"empty" empirically by watching whether each Marstek honours its
-directional pulses — see [Empirical full/empty detection](#empirical-fullempty-detection-no-soc-mode)
-under `[dispatcher]`. The admin UI flags such batteries with a "no
-SoC" pill so you can tell at a glance which ones run in
-empirical-only mode.
-
-**Upgrade behaviour from v0.4.x:** old configs that still carry the
-retired `vendor` and `marstek_port` fields load unchanged — Serde
-ignores the unknown fields. Affected batteries participate in
-dispatch via empirical detection until you wire up a SoC source.
+**No SoC source? Pulse mode still works.** A battery without ANY SoC
+source still participates in pulse mode — the dispatcher derives
+"full" / "empty" empirically by watching whether each Marstek honours
+its directional pulses. Modbus mode requires a SoC source (the
+Marstek's Modbus host IS the source).
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -398,7 +444,7 @@ dispatch via empirical detection until you wire up a SoC source.
 
 One entry per shared protective device (typically one MCB). The cap
 is `fuse_amps × voltage × phases` — set `fuse_amps` to a value you're
-comfortable driving at 100 %.
+comfortable driving at 100 %. There is no built-in safety fraction.
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -408,24 +454,25 @@ comfortable driving at 100 %.
 | `voltage` | 230 | Nominal phase voltage. |
 
 Example for a B16 single-phase circuit: `fuse_amps = 16, phases = 1,
-voltage = 230` → 3680 W cap, or 3496 W with the default 0.95 headroom.
+voltage = 230` → 3680 W cap.
 
 ### `[[batteries]]` — one per Marstek + its dedicated plug
 
 | Field | Default | Purpose |
 |---|---|---|
 | `id` | — | Symbolic name. Required. |
-| `address` | — | Static IP the Marstek uses when polling the virtual Shelly. Used to route per-Marstek pulse queues. Required. |
+| `address` | — | Static IP the Marstek uses when polling the virtual Shelly (pulse mode). Required. |
 | `circuit` | — | Which `[[circuits]]` entry this battery sits on. Required. |
-| `plug_url` | — | HTTP base URL of the dedicated Shelly Plug PM Gen3 measuring this battery. **Mandatory** — the plug is authoritative for the cap math. Required. |
+| `plug_url` | — | HTTP base URL of the dedicated Shelly Plug PM Gen3 measuring this battery. **Mandatory** — the plug is authoritative for the cap math AND the overhead-compensation EMA. Required. |
 | `max_charge_w` | — | Hardware charge cap. Required. |
 | `max_discharge_w` | — | Hardware discharge cap. Required. |
 | `capacity_wh` | (auto) | Usable capacity, used as a distribution weight. Defaults to `max_charge_w + max_discharge_w` if unset. |
 | `priority_weight` | 1.0 | Manual multiplier on top of capacity (bigger = more share of work). |
-| `marstek_model` | `venus_e` | Picks the Modbus SoC register: `venus_e` (reg 34002, fits Venus E v1/v2/v3) or `venus_e_v12` (reg 32104, Venus E v1.2). Register map sourced from the [ViperRNMC marstek_venus_modbus](https://github.com/ViperRNMC/marstek_venus_modbus) project. |
-| `modbus_host` | — | Modbus TCP host. Needed in Modbus mode (`[home_assistant].enabled = false`); ignored in HA mode. Usually the IP of an RS485-to-LAN bridge — only Venus E V3 with Ethernet speaks Modbus TCP natively, in which case set this to the same value as `address`. Every other variant (Venus A, D, E V1, V2, V1.2, E 2.0) needs an external bridge such as Waveshare RS485-to-RJ45, Elfin EW11, PUSR DR134 or M5Stack Atom S3 + RS485. **Until this is set, the battery stays inactive** — the dispatcher skips it entirely. Not auto-derived from `address` on purpose: silently polling the wrong IP for SoC is a worse failure mode than asking for an explicit setting. |
+| `marstek_model` | `venus_e` | Picks the Modbus register table for that variant. Variants: `venus_e_v12`, `venus_e_v1`/`v2`, `venus_e_v3`, `venus_a`, `venus_d`. Register map sourced from the [ViperRNMC marstek_venus_modbus](https://github.com/ViperRNMC/marstek_venus_modbus) project. |
+| `modbus_host` | — | Modbus TCP host. **Required in modbus mode.** For Venus E V3 with Ethernet, set this to the same value as `address`. Every other variant needs an external RS485-to-LAN bridge (Waveshare RS485-to-RJ45, Elfin EW11, PUSR DR134, M5Stack Atom S3 + RS485) — `modbus_host` then points at the bridge's IP. **Until this is set, the battery stays INACTIVE** — the dispatcher skips it entirely. Not auto-derived from `address` on purpose: silently polling the wrong IP is a worse failure mode than asking for an explicit setting. |
 | `modbus_port` | 502 | Modbus TCP port (most bridges default to 502; some use 8899 or 4196 — check the bridge's web UI). |
 | `modbus_unit_id` | 1 | Modbus unit / slave ID. |
+| `virtual_unit_id` | (auto) | Unit ID this battery is exposed under on the multiplexer's `:1502` cache server. Defaults to config-index + 1. Overridable if your HA integration expects a specific layout. |
 | `soc_interval_ms` | 30000 | How often we poll the battery's SoC. |
 | `soc_entity_id` | — | HA entity ID. **Required** when `[home_assistant].enabled = true`; ignored otherwise. |
 | `soc_full_pct` | (inherit) | Per-battery override of `[dispatcher].soc_full_pct`. |
@@ -444,9 +491,11 @@ integrator never asks for more than the battery accepts.
 
 Per cycle, with N eligible batteries on one or more circuits:
 
-1. `grid_correction = grid_w - grid_bias_w` (asymmetric, with a deadband).
-2. `desired_total = Σ plug_w + grid_correction`. If `desired_total` is
-   negative the system net charges; positive means net discharge.
+1. `grid_correction = grid_w − SAFETY_MARGIN_W` (asymmetric: ±10 W
+   on the import / export side depending on charge / discharge
+   direction).
+2. `desired_total = Σ plug_w + grid_correction`. If `desired_total`
+   is negative the system net charges; positive means net discharge.
 3. Each battery gets a share of `desired_total` weighted by
    `priority_weight × capacity_wh × soc_room`, where `soc_room` is
    `(soc_full − soc)` when charging and `(soc − soc_empty)` when
@@ -457,17 +506,20 @@ Per cycle, with N eligible batteries on one or more circuits:
    tapers). Any clipped excess is redistributed to the remaining
    batteries up to six times.
 5. **Modbus mode**: each target's distance from the current plug-
-   measured power is clamped to `±rate_limit_w_per_cycle` so big swings
-   become ramps. Then per-circuit cap on the sum of targets; if either
-   the would-be commanded sum OR the live plug sum exceeds the fuse
-   cap, every target on that circuit is scaled toward zero. The
-   BatteryWriter writes the resulting absolute setpoint to its battery
-   via Modbus.
-6. **Pulse mode**: `delta = target - plug_w` for each battery. Deltas
-   below `deadband_w` are dropped; the per-circuit cap is enforced on
-   the plug+delta sum. Surviving deltas are queued as 3 identical CT
-   samples for the next Marstek polls. The dispatcher waits for plug
-   stability before queueing the next delta to the same battery.
+   measured power is clamped to `±rate_limit_w_per_cycle` so big
+   swings become ramps. Then per-circuit cap on the sum of targets;
+   if either the would-be commanded sum OR the live plug sum
+   exceeds the fuse cap, every target on that circuit is scaled
+   toward zero. Finally, per-battery empirical overhead is
+   subtracted so the plug LANDS at `target` rather than at
+   `target × (1 + overhead_ratio)`. The BatteryWriter writes the
+   resulting absolute setpoint to its battery via Modbus.
+6. **Pulse mode**: `delta = target − plug_w` for each battery.
+   Deltas below `deadband_w` are dropped; the per-circuit cap is
+   enforced on the plug+delta sum. Surviving deltas are queued as
+   3 identical CT samples for the next Marstek polls. The
+   dispatcher waits for plug stability before queueing the next
+   delta to the same battery.
 
 This means: (a) the primary goal — meeting the grid setpoint — is
 always pursued within physical limits, (b) batteries on the same
