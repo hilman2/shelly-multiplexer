@@ -108,6 +108,38 @@ async fn poll_plug_loop(
                     b.last_plug_w = Some(signed_w);
                     b.last_plug_at = Some(now);
                     b.plug_relay_state = relay_on;
+                    // Update plug↔commanded overhead EMA. Captures the
+                    // gap between what we tell the Marstek over Modbus
+                    // and what the plug actually draws — inverter
+                    // idle + AC↔DC conversion losses + meter bias,
+                    // typically 2-3 % of the operating point. Only
+                    // updated when we have a meaningful commanded
+                    // setpoint (≥ Marstek's minimum 50 W); below that
+                    // the Marstek is in standby and `plug - 0` is just
+                    // its idle draw, which we don't want polluting the
+                    // proportional-overhead estimate. EMA factor 0.3 ≈
+                    // half-life of ~2 measurements (~1.2 s with the
+                    // 600 ms plug poll), responsive enough to catch
+                    // direction changes within a few cycles.
+                    if let Some(cmd) = b.last_modbus_setpoint_w {
+                        if cmd.abs() >= 50.0 && signed_w.signum() == cmd.signum() {
+                            let instant = signed_w - cmd;
+                            let smoothed = match b.plug_overhead_w_smoothed {
+                                Some(prev) => 0.3 * instant + 0.7 * prev,
+                                None => instant,
+                            };
+                            b.plug_overhead_w_smoothed = Some(smoothed);
+                        } else if cmd.abs() < 50.0 {
+                            // Marstek is in standby per our command. Whatever
+                            // the plug shows is its idle load — don't fold it
+                            // into the proportional overhead estimate. Keep
+                            // the existing smoothed value (or None).
+                        } else {
+                            // Sign mismatch (e.g. we commanded discharge but
+                            // plug reads charge): probably a transition
+                            // moment, ignore for the EMA.
+                        }
+                    }
                     // Any previous error is now stale — the plug is reachable
                     // again and the marstek SoC poller has its own clearing
                     // logic, so leaving its message would be misleading.

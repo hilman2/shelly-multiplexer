@@ -178,6 +178,19 @@ pub struct BatteryState {
     /// Last error from any subsystem, surfaced in the UI.
     pub last_error: Option<String>,
 
+    /// Smoothed empirical overhead = (plug_w - last_modbus_setpoint_w).
+    /// Captures everything the dispatcher CAN'T predict from the
+    /// Modbus command alone: Marstek inverter idle draw (~5-15 W),
+    /// AC↔DC conversion losses, plug measurement bias. Signed: same
+    /// direction as plug_w. Concretely, with charging both numbers are
+    /// negative and `plug_w - commanded` is also negative, so the
+    /// dispatcher subtracts this from the target to find what to
+    /// COMMAND for the plug to LAND at the target. Updated as an EMA
+    /// in plug.rs on every fresh plug reading whose `last_modbus_
+    /// setpoint_w` is current (= a meaningful write happened). None
+    /// until the first successful pair (command + plug response).
+    pub plug_overhead_w_smoothed: Option<f64>,
+
     /// Unit ID this battery is exposed under on our virtual Modbus
     /// server. Resolved at startup from `BatteryConfig::virtual_unit_id`
     /// (explicit) or its config index + 1 (fallback).
@@ -241,6 +254,7 @@ impl BatteryState {
             plug_cut_until: None,
             plug_cut_reason: None,
             last_error: None,
+            plug_overhead_w_smoothed: None,
             virtual_unit_id: cfg.effective_virtual_unit_id(index),
             cached_holding_regs: HashMap::new(),
             cached_regs_refreshed_at: None,
@@ -648,6 +662,7 @@ mod tests {
             plug_cut_until: None,
             plug_cut_reason: None,
             last_error: None,
+            plug_overhead_w_smoothed: None,
             virtual_unit_id: 1,
             cached_holding_regs: HashMap::new(),
             cached_regs_refreshed_at: None,

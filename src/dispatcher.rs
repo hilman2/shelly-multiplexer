@@ -524,6 +524,33 @@ fn enforce_circuit_safety(
     }
 }
 
+/// Apply empirical plug↔commanded overhead compensation to a target
+/// power. The dispatcher's `target` is what we want the plug to READ
+/// next cycle; the Marstek's Modbus setpoint addresses inverter input
+/// power. The plug therefore ends up at roughly `commanded +
+/// per_battery_overhead` where the overhead captures inverter idle
+/// draw + AC↔DC conversion loss + plug meter bias (typically 2-3 % of
+/// the operating point — empirically ~30-50 W when charging at
+/// ~1.5 kW). To make the plug LAND at `target`, we COMMAND `target -
+/// overhead`.
+///
+/// Safety rails:
+///   * Clipped to ±200 W per battery. A residential inverter's
+///     standby + conversion loss is realistically inside that range;
+///     a smoothed EMA outside it is garbage (transient, sign
+///     confusion, math glitch) and we'd rather not over-correct.
+///   * Sign check: only compensate when `overhead` and `target` point
+///     in the same direction. A charge-direction overhead applied to
+///     a discharge target would AMPLIFY rather than cancel.
+fn apply_overhead_compensation(target: f64, overhead_raw: f64) -> f64 {
+    let overhead = overhead_raw.clamp(-200.0, 200.0);
+    if overhead.signum() == target.signum() {
+        target - overhead
+    } else {
+        target
+    }
+}
+
 /// Modbus-dispatch tick — compute absolute setpoints and push them
 /// through `ModbusDispatch`. Way simpler than the pulse path: no
 /// settle gate, no in-flight tracking, no virtual Shelly. Just
@@ -593,8 +620,13 @@ fn step_modbus(
     // under cap — separate from the cap-engaged WARN, which fires
     // BEFORE per-battery `from_signed_watts` clamping. The numbers in
     // this log are exactly what the BatteryWriters will write.
-    let mut commanded_per_circuit: HashMap<String, (f64, f64, f64, f64, Vec<(String, f64, f64)>)> =
-        HashMap::new();
+    // Per-circuit accumulator: (target_sum, commanded_sum, plug_sum,
+    // cap_w, per_battery_tuples). per_battery_tuples is (id, target,
+    // commanded, plug, overhead).
+    let mut commanded_per_circuit: HashMap<
+        String,
+        (f64, f64, f64, f64, Vec<(String, f64, f64, f64, f64)>),
+    > = HashMap::new();
     for b in bats.values() {
         // Skip cut plugs (emergency cutoff or night cutoff active).
         if b.plug_cut_until.map(|t| t > now).unwrap_or(false) {
@@ -610,7 +642,22 @@ fn step_modbus(
             continue;
         }
         let target = targets.get(&b.id).copied().unwrap_or(0.0);
-        let sp = Setpoint::from_signed_watts(target, b.max_charge_w, b.max_discharge_w);
+        // Empirical overhead compensation. `target` is what we want the
+        // PLUG to read; `from_signed_watts` will pass an absolute power
+        // setpoint to the Marstek. The plug ends up at roughly
+        // commanded + per-battery overhead (inverter losses + idle
+        // draw + meter bias, typically -30 to -50 W when charging at
+        // 1.5 kW). So to land plug at `target`, we COMMAND `target -
+        // overhead`. With the overhead in the same direction as the
+        // command, this means commanding a slightly SMALLER absolute
+        // power — which is exactly what the user asked for after
+        // v0.11.6 ("der wert den ich einstelle soll erreicht werden"
+        // / circuit cap actually held). The EMA in plug.rs adapts to
+        // changes in the operating point so this stays accurate
+        // across SoC and charge level shifts.
+        let overhead = b.plug_overhead_w_smoothed.unwrap_or(0.0);
+        let compensated_target = apply_overhead_compensation(target, overhead);
+        let sp = Setpoint::from_signed_watts(compensated_target, b.max_charge_w, b.max_discharge_w);
         let commanded = sp.to_signed_watts();
         let plug = b.last_plug_w.unwrap_or(0.0);
         let entry = commanded_per_circuit
@@ -619,7 +666,8 @@ fn step_modbus(
         entry.0 += target;
         entry.1 += commanded;
         entry.2 += plug;
-        entry.4.push((b.id.clone(), commanded, plug));
+        entry.4
+            .push((b.id.clone(), target, commanded, plug, overhead));
         dispatch.send(&b.id, sp);
     }
     // Fill cap_w per circuit (separate loop so we don't double-hold
@@ -630,11 +678,14 @@ fn step_modbus(
         }
     }
     for (cid, (target_sum, commanded_sum, plug_sum, cap, per_bat)) in &commanded_per_circuit {
-        let over_cap = commanded_sum.abs() > *cap;
-        let level = if over_cap { tracing::Level::WARN } else { tracing::Level::DEBUG };
-        // Manual dispatch — `warn!`/`debug!` macros don't accept a
-        // dynamic level.
-        if level == tracing::Level::WARN {
+        let commanded_over_cap = commanded_sum.abs() > *cap;
+        let plug_over_cap = plug_sum.abs() > *cap;
+        // Promote to INFO when there's ANY action on this circuit
+        // (commanded != 0 or plug != 0) so the operator can see what
+        // the dispatcher is doing without enabling debug logging.
+        // Promote further to WARN if the commanded sum exceeds cap
+        // (cap-scaling failed) — that's a real bug we want loud.
+        if commanded_over_cap {
             warn!(
                 circuit = %cid,
                 cap_w = cap,
@@ -642,15 +693,17 @@ fn step_modbus(
                 commanded_sum,
                 plug_sum,
                 per_battery = ?per_bat,
-                "POST-DISPATCH SUMMARY: commanded sum OVER cap — cap-scaling failed to hold"
+                "POST-DISPATCH SUMMARY: commanded sum OVER cap — cap-scaling math failed"
             );
-        } else {
-            debug!(
+        } else if commanded_sum.abs() > 50.0 || plug_sum.abs() > 50.0 {
+            // (id, target, commanded, plug, overhead) per battery
+            info!(
                 circuit = %cid,
                 cap_w = cap,
                 target_sum,
                 commanded_sum,
                 plug_sum,
+                plug_over_cap,
                 per_battery = ?per_bat,
                 "post-dispatch summary"
             );
@@ -1763,6 +1816,7 @@ mod tests {
             plug_cut_until: None,
             plug_cut_reason: None,
             last_error: None,
+            plug_overhead_w_smoothed: None,
             virtual_unit_id: 1,
             cached_holding_regs: std::collections::HashMap::new(),
             cached_regs_refreshed_at: None,
@@ -2595,6 +2649,52 @@ modbus_host = "192.168.1.93"
             cs.overload_started_at.is_none(),
             "disabled feature must not even start the tracker"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Empirical plug↔commanded overhead compensation (v0.11.8).
+    // -----------------------------------------------------------------
+
+    /// Charging: target -1500 W, observed +40 W over-delivery
+    /// (overhead = -40, both negative). We must COMMAND -1460 so the
+    /// plug lands at -1500.
+    #[test]
+    fn overhead_compensation_charging_subtracts_overshoot() {
+        let commanded = apply_overhead_compensation(-1500.0, -40.0);
+        assert!((commanded - -1460.0).abs() < 1e-6, "got {commanded}");
+    }
+
+    /// Discharging: target +1500 W, observed overhead +40 (plug
+    /// discharges more than commanded). Command +1460.
+    #[test]
+    fn overhead_compensation_discharging_subtracts_overshoot() {
+        let commanded = apply_overhead_compensation(1500.0, 40.0);
+        assert!((commanded - 1460.0).abs() < 1e-6, "got {commanded}");
+    }
+
+    /// Sign mismatch (e.g. overhead estimate from a previous direction
+    /// hasn't been re-learned yet). Don't apply — would amplify.
+    #[test]
+    fn overhead_compensation_skipped_on_sign_mismatch() {
+        let commanded = apply_overhead_compensation(-1500.0, 40.0);
+        assert_eq!(commanded, -1500.0);
+    }
+
+    /// No estimate yet (= 0) → pass-through.
+    #[test]
+    fn overhead_compensation_no_estimate_is_noop() {
+        assert_eq!(apply_overhead_compensation(-1500.0, 0.0), -1500.0);
+    }
+
+    /// Out-of-range estimate (= absurd value from a glitch) is clamped
+    /// to ±200 W before applying.
+    #[test]
+    fn overhead_compensation_clamped_to_safety_range() {
+        // -500 W estimate → clamped to -200 → commanded = target -
+        // (-200) = -1500 + 200 = -1300.
+        assert_eq!(apply_overhead_compensation(-1500.0, -500.0), -1300.0);
+        // Same on the discharge side.
+        assert_eq!(apply_overhead_compensation(1500.0, 500.0), 1300.0);
     }
 
     // -----------------------------------------------------------------
