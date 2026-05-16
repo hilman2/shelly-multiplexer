@@ -359,7 +359,15 @@ fn default_settle_timeout_s() -> f64 {
     10.0
 }
 fn default_emergency_cutoff_margin_w() -> f64 {
-    200.0
+    // Marsteks routinely overshoot a commanded power by 5-10 % for a
+    // few seconds before settling. With three batteries on a circuit
+    // and a 6 kW cap, that's up to ~600 W of headroom we need to
+    // tolerate before screaming "emergency". 500 W keeps the safety
+    // net but stops the dispatcher from tripping plugs on routine
+    // ramps. The two-phase escalation (soft Standby first, then hard
+    // plug-open) is the real protection — this margin only controls
+    // how impatient we are about treating an overshoot as pathological.
+    500.0
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +426,19 @@ pub const MODBUS_REQUEST_TIMEOUT_MS: u64 = 5_000;
 /// Per-write retry budget on transient Modbus failures (200 ms × attempt).
 pub const MODBUS_WRITE_RETRIES: u32 = 2;
 
-/// Sustained-overload grace before the emergency plug relay opens.
+/// Sustained-overload grace before the emergency soft-remediation
+/// kicks in (Standby commands sent to every member of the offending
+/// circuit). Short by design — the circuit cap in `compute_targets`
+/// already pulls the dispatch toward safe levels every cycle, so a
+/// genuine overload that lasts longer than this means soft control
+/// isn't working.
 pub const EMERGENCY_CUTOFF_GRACE_S: f64 = 5.0;
+/// After soft remediation (Standby) is in effect for this long and
+/// the circuit is STILL over cap, we physically open the worst
+/// offender's plug relay. Gives Marsteks time to actually ramp down
+/// from a high setpoint before nuking the relay — typical ramp is
+/// 1-3 s so 10 s is plenty.
+pub const EMERGENCY_SOFT_REMEDIATION_GRACE_S: f64 = 10.0;
 /// Auto-recovery window after an emergency cutoff. Manual reset is
 /// always available via the admin API.
 pub const EMERGENCY_CUTOFF_RECOVERY_S: f64 = 600.0;
