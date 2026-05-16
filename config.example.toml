@@ -80,9 +80,6 @@ rate_limit_w_per_cycle = 500
 # in the Marstek app and are far more authoritative.
 soc_full_pct = 95
 soc_empty_pct = 5
-# Fraction of the circuit fuse cap the dispatcher will actually use.
-# 0.95 = 5 % jitter buffer.
-circuit_headroom = 0.95
 # Plug silent this long → mute its circuit (cap math goes stale).
 plug_stale_s = 5
 # Real Shelly silent this long → mute every circuit.
@@ -92,9 +89,9 @@ grid_stale_s = 5
 # wait if a Marstek refuses to react.
 settle_timeout_s = 10
 # Hardware safety: when the SIGNED plug-power sum on a circuit exceeds
-# cap × headroom + this, physically open the worst offender's Shelly
-# Plug relay. 0 disables. Grace + recovery are hardcoded at 5 s / 600 s.
-emergency_cutoff_margin_w = 200
+# cap + this, physically open the worst offender's Shelly Plug relay.
+# 0 disables. Grace + recovery are hardcoded at 5 s / 600 s.
+emergency_cutoff_margin_w = 500
 # Optional efficiency feature: between sunset and sunrise, disconnect
 # empty batteries to skip the Marstek inverter's ~5-15 W standby loss.
 # Requires [location] below. Hysteresis is hardcoded at 2 % SoC.
@@ -122,7 +119,9 @@ timeout_ms = 3000
 
 # --- Circuits ---
 # A circuit is a shared protective device (MCB/RCD). The dispatcher
-# enforces (signed sum of plug_w on members) ≤ cap_w × circuit_headroom.
+# enforces (signed sum of plug_w on members) ≤ cap_w. The cap is the
+# fuse rating you configure — there is no built-in safety margin, set
+# fuse_amps to a value you're comfortable being driven at 100 %.
 
 [[circuits]]
 id = "basement"

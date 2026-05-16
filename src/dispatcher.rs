@@ -343,7 +343,7 @@ fn enforce_circuit_safety(
         let mut circuits = state.circuits.write();
 
         for cs in circuits.values_mut() {
-            let cap = cs.cap_w() * dcfg.circuit_headroom;
+            let cap = cs.cap_w();
             let margin = dcfg.emergency_cutoff_margin_w;
             // Only consider batteries whose plug is currently on (otherwise
             // they can't contribute, and we don't want to count a stale
@@ -588,6 +588,13 @@ fn step_modbus(
     // in the target doesn't spam Modbus traffic.
     let bats = state.batteries.read();
     let circuits = state.circuits.read();
+    // Per-circuit accumulator for the post-dispatch summary log. Lets
+    // the operator confirm at a glance whether the commanded sum stays
+    // under cap — separate from the cap-engaged WARN, which fires
+    // BEFORE per-battery `from_signed_watts` clamping. The numbers in
+    // this log are exactly what the BatteryWriters will write.
+    let mut commanded_per_circuit: HashMap<String, (f64, f64, f64, f64, Vec<(String, f64, f64)>)> =
+        HashMap::new();
     for b in bats.values() {
         // Skip cut plugs (emergency cutoff or night cutoff active).
         if b.plug_cut_until.map(|t| t > now).unwrap_or(false) {
@@ -604,7 +611,50 @@ fn step_modbus(
         }
         let target = targets.get(&b.id).copied().unwrap_or(0.0);
         let sp = Setpoint::from_signed_watts(target, b.max_charge_w, b.max_discharge_w);
+        let commanded = sp.to_signed_watts();
+        let plug = b.last_plug_w.unwrap_or(0.0);
+        let entry = commanded_per_circuit
+            .entry(b.circuit.clone())
+            .or_insert((0.0, 0.0, 0.0, 0.0, Vec::new()));
+        entry.0 += target;
+        entry.1 += commanded;
+        entry.2 += plug;
+        entry.4.push((b.id.clone(), commanded, plug));
         dispatch.send(&b.id, sp);
+    }
+    // Fill cap_w per circuit (separate loop so we don't double-hold
+    // the circuits read-lock).
+    for (cid, entry) in commanded_per_circuit.iter_mut() {
+        if let Some(cs) = circuits.get(cid) {
+            entry.3 = cs.cap_w();
+        }
+    }
+    for (cid, (target_sum, commanded_sum, plug_sum, cap, per_bat)) in &commanded_per_circuit {
+        let over_cap = commanded_sum.abs() > *cap;
+        let level = if over_cap { tracing::Level::WARN } else { tracing::Level::DEBUG };
+        // Manual dispatch — `warn!`/`debug!` macros don't accept a
+        // dynamic level.
+        if level == tracing::Level::WARN {
+            warn!(
+                circuit = %cid,
+                cap_w = cap,
+                target_sum,
+                commanded_sum,
+                plug_sum,
+                per_battery = ?per_bat,
+                "POST-DISPATCH SUMMARY: commanded sum OVER cap — cap-scaling failed to hold"
+            );
+        } else {
+            debug!(
+                circuit = %cid,
+                cap_w = cap,
+                target_sum,
+                commanded_sum,
+                plug_sum,
+                per_battery = ?per_bat,
+                "post-dispatch summary"
+            );
+        }
     }
     Ok(())
 }
@@ -1114,7 +1164,7 @@ fn compute_deltas(
             .map(|b| deltas.get(&b.id).copied().unwrap_or(0.0))
             .sum();
         let post = measured_sum + delta_sum;
-        let cap = cs.cap_w() * dcfg.circuit_headroom;
+        let cap = cs.cap_w();
         if post.abs() > cap && delta_sum.abs() > 1e-3 {
             let target_post = cap.copysign(post);
             let target_delta_sum = target_post - measured_sum;
@@ -1376,7 +1426,7 @@ fn compute_targets(
     // commanded value pulls the plug back down. Use the larger of
     // |target_sum| and |plug_sum| as the constraint basis.
     for cs in circuits.values() {
-        let cap = cs.cap_w() * dcfg.circuit_headroom;
+        let cap = cs.cap_w();
         let member_ids: Vec<String> = cs.member_ids.clone();
         let target_sum: f64 = member_ids
             .iter()
@@ -2317,7 +2367,10 @@ modbus_host = "192.168.1.93"
         dcfg.rate_limit_w_per_cycle = 9999.0;
         let targets = compute_targets(&state, &dcfg, 9000.0, now);
 
-        let cap = 32.0 * 230.0 * 0.95;
+        // v0.11.7 removed the circuit_headroom factor — the cap is now
+        // raw fuse_amps × voltage. User is expected to pick fuse_amps
+        // they're comfortable driving at 100 %.
+        let cap = 32.0 * 230.0;
         let sum: f64 = targets.values().sum();
         // After cap scaling, sum should be at the cap (within a small epsilon).
         assert!(
@@ -2431,8 +2484,6 @@ modbus_host = "192.168.1.93"
         assert!(bats.get("b").unwrap().plug_cut_until.is_none());
     }
 
-    /// Disabled feature (margin = 0) is a complete no-op.
-    #[test]
     /// After grace, but before soft_grace elapses: the function must
     /// stamp `soft_remediation_started_at` and NOT trip any plug. This
     /// is the bug the user reported in v0.11.5 ("Plugs ausgeschaltet
